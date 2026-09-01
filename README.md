@@ -14,6 +14,12 @@ cargo run
 cargo run -- agent-demo
 ```
 
+To exercise the coding-agent tools against this workspace:
+
+```bash
+cargo run -- coding-demo
+```
+
 ## Connect a model process
 
 The native agent command launches the executable named by

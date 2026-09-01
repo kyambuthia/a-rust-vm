@@ -63,6 +63,13 @@ pub struct PermissionRequest {
     pub description: String,
 }
 
+/// The decision returned by the host for a guarded tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny { reason: String },
+}
+
 /// Events emitted by one agent turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -86,7 +93,7 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
-    fn new(name: &str, description: &str, input_schema: &str) -> Self {
+    pub(crate) fn new(name: &str, description: &str, input_schema: &str) -> Self {
         Self {
             name: name.to_owned(),
             description: description.to_owned(),
@@ -397,6 +404,10 @@ impl std::error::Error for ToolError {}
 pub trait Tool {
     fn spec(&self) -> ToolSpec;
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError>;
+
+    fn permission(&self, _arguments: &ToolArguments) -> Option<PermissionRequest> {
+        None
+    }
 }
 
 /// Mutable collection of named tools with deterministic dispatch.
@@ -426,6 +437,20 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.spec()).collect()
     }
 
+    pub fn merge(&mut self, other: ToolRegistry) -> Result<(), ToolError> {
+        if let Some(name) = other
+            .tools
+            .keys()
+            .find(|name| self.tools.contains_key(*name))
+        {
+            return Err(ToolError::new(format!(
+                "tool is already registered: {name}"
+            )));
+        }
+        self.tools.extend(other.tools);
+        Ok(())
+    }
+
     pub fn execute(&mut self, call: &ToolCall) -> ToolResult {
         let Some(tool) = self.tools.get_mut(&call.name) else {
             return ToolResult {
@@ -450,6 +475,12 @@ impl ToolRegistry {
                 is_error: true,
             },
         }
+    }
+
+    pub fn permission_request(&self, call: &ToolCall) -> Option<PermissionRequest> {
+        self.tools
+            .get(&call.name)
+            .and_then(|tool| tool.permission(&call.arguments))
     }
 }
 
@@ -498,6 +529,20 @@ where
     }
 
     pub fn run(&mut self, prompt: impl Into<String>) -> Result<Vec<AgentEvent>, AgentError> {
+        self.run_with_approval(prompt, |_| PermissionDecision::Deny {
+            reason: "tool requires host approval".to_owned(),
+        })
+    }
+
+    /// Run one turn with an explicit approval callback for guarded tools.
+    pub fn run_with_approval<F>(
+        &mut self,
+        prompt: impl Into<String>,
+        mut approve: F,
+    ) -> Result<Vec<AgentEvent>, AgentError>
+    where
+        F: FnMut(&PermissionRequest) -> PermissionDecision,
+    {
         let prompt = prompt.into();
         let mut events = vec![AgentEvent::UserMessage {
             content: prompt.clone(),
@@ -522,7 +567,8 @@ where
                 }
                 ModelResponse::ToolCall(call) => {
                     events.push(AgentEvent::ToolCall(call.clone()));
-                    let result = self.tools.execute(&call);
+                    let result =
+                        self.execute_with_approval(&call, &mut approve, |event| events.push(event));
                     tool_results.push(result.clone());
                     events.push(AgentEvent::ToolResult(result));
                 }
@@ -535,13 +581,29 @@ where
     }
 
     /// Run one turn and emit model text as it arrives.
-    pub fn run_streaming<F>(
-        &mut self,
-        prompt: impl Into<String>,
-        mut emit: F,
-    ) -> Result<(), AgentError>
+    pub fn run_streaming<F>(&mut self, prompt: impl Into<String>, emit: F) -> Result<(), AgentError>
     where
         F: FnMut(AgentEvent),
+    {
+        self.run_streaming_with_approval(
+            prompt,
+            |_| PermissionDecision::Deny {
+                reason: "tool requires host approval".to_owned(),
+            },
+            emit,
+        )
+    }
+
+    /// Run one streaming turn with an explicit approval callback.
+    pub fn run_streaming_with_approval<F, A>(
+        &mut self,
+        prompt: impl Into<String>,
+        mut approve: F,
+        mut emit: A,
+    ) -> Result<(), AgentError>
+    where
+        F: FnMut(&PermissionRequest) -> PermissionDecision,
+        A: FnMut(AgentEvent),
     {
         let prompt = prompt.into();
         emit(AgentEvent::UserMessage {
@@ -578,7 +640,7 @@ where
                 }
                 ModelResponse::ToolCall(call) => {
                     emit(AgentEvent::ToolCall(call.clone()));
-                    let result = self.tools.execute(&call);
+                    let result = self.execute_with_approval(&call, &mut approve, &mut emit);
                     tool_results.push(result.clone());
                     emit(AgentEvent::ToolResult(result));
                 }
@@ -588,6 +650,32 @@ where
         Err(AgentError::StepLimitExceeded {
             limit: self.max_steps,
         })
+    }
+
+    fn execute_with_approval<F, A>(
+        &mut self,
+        call: &ToolCall,
+        approve: &mut F,
+        mut emit: A,
+    ) -> ToolResult
+    where
+        F: FnMut(&PermissionRequest) -> PermissionDecision,
+        A: FnMut(AgentEvent),
+    {
+        let Some(request) = self.tools.permission_request(call) else {
+            return self.tools.execute(call);
+        };
+
+        emit(AgentEvent::PermissionRequested(request.clone()));
+        match approve(&request) {
+            PermissionDecision::Allow => self.tools.execute(call),
+            PermissionDecision::Deny { reason } => ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                content: reason,
+                is_error: true,
+            },
+        }
     }
 }
 
@@ -877,8 +965,8 @@ fn vm_tool_error(error: VmError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AgentEvent, Model, ModelResponse, ScriptedModel, ToolArguments, ToolCall,
-        ToolRegistry, ToolValue, vm_tool_registry,
+        Agent, AgentEvent, Model, ModelResponse, PermissionDecision, ScriptedModel, ToolArguments,
+        ToolCall, ToolRegistry, ToolValue, vm_tool_registry,
     };
 
     fn program_arguments(source: &str) -> ToolArguments {
@@ -1066,5 +1154,46 @@ mod tests {
 
         assert!(result.is_error);
         assert_eq!(result.content, "unknown tool: missing_tool");
+    }
+
+    #[test]
+    fn denied_workspace_write_emits_permission_and_does_not_write() {
+        let root =
+            std::env::temp_dir().join(format!("a-rust-vm-agent-permission-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new(
+                "write-1",
+                "write_file",
+                [
+                    ("path".to_owned(), ToolValue::Text("blocked.txt".to_owned())),
+                    ("content".to_owned(), ToolValue::Text("nope".to_owned())),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            ModelResponse::Text("The write was not approved.".to_owned()),
+        ]);
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        );
+
+        let events = agent
+            .run_with_approval("write a file", |_| PermissionDecision::Deny {
+                reason: "test denial".to_owned(),
+            })
+            .unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::PermissionRequested(_)))
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolResult(result) if result.is_error && result.content == "test denial")
+        }));
+        assert!(!root.join("blocked.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

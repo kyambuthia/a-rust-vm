@@ -4,6 +4,8 @@
 //! evaluates them from left to right and leaves the result on its value stack.
 
 pub mod agent;
+pub mod session;
+pub mod workspace;
 
 /// The instructions understood by the VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

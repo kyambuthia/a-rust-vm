@@ -20,6 +20,9 @@ The VM, debugger, language, and LLVM work remain first-class features.
 - [x] Project-level agent and commit rules
 - [x] Provider-neutral model boundary and streamed agent events
 - [x] Native interactive agent command with a line-oriented process bridge
+- [x] Workspace list, read, search, write, and command tools
+- [x] Workspace containment checks and approval-aware guarded tools
+- [x] Local session persistence primitives with atomic saves
 - [ ] LLM provider integration
 - [ ] Agent turn loop
 - [ ] Workspace and file tools

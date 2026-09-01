@@ -3,13 +3,18 @@ use std::io::{self, BufRead, Write};
 
 use a_rust_vm::agent::{
     Agent, AgentEvent, ModelResponse, ProcessModel, ScriptedModel, ToolArguments, ToolCall,
-    ToolValue, vm_tool_registry,
+    ToolValue,
 };
+use a_rust_vm::workspace::coding_tool_registry;
 use a_rust_vm::{Instruction, Vm};
 
 fn main() {
     if env::args().nth(1).as_deref() == Some("agent-demo") {
         run_agent_demo();
+        return;
+    }
+    if env::args().nth(1).as_deref() == Some("coding-demo") {
+        run_coding_demo();
         return;
     }
     if env::args().nth(1).as_deref() == Some("agent") {
@@ -49,7 +54,10 @@ fn run_agent_demo() {
         ModelResponse::ToolCall(ToolCall::new("call-1", "run_program", arguments)),
         ModelResponse::Text("The VM result is 40.".to_owned()),
     ]);
-    let mut agent = Agent::new(model, vm_tool_registry().expect("VM tools should register"));
+    let mut agent = Agent::new(
+        model,
+        coding_tool_registry(working_directory()).expect("agent tools should register"),
+    );
 
     println!("Agent prompt: multiply 8 by 5");
     match agent.run("multiply 8 by 5") {
@@ -95,14 +103,14 @@ fn run_live_agent() {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let working_directory = env::current_dir().unwrap_or_else(|error| {
-        eprintln!("failed to resolve the working directory: {error}");
-        std::process::exit(2);
-    });
+    let working_directory = working_directory();
     let model = ProcessModel::new(program)
         .with_arguments(arguments)
-        .with_working_directory(working_directory);
-    let mut agent = Agent::new(model, vm_tool_registry().expect("VM tools should register"));
+        .with_working_directory(&working_directory);
+    let mut agent = Agent::new(
+        model,
+        coding_tool_registry(&working_directory).expect("agent tools should register"),
+    );
     let stdin = io::stdin();
 
     println!("A/RVM agent. Type /exit to quit.");
@@ -126,22 +134,100 @@ fn run_live_agent() {
             break;
         }
 
-        if let Err(error) = agent.run_streaming(prompt, |event| match event {
-            AgentEvent::AssistantDelta { content } => {
-                print!("{content}");
-                io::stdout().flush().expect("stdout should be writable");
-            }
-            AgentEvent::AssistantText { content } => print!("{content}"),
-            AgentEvent::ToolCall(call) => print!("\n[tool] {}\n", call.name),
-            AgentEvent::ToolResult(result) => println!("[tool result] {}", result.content),
-            AgentEvent::PermissionRequested(request) => {
-                println!("[permission] {}", request.description)
-            }
-            AgentEvent::Error { message } => println!("[error] {message}"),
-            AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
-        }) {
+        if let Err(error) = agent.run_streaming_with_approval(
+            prompt,
+            |request| {
+                println!("[approval] allow {}? [y/N]", request.description);
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .expect("stdin should be readable");
+                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    a_rust_vm::agent::PermissionDecision::Allow
+                } else {
+                    a_rust_vm::agent::PermissionDecision::Deny {
+                        reason: "approval denied by user".to_owned(),
+                    }
+                }
+            },
+            |event| match event {
+                AgentEvent::AssistantDelta { content } => {
+                    print!("{content}");
+                    io::stdout().flush().expect("stdout should be writable");
+                }
+                AgentEvent::AssistantText { content } => print!("{content}"),
+                AgentEvent::ToolCall(call) => print!("\n[tool] {}\n", call.name),
+                AgentEvent::ToolResult(result) => println!("[tool result] {}", result.content),
+                AgentEvent::PermissionRequested(request) => {
+                    println!("[permission] {}", request.description)
+                }
+                AgentEvent::Error { message } => println!("[error] {message}"),
+                AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
+            },
+        ) {
             eprintln!("\n[agent error] {error}");
         }
         println!();
     }
+}
+
+fn run_coding_demo() {
+    let model = ScriptedModel::new([
+        ModelResponse::ToolCall(ToolCall::new("list-1", "list_files", ToolArguments::new())),
+        ModelResponse::ToolCall(ToolCall::new(
+            "read-1",
+            "read_file",
+            [("path".to_owned(), ToolValue::Text("README.md".to_owned()))]
+                .into_iter()
+                .collect(),
+        )),
+        ModelResponse::Text("I inspected the workspace and read its README.".to_owned()),
+    ]);
+    let mut agent = Agent::new(
+        model,
+        coding_tool_registry(working_directory()).expect("agent tools should register"),
+    );
+
+    println!("Agent prompt: inspect this workspace");
+    match agent.run("inspect this workspace") {
+        Ok(events) => {
+            for event in events {
+                match event {
+                    AgentEvent::UserMessage { content } => println!("user: {content}"),
+                    AgentEvent::AssistantText { content } => println!("assistant: {content}"),
+                    AgentEvent::ToolCall(call) => {
+                        println!("tool call: {} ({})", call.name, call.id)
+                    }
+                    AgentEvent::ToolResult(result) => {
+                        let content = if result.content.len() > 600 {
+                            let preview = result.content.chars().take(600).collect::<String>();
+                            format!("{preview}...")
+                        } else {
+                            result.content
+                        };
+                        println!("tool result: {content}");
+                    }
+                    AgentEvent::AssistantDelta { content } => {
+                        println!("assistant delta: {content}")
+                    }
+                    AgentEvent::PermissionRequested(request) => {
+                        println!("permission: {}", request.description)
+                    }
+                    AgentEvent::Error { message } => println!("error: {message}"),
+                    AgentEvent::Done => println!("done"),
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("agent error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn working_directory() -> std::path::PathBuf {
+    env::current_dir().unwrap_or_else(|error| {
+        eprintln!("failed to resolve the working directory: {error}");
+        std::process::exit(2);
+    })
 }
