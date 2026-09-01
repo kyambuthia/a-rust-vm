@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101010">
+    <meta name="description" content="A/RVM — a tiny Rust virtual machine running in WebAssembly.">
+    <title>A/RVM</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="terminal-page">
+      <section class="terminal-window" id="terminal-window" aria-label="A/RVM terminal">
+        <header class="terminal-bar">
+          <div class="terminal-identity">
+            <span class="terminal-mark" aria-hidden="true">𝒂</span>
+            <span>a/rvm</span>
+            <span class="terminal-version">v0.1.0 · Run /help for commands</span>
+          </div>
+          <div class="terminal-actions">
+            <span class="runtime-badge" id="runtime-badge" data-state="loading">
+              <span class="runtime-dot" aria-hidden="true"></span>
+              <span id="runtime-label">loading runtime</span>
+            </span>
+            <button class="expand-button" id="expand-terminal" type="button" aria-expanded="false" aria-controls="terminal-body">expand ↗</button>
+          </div>
+        </header>
+
+        <div class="terminal-body" id="terminal-body">
+          <div class="terminal-output" id="terminal-output" role="log" aria-live="polite" aria-label="A/RVM terminal output"></div>
+          <form class="terminal-form" id="terminal-form">
+            <label class="prompt" for="terminal-input">›</label>
+            <input id="terminal-input" name="command" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Terminal input" placeholder="run 8 * 5" disabled>
+            <button type="submit" class="sr-only">Run command</button>
+          </form>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
