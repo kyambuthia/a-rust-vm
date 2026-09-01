@@ -5,6 +5,8 @@
 
 pub mod agent;
 pub mod guest_tools;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod persistent_model;
 pub mod runtime;
 pub mod session;
 pub mod workspace;

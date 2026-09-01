@@ -51,9 +51,29 @@ async function uploadFiles(files) {
         throw new Error(payload.error ?? `upload failed: ${response.status}`);
       }
       writeLine(`[uploaded] ${payload.path} · ${payload.bytes} bytes`, "result");
+      await listGuestFiles();
     } catch (error) {
       writeLine(`[upload error] ${file.name}: ${error.message}`, "error");
     }
+  }
+}
+
+async function listGuestFiles() {
+  try {
+    const response = await fetch("../api/files");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error ?? `file listing failed: ${response.status}`);
+    }
+    if (!payload.files?.length) {
+      writeLine("[guest] no uploaded files", "muted");
+      return;
+    }
+    for (const file of payload.files) {
+      writeLine(`[guest] ${file.path} · ${file.bytes} bytes`, "muted");
+    }
+  } catch (error) {
+    writeLine(`[guest files error] ${error.message}`, "error");
   }
 }
 
@@ -322,6 +342,7 @@ function executeCommand(rawCommand, instance) {
   if (normalized === "/help" || normalized === "help") {
     writeLine("commands:", "result");
     writeLine("  /ask <prompt>         ask the server-side LLM agent");
+    writeLine("  /files                list files in the guest VM");
     writeLine("  /load <a> <op> <b>  load a program");
     writeLine("  /disassemble         inspect loaded bytecode");
     writeLine("  /step                execute one instruction");
@@ -338,6 +359,11 @@ function executeCommand(rawCommand, instance) {
     const pointer = instance.exports.debug_instruction_pointer();
     writeLine(`[status] wasm online · program: ${loaded} · ip: ${pointer}`, "result");
     writeLine(`[status] stack: ${formatStack(instance)}`);
+    return;
+  }
+
+  if (normalized === "/files" || normalized === "files") {
+    void listGuestFiles();
     return;
   }
 

@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{Agent, AgentEvent, ModelCapabilities, ModelRouter, ProcessModel, RouteRequest};
+use crate::agent::{Agent, AgentEvent, ModelCapabilities, ModelRouter, RouteRequest};
 use crate::guest_tools::{SharedGuestVm, guest_coding_tool_registry_shared};
+use crate::persistent_model::PersistentModelService;
 use crate::runtime::VmInstance;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -34,6 +35,17 @@ struct UploadRequest {
 struct UploadResponse {
     path: String,
     bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GuestFile {
+    path: String,
+    bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GuestFilesResponse {
+    files: Vec<GuestFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +74,7 @@ struct ApprovalStore {
 struct ServerState {
     approvals: Arc<ApprovalStore>,
     guest_vm: SharedGuestVm,
-    model_directory: PathBuf,
+    model_service: Arc<PersistentModelService>,
 }
 
 impl Default for ApprovalStore {
@@ -156,10 +168,16 @@ pub fn run(root: PathBuf) {
     println!("Agent endpoint: http://127.0.0.1:{port}/api/agent");
     println!("Upload endpoint: http://127.0.0.1:{port}/api/upload");
     println!("Approval endpoint: http://127.0.0.1:{port}/api/approval");
+    let model_service = Arc::new(
+        PersistentModelService::start(&model_directory).unwrap_or_else(|error| {
+            eprintln!("failed to start persistent model service: {error}");
+            std::process::exit(2);
+        }),
+    );
     let state = ServerState {
         approvals: Arc::new(ApprovalStore::default()),
         guest_vm: Arc::new(Mutex::new(VmInstance::new("browser"))),
-        model_directory,
+        model_service,
     };
 
     for stream in listener.incoming() {
@@ -216,6 +234,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         ),
         ("POST", "/api/agent") => handle_agent(&mut stream, root, &request.body, state),
         ("POST", "/api/upload") => handle_upload(&mut stream, &request.body, state),
+        ("GET", "/api/files") => handle_files(&mut stream, state),
         ("POST", "/api/approval") => handle_approval(&mut stream, &request.body, &state.approvals),
         _ => write_response(&mut stream, 404, "text/plain; charset=utf-8", b"not found"),
     }
@@ -307,19 +326,12 @@ fn handle_agent(stream: &mut TcpStream, _root: &Path, body: &[u8], state: &Serve
         }
     };
 
-    let model_program = env::current_exe().unwrap_or_else(|error| {
-        let body = format!(r#"{{"error":"failed to resolve model bridge: {error}"}}"#);
-        write_response(stream, 500, "application/json", body.as_bytes());
-        std::process::exit(1);
-    });
-    let model_name = env::var("A_RVM_MODEL_NAME").unwrap_or_else(|_| "configured".to_owned());
-    let model = ProcessModel::new(model_program)
-        .with_arguments(["model-bridge"])
-        .with_working_directory(state.model_directory.clone());
+    let model_name = "guest";
+    let model = state.model_service.model.clone();
     let mut router = ModelRouter::new();
     if let Err(error) = router
-        .register_model(&model_name, ModelCapabilities::STREAMING_TOOLS, model)
-        .and_then(|_| router.set_default(&model_name))
+        .register_model(model_name, ModelCapabilities::STREAMING_TOOLS, model)
+        .and_then(|_| router.set_default(model_name))
     {
         let body = format!(r#"{{"error":"failed to configure model route: {error}"}}"#);
         write_response(stream, 500, "application/json", body.as_bytes());
@@ -412,6 +424,38 @@ fn handle_upload(stream: &mut TcpStream, body: &[u8], state: &ServerState) {
         Ok(body) => write_response(stream, 200, "application/json", &body),
         Err(error) => {
             let body = format!(r#"{{"error":"failed to encode upload response: {error}"}}"#);
+            write_response(stream, 500, "application/json", body.as_bytes());
+        }
+    }
+}
+
+fn handle_files(stream: &mut TcpStream, state: &ServerState) {
+    let vm = match state.guest_vm.lock() {
+        Ok(vm) => vm,
+        Err(_) => {
+            write_response(
+                stream,
+                500,
+                "application/json",
+                br#"{"error":"guest VM lock is poisoned"}"#,
+            );
+            return;
+        }
+    };
+    let files = vm
+        .list_dir("/workspace/uploads")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| matches!(entry.kind, crate::runtime::EntryKind::File))
+        .map(|entry| GuestFile {
+            path: format!("/workspace/uploads/{}", entry.name),
+            bytes: entry.size,
+        })
+        .collect();
+    match serde_json::to_vec(&GuestFilesResponse { files }) {
+        Ok(body) => write_response(stream, 200, "application/json", &body),
+        Err(error) => {
+            let body = format!(r#"{{"error":"failed to encode guest files: {error}"}}"#);
             write_response(stream, 500, "application/json", body.as_bytes());
         }
     }

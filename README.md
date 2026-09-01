@@ -56,6 +56,12 @@ file, and accept only a single filename component. The browser agent uses the
 same process-lifetime guest VM, so it can inspect uploaded files without
 receiving a host filesystem path.
 
+Use `/files` to list the uploaded guest files independently of the agent. The
+browser host keeps one local, fixed-model session warm for its lifetime, which
+lets follow-up requests reuse provider context. The local model service runs
+against an empty temporary project with its built-in tools denied; browser
+requests retain access only to the guest-prefixed A/RVM tools.
+
 The local browser server currently creates one guest VM per server process and
 binds to loopback. Authenticated multi-user VM selection is not wired into the
 browser protocol yet. Host workspace tools remain available to native coding
