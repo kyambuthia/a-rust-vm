@@ -3,6 +3,8 @@
 //! Programs are represented as a sequence of [`Instruction`] values. The VM
 //! evaluates them from left to right and leaves the result on its value stack.
 
+pub mod agent;
+
 /// The instructions understood by the VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instruction {
