@@ -31,6 +31,7 @@ The VM, debugger, language, and LLVM work remain first-class features.
 - [x] Permission runtime for guarded workspace actions
 - [x] Persistent session primitives
 - [x] Browser event streaming and approval handoff for guarded tools
+- [x] Browser upload into a bounded guest filesystem
 - [ ] Skills, MCP, subagents, and ACP
 
 ## Feature parity matrix

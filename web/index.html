@@ -7,7 +7,7 @@
     <meta name="description" content="A/RVM — a tiny Rust virtual machine running in WebAssembly.">
     <title>A/RVM</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="./styles.css?v=agent-2">
+    <link rel="stylesheet" href="./styles.css?v=agent-3">
   </head>
   <body>
     <main class="terminal-page">
@@ -23,6 +23,8 @@
               <span class="runtime-dot" aria-hidden="true"></span>
               <span id="runtime-label">loading runtime</span>
             </span>
+            <label class="upload-button" for="file-input">upload</label>
+            <input id="file-input" class="upload-input" type="file" multiple aria-label="Upload files to the guest VM">
             <button class="expand-button" id="expand-terminal" type="button" aria-expanded="false" aria-controls="terminal-body">expand ↗</button>
           </div>
         </header>
@@ -38,6 +40,6 @@
       </section>
     </main>
 
-    <script type="module" src="./main.js?v=agent-2"></script>
+    <script type="module" src="./main.js?v=agent-3"></script>
   </body>
 </html>

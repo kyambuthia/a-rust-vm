@@ -47,12 +47,19 @@ cargo build --target wasm32-unknown-unknown --lib
 cargo run -- serve
 ```
 
-Open `http://127.0.0.1:8080/web/`. Natural-language input goes to the agent;
-VM expressions and slash commands remain available alongside it. Agent events
-arrive as newline-delimited JSON while the turn is running. If a guarded tool
-is requested, the browser asks for approval and posts the decision to the
-local approval endpoint. Model access, workspace tools, and permission policy
-remain native-only.
+Open `http://127.0.0.1:8080/web/`. Natural-language input goes to the
+server-side agent; VM expressions and slash commands remain available
+alongside it. Agent events arrive as newline-delimited JSON while the turn is
+running. Use the `upload` control to copy files into the guest VM at
+`/workspace/uploads/<filename>`. Uploads are binary-safe, limited to 1 MiB per
+file, and accept only a single filename component. The browser agent uses the
+same process-lifetime guest VM, so it can inspect uploaded files without
+receiving a host filesystem path.
+
+The local browser server currently creates one guest VM per server process and
+binds to loopback. Authenticated multi-user VM selection is not wired into the
+browser protocol yet. Host workspace tools remain available to native coding
+workflows, but are not registered with the browser guest agent.
 
 ## Run the interactive terminal agent
 

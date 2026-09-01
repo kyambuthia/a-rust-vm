@@ -9,6 +9,9 @@ const terminalInput = document.querySelector("#terminal-input");
 const expandButton = document.querySelector("#expand-terminal");
 const runtimeBadge = document.querySelector("#runtime-badge");
 const runtimeLabel = document.querySelector("#runtime-label");
+const fileInput = document.querySelector("#file-input");
+
+const maxUploadBytes = 1024 * 1024;
 
 const state = {
   program: null,
@@ -26,8 +29,39 @@ function writeLine(text, kind = "muted") {
 function printWelcome() {
   writeLine("a/rvm v0.1.0 · Run /help for commands");
   writeLine("[ready] wasm runtime online", "result");
-  writeLine("[hint] ask anything · /load 2 + 3 · /step", "muted");
+  writeLine("[hint] ask anything · upload files · /load 2 + 3", "muted");
 }
+
+async function uploadFiles(files) {
+  for (const file of files) {
+    if (file.size > maxUploadBytes) {
+      writeLine(`[upload error] ${file.name} exceeds the 1 MiB limit`, "error");
+      continue;
+    }
+
+    try {
+      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+      const response = await fetch("../api/upload", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: file.name, bytes }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error ?? `upload failed: ${response.status}`);
+      }
+      writeLine(`[uploaded] ${payload.path} · ${payload.bytes} bytes`, "result");
+    } catch (error) {
+      writeLine(`[upload error] ${file.name}: ${error.message}`, "error");
+    }
+  }
+}
+
+fileInput.addEventListener("change", () => {
+  const files = Array.from(fileInput.files ?? []);
+  fileInput.value = "";
+  void uploadFiles(files);
+});
 
 function printAgentEvent(event) {
   switch (event.type) {

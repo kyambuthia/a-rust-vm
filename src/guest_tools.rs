@@ -4,8 +4,7 @@
 //! every path and process operation is resolved by the guest runtime. They do
 //! not invoke a host shell or read the host filesystem.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::agent::{Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ToolValue};
 use crate::runtime::{
@@ -13,11 +12,16 @@ use crate::runtime::{
     WaitStatus,
 };
 
-type SharedGuest = Rc<RefCell<VmInstance>>;
+/// Shared handle used when multiple server requests target one guest VM.
+pub type SharedGuestVm = Arc<Mutex<VmInstance>>;
 
 /// Register tools that operate only inside the supplied guest VM.
 pub fn guest_tool_registry(vm: VmInstance) -> Result<ToolRegistry, ToolError> {
-    let vm = Rc::new(RefCell::new(vm));
+    guest_tool_registry_shared(Arc::new(Mutex::new(vm)))
+}
+
+/// Register guest tools against a VM that persists across requests.
+pub fn guest_tool_registry_shared(vm: SharedGuestVm) -> Result<ToolRegistry, ToolError> {
     let mut registry = ToolRegistry::default();
 
     registry.register(GuestListFilesTool::new(vm.clone()))?;
@@ -34,17 +38,22 @@ pub fn guest_tool_registry(vm: VmInstance) -> Result<ToolRegistry, ToolError> {
 
 /// Compose the arithmetic VM tools with the isolated guest tools.
 pub fn guest_coding_tool_registry(vm: VmInstance) -> Result<ToolRegistry, ToolError> {
+    guest_coding_tool_registry_shared(Arc::new(Mutex::new(vm)))
+}
+
+/// Compose the arithmetic VM tools with a shared isolated guest VM.
+pub fn guest_coding_tool_registry_shared(vm: SharedGuestVm) -> Result<ToolRegistry, ToolError> {
     let mut registry = crate::agent::vm_tool_registry()?;
-    registry.merge(guest_tool_registry(vm)?)?;
+    registry.merge(guest_tool_registry_shared(vm)?)?;
     Ok(registry)
 }
 
 struct GuestListFilesTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestListFilesTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -61,18 +70,18 @@ impl Tool for GuestListFilesTool {
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &["path"])?;
         let path = optional_text(arguments, "path").unwrap_or("/");
-        let vm = self.vm.borrow();
+        let vm = lock_guest(&self.vm)?;
         let entries = vm.list_dir(path).map_err(runtime_error)?;
         Ok(format_entries(&entries))
     }
 }
 
 struct GuestReadFileTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestReadFileTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -89,16 +98,16 @@ impl Tool for GuestReadFileTool {
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &["path"])?;
         let path = required_text(arguments, "path")?;
-        self.vm.borrow().read_text(path).map_err(runtime_error)
+        lock_guest(&self.vm)?.read_text(path).map_err(runtime_error)
     }
 }
 
 struct GuestWriteFileTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestWriteFileTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -117,8 +126,7 @@ impl Tool for GuestWriteFileTool {
         let path = required_text(arguments, "path")?;
         let content = required_text_allow_empty(arguments, "content")?;
         let byte_count = content.len();
-        self.vm
-            .borrow_mut()
+        lock_guest_mut(&self.vm)?
             .write_file(path, content)
             .map_err(runtime_error)?;
         Ok(format!("wrote {byte_count} bytes to guest:{path}"))
@@ -126,11 +134,11 @@ impl Tool for GuestWriteFileTool {
 }
 
 struct GuestMakeDirectoryTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestMakeDirectoryTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -148,8 +156,7 @@ impl Tool for GuestMakeDirectoryTool {
         ensure_arguments(arguments, &["path", "recursive"])?;
         let path = required_text(arguments, "path")?;
         let recursive = optional_bool(arguments, "recursive").unwrap_or(false);
-        self.vm
-            .borrow_mut()
+        lock_guest_mut(&self.vm)?
             .mkdir(path, recursive)
             .map_err(runtime_error)?;
         Ok(format!("created guest directory {path}"))
@@ -157,11 +164,11 @@ impl Tool for GuestMakeDirectoryTool {
 }
 
 struct GuestSpawnTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestSpawnTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -180,9 +187,7 @@ impl Tool for GuestSpawnTool {
         let source = required_text(arguments, "program")?;
         let program = crate::agent::parse_program(source)?;
         let argv = optional_string_list(arguments, "argv")?;
-        let pid = self
-            .vm
-            .borrow_mut()
+        let pid = lock_guest_mut(&self.vm)?
             .spawn(None, program, argv)
             .map_err(runtime_error)?;
         Ok(format!("spawned guest process pid={pid}"))
@@ -190,11 +195,11 @@ impl Tool for GuestSpawnTool {
 }
 
 struct GuestTickTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestTickTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -210,7 +215,7 @@ impl Tool for GuestTickTool {
 
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &[])?;
-        let event = self.vm.borrow_mut().tick();
+        let event = lock_guest_mut(&self.vm)?.tick();
         Ok(event
             .map(|event| format_event(&event))
             .unwrap_or_else(|| "guest scheduler idle".to_owned()))
@@ -218,11 +223,11 @@ impl Tool for GuestTickTool {
 }
 
 struct GuestRunTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestRunTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -247,9 +252,7 @@ impl Tool for GuestRunTool {
                 "argument 'max_ticks' must be a positive integer",
             ));
         }
-        let events = self
-            .vm
-            .borrow_mut()
+        let events = lock_guest_mut(&self.vm)?
             .run_until_idle(max_ticks)
             .map_err(runtime_error)?;
         if events.is_empty() {
@@ -265,11 +268,11 @@ impl Tool for GuestRunTool {
 }
 
 struct GuestProcessListTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestProcessListTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -285,7 +288,7 @@ impl Tool for GuestProcessListTool {
 
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &[])?;
-        let vm = self.vm.borrow();
+        let vm = lock_guest(&self.vm)?;
         let processes = vm.processes();
         if processes.is_empty() {
             return Ok("(no guest processes)".to_owned());
@@ -299,11 +302,11 @@ impl Tool for GuestProcessListTool {
 }
 
 struct GuestWaitTool {
-    vm: SharedGuest,
+    vm: SharedGuestVm,
 }
 
 impl GuestWaitTool {
-    fn new(vm: SharedGuest) -> Self {
+    fn new(vm: SharedGuestVm) -> Self {
         Self { vm }
     }
 }
@@ -320,13 +323,22 @@ impl Tool for GuestWaitTool {
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &["pid"])?;
         let pid = required_pid(arguments, "pid")?;
-        let status = self.vm.borrow().wait(pid).map_err(runtime_error)?;
+        let status = lock_guest(&self.vm)?.wait(pid).map_err(runtime_error)?;
         Ok(format_wait_status(&status))
     }
 }
 
 fn runtime_error(error: RuntimeError) -> ToolError {
     ToolError::new(error.to_string())
+}
+
+fn lock_guest(vm: &SharedGuestVm) -> Result<MutexGuard<'_, VmInstance>, ToolError> {
+    vm.lock()
+        .map_err(|_| ToolError::new("guest VM lock is poisoned"))
+}
+
+fn lock_guest_mut(vm: &SharedGuestVm) -> Result<MutexGuard<'_, VmInstance>, ToolError> {
+    lock_guest(vm)
 }
 
 fn format_entries(entries: &[DirectoryEntry]) -> String {

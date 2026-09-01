@@ -119,6 +119,24 @@ input:focus-visible {
   font-size: 0.62rem;
 }
 
+.upload-button {
+  color: var(--muted);
+  font-size: 0.62rem;
+  cursor: pointer;
+}
+
+.upload-button:hover {
+  color: var(--text);
+}
+
+.upload-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .expand-button:hover {
   color: var(--text);
 }
