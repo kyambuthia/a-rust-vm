@@ -23,11 +23,14 @@ The VM, debugger, language, and LLVM work remain first-class features.
 - [x] Workspace list, read, search, write, and command tools
 - [x] Workspace containment checks and approval-aware guarded tools
 - [x] Local session persistence primitives with atomic saves
-- [ ] LLM provider integration
-- [ ] Agent turn loop
-- [ ] Workspace and file tools
-- [ ] Permission runtime
-- [ ] Persistent sessions
+- [x] Deterministic model router with profile selection, capability checks, and
+  pre-output fallback
+- [x] Agent turn loop with bounded tool execution and streamed output
+- [x] Workspace and file tools
+- [x] Guest-only tool adapter for isolated filesystem and process operations
+- [x] Permission runtime for guarded workspace actions
+- [x] Persistent session primitives
+- [x] Browser event streaming and approval handoff for guarded tools
 - [ ] Skills, MCP, subagents, and ACP
 
 ## Feature parity matrix
@@ -38,8 +41,9 @@ The VM, debugger, language, and LLVM work remain first-class features.
   results, permissions, errors, and turn completion
 - [x] Provider-neutral model interface with streaming text and tool calls
 - [ ] Server-side credential boundary; no provider secrets in browser code
-- [ ] System prompt and project-instruction loading
-- [ ] Conversation state and bounded context assembly
+- [x] Deterministic route request carried through the model boundary
+- [x] System prompt and project-instruction loading
+- [x] Conversation state and bounded context assembly
 - [x] Tool registry with JSON schemas and deterministic dispatch
 - [ ] Cancellation, timeouts, retry limits, and maximum agent steps
 - [ ] Machine-readable JSON output alongside terminal text output
@@ -51,7 +55,7 @@ The VM, debugger, language, and LLVM work remain first-class features.
 - [ ] Multiline input and interrupt with Escape/Ctrl-C
 - [ ] Slash-command menu and command categories
 - [ ] Interactive `ask` mode and non-interactive one-shot mode
-- [ ] Model selection and fast-mode controls
+- [x] Model selection and fast-mode controls
 - [ ] Status, version, doctor, usage, and credits commands
 - [ ] Clean output mode for scripts and automation
 - [ ] Completion behavior and terminal notifications
@@ -85,12 +89,17 @@ The VM, debugger, language, and LLVM work remain first-class features.
 
 - [ ] Program object with bytecode validation
 - [ ] Disassembler and stable instruction names
-- [ ] Structured execution trace and replayable VM tape
+- [x] Structured execution trace for agent-visible program runs
 - [ ] Constants, booleans, comparisons, and unary operations
 - [ ] Locals and variable storage
 - [ ] Conditional jumps and loops
 - [ ] Call frames, functions, and return values
 - [ ] Runtime limits for stack depth, program size, and execution steps
+- [x] Per-instance virtual filesystem with guest path containment and quotas
+- [x] Guest processes with deterministic round-robin scheduling
+- [x] Ownership-scoped in-memory VM manager API
+- [ ] VM manager with authenticated ownership and lifecycle controls
+- [ ] Host sandbox worker for native programs and external capabilities
 - [ ] Small source language with lexer, parser, AST, and compiler
 - [ ] Browser API for loading arbitrary validated programs
 - [ ] LLVM backend for optimized native and WebAssembly execution
@@ -109,12 +118,12 @@ The VM, debugger, language, and LLVM work remain first-class features.
 
 ### P2: Agent-aware VM experience
 
-- [ ] `run_program` tool with typed bytecode input
-- [ ] `compile_program` tool for source-language input
-- [ ] `step_vm` tool with instruction-pointer and stack result
-- [ ] `inspect_vm` tool for stack, locals, frames, and memory
-- [ ] `disassemble_program` tool
-- [ ] `reset_vm` tool
+- [x] `run_program` tool with validated assembly input
+- [x] `compile_program` tool for validated assembly input
+- [x] `step_vm` tool with instruction-pointer and stack result
+- [x] `inspect_vm` tool for stack, locals, frames, and memory
+- [x] `disassemble_program` tool
+- [x] `reset_vm` tool
 - [ ] LLM explanations grounded in actual VM tool results
 - [ ] LLM-generated programs validated before execution
 - [ ] Program history and named experiments in the terminal

@@ -14,17 +14,64 @@ cargo run
 cargo run -- agent-demo
 ```
 
+To exercise the agent's compile and trace workflow offline:
+
+```bash
+cargo run -- runtime-demo
+```
+
+To exercise isolated guest filesystems and guest processes:
+
+```bash
+cargo run -- guest-demo
+```
+
+The guest tool adapter is available to embedders through
+`guest_tools::guest_tool_registry`. It exposes guest-prefixed filesystem and
+process tools backed by an in-memory `VmInstance`; these tools do not read the
+host workspace or invoke a host shell. The host must create the instance for
+the authenticated user and session before handing the registry to an agent.
+
 To exercise the coding-agent tools against this workspace:
 
 ```bash
 cargo run -- coding-demo
 ```
 
-## Connect a model process
+## Run the browser agent
 
-The native agent command launches the executable named by
-`A_RVM_MODEL_PROGRAM`. It sends one JSON request to the child process on
-stdin. The child writes one JSON event per line to stdout.
+Build the Wasm runtime and start the local browser host:
+
+```bash
+cargo build --target wasm32-unknown-unknown --lib
+cargo run -- serve
+```
+
+Open `http://127.0.0.1:8080/web/`. Natural-language input goes to the agent;
+VM expressions and slash commands remain available alongside it. Agent events
+arrive as newline-delimited JSON while the turn is running. If a guarded tool
+is requested, the browser asks for approval and posts the decision to the
+local approval endpoint. Model access, workspace tools, and permission policy
+remain native-only.
+
+## Run the interactive terminal agent
+
+With the local model runner installed and authenticated, the interactive agent
+starts without extra bridge configuration:
+
+```bash
+cargo run -- agent
+```
+
+Set `A_RVM_OPENCODE_MODEL` to choose a specific model. The built-in bridge
+only forwards requests and structured responses; credentials remain in the
+runner's protected configuration.
+
+## Connect an external model process
+
+The native agent command can launch an external executable named by
+`A_RVM_MODEL_PROGRAM`. It sends one JSON request to the child process on stdin.
+The child writes one JSON event per line to stdout.
 
 ```bash
 A_RVM_MODEL_PROGRAM=/path/to/model-bridge \
@@ -33,6 +80,15 @@ cargo run -- agent
 ```
 
 The request contains `prompt`, `tool_results`, and the available `tools`.
+It also contains a `route` object describing the requested model profile and
+required capabilities. The interactive command supports `/model <name>`,
+`/fast`, `/strong`, `/default`, and `/status` route controls. Set
+`A_RVM_MODEL_NAME` when the process should be addressed by a specific route
+name; it defaults to `configured`.
+Native agent requests also include the baseline system contract, the contents
+of a non-empty workspace `AGENTS.md` when present, and a bounded transcript of
+earlier turns. The transcript is kept in memory for the current process and
+does not write additional files.
 Supported response events are:
 
 ```json

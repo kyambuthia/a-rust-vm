@@ -7,7 +7,7 @@
     <meta name="description" content="A/RVM — a tiny Rust virtual machine running in WebAssembly.">
     <title>A/RVM</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./styles.css?v=agent-2">
   </head>
   <body>
     <main class="terminal-page">
@@ -31,13 +31,13 @@
           <div class="terminal-output" id="terminal-output" role="log" aria-live="polite" aria-label="A/RVM terminal output"></div>
           <form class="terminal-form" id="terminal-form">
             <label class="prompt" for="terminal-input">›</label>
-            <input id="terminal-input" name="command" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Terminal input" placeholder="run 8 * 5" disabled>
+            <input id="terminal-input" name="command" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Terminal input" placeholder="ask the agent or run 8 * 5" disabled>
             <button type="submit" class="sr-only">Run command</button>
           </form>
         </div>
       </section>
     </main>
 
-    <script type="module" src="./main.js"></script>
+    <script type="module" src="./main.js?v=agent-2"></script>
   </body>
 </html>

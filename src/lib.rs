@@ -4,8 +4,13 @@
 //! evaluates them from left to right and leaves the result on its value stack.
 
 pub mod agent;
+pub mod guest_tools;
+pub mod runtime;
 pub mod session;
 pub mod workspace;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod server;
 
 /// The instructions understood by the VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

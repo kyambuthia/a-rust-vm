@@ -12,6 +12,7 @@ const runtimeLabel = document.querySelector("#runtime-label");
 
 const state = {
   program: null,
+  agentBusy: false,
 };
 
 function writeLine(text, kind = "muted") {
@@ -25,7 +26,101 @@ function writeLine(text, kind = "muted") {
 function printWelcome() {
   writeLine("a/rvm v0.1.0 · Run /help for commands");
   writeLine("[ready] wasm runtime online", "result");
-  writeLine("[hint] try: /load 2 + 3 · /step", "muted");
+  writeLine("[hint] ask anything · /load 2 + 3 · /step", "muted");
+}
+
+function printAgentEvent(event) {
+  switch (event.type) {
+    case "assistant_text":
+      writeLine(event.content, "result");
+      break;
+    case "assistant_delta":
+      writeLine(event.content, "result");
+      break;
+    case "tool_call":
+      writeLine(`[tool] ${event.name}`, "command");
+      break;
+    case "tool_result":
+      writeLine(`[tool result] ${event.content}`, event.is_error ? "error" : "muted");
+      break;
+    case "permission_requested":
+      writeLine(`[permission] ${event.description}`, "error");
+      break;
+    case "error":
+      writeLine(`[error] ${event.message}`, "error");
+      break;
+    default:
+      break;
+  }
+}
+
+async function askAgent(prompt) {
+  state.agentBusy = true;
+  terminalInput.disabled = true;
+  writeLine("[agent] thinking...", "muted");
+  try {
+    const response = await fetch("../api/agent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error ?? `agent request failed: ${response.status}`);
+    }
+
+    if (!response.body) {
+      throw new Error("agent response did not provide a stream");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      pending += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) {
+          continue;
+        }
+        const event = JSON.parse(line);
+        printAgentEvent(event);
+        if (event.type === "permission_requested") {
+          await answerApproval(event);
+        }
+      }
+      if (done) {
+        break;
+      }
+    }
+    if (pending.trim()) {
+      printAgentEvent(JSON.parse(pending));
+    }
+  } catch (error) {
+    writeLine(`[agent error] ${error.message}`, "error");
+  } finally {
+    state.agentBusy = false;
+    terminalInput.disabled = false;
+    terminalInput.focus();
+  }
+}
+
+async function answerApproval(request) {
+  const allowed = window.confirm(`Allow ${request.description}?`);
+  const response = await fetch("../api/approval", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      id: request.id,
+      decision: allowed ? "allow" : "deny",
+    }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error ?? `approval request failed: ${response.status}`);
+  }
 }
 
 function parseExpression(command) {
@@ -192,6 +287,7 @@ function executeCommand(rawCommand, instance) {
 
   if (normalized === "/help" || normalized === "help") {
     writeLine("commands:", "result");
+    writeLine("  /ask <prompt>         ask the server-side LLM agent");
     writeLine("  /load <a> <op> <b>  load a program");
     writeLine("  /disassemble         inspect loaded bytecode");
     writeLine("  /step                execute one instruction");
@@ -250,10 +346,30 @@ function executeCommand(rawCommand, instance) {
     return;
   }
 
+  if (normalized === "/ask" || normalized === "ask") {
+    writeLine("[error] usage: /ask <prompt>", "error");
+    return;
+  }
+
+  if (normalized.startsWith("/ask ") || normalized.startsWith("ask ")) {
+    const prefixLength = normalized.startsWith("/ask ") ? 5 : 4;
+    const prompt = command.slice(prefixLength).trim();
+    if (prompt) {
+      void askAgent(prompt);
+    } else {
+      writeLine("[error] usage: /ask <prompt>", "error");
+    }
+    return;
+  }
+
   const parsed = parseExpression(command);
 
   if (!parsed) {
-    writeLine("[error] unknown command. Try /help", "error");
+    if (command.startsWith("/")) {
+      writeLine("[error] unknown slash command. Use plain text to ask the agent, or try /help", "error");
+    } else {
+      void askAgent(command);
+    }
     return;
   }
 
@@ -266,6 +382,9 @@ function executeCommand(rawCommand, instance) {
 }
 
 function submitCommand(instance, command) {
+  if (state.agentBusy) {
+    return;
+  }
   const trimmedCommand = command.trim();
 
   if (!trimmedCommand) {

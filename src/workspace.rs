@@ -600,11 +600,12 @@ mod tests {
             .collect(),
         );
         let request = registry.permission_request(&call).unwrap();
+        assert_eq!(request.id, "write-1:write_file:new.txt");
         assert_eq!(request.tool, "write_file");
         assert!(request.description.contains("new.txt"));
 
         let coding = coding_tool_registry(&root).unwrap();
-        assert_eq!(coding.specs().len(), 10);
+        assert_eq!(coding.specs().len(), 12);
         std::fs::remove_dir_all(root).unwrap();
     }
 
