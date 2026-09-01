@@ -5,9 +5,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct ApprovalStore {
 struct ServerState {
     approvals: Arc<ApprovalStore>,
     guest_vm: SharedGuestVm,
+    model_directory: PathBuf,
 }
 
 impl Default for ApprovalStore {
@@ -146,6 +148,10 @@ pub fn run(root: PathBuf) {
         eprintln!("failed to bind browser host on port {port}: {error}");
         std::process::exit(2);
     });
+    let model_directory = create_model_working_directory().unwrap_or_else(|error| {
+        eprintln!("failed to create model runner directory: {error}");
+        std::process::exit(2);
+    });
     println!("A/RVM browser host: http://127.0.0.1:{port}/web/");
     println!("Agent endpoint: http://127.0.0.1:{port}/api/agent");
     println!("Upload endpoint: http://127.0.0.1:{port}/api/upload");
@@ -153,6 +159,7 @@ pub fn run(root: PathBuf) {
     let state = ServerState {
         approvals: Arc::new(ApprovalStore::default()),
         guest_vm: Arc::new(Mutex::new(VmInstance::new("browser"))),
+        model_directory,
     };
 
     for stream in listener.incoming() {
@@ -308,7 +315,7 @@ fn handle_agent(stream: &mut TcpStream, _root: &Path, body: &[u8], state: &Serve
     let model_name = env::var("A_RVM_MODEL_NAME").unwrap_or_else(|_| "configured".to_owned());
     let model = ProcessModel::new(model_program)
         .with_arguments(["model-bridge"])
-        .with_working_directory(env::temp_dir());
+        .with_working_directory(state.model_directory.clone());
     let mut router = ModelRouter::new();
     if let Err(error) = router
         .register_model(&model_name, ModelCapabilities::STREAMING_TOOLS, model)
@@ -427,6 +434,46 @@ fn guest_upload_path(name: &str) -> Result<String, String> {
         return Err("file name contains a control character".to_owned());
     }
     Ok(format!("/workspace/uploads/{name}"))
+}
+
+fn create_model_working_directory() -> Result<PathBuf, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_nanos();
+    let base = env::temp_dir();
+    let process_id = std::process::id();
+
+    for attempt in 0..16 {
+        let path = base.join(format!(
+            "a-rust-vm-model-{process_id}-{timestamp}-{attempt}"
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                let output = Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&path)
+                    .output()
+                    .map_err(|error| {
+                        format!("failed to initialize model runner project: {error}")
+                    })?;
+                if !output.status.success() {
+                    let detail = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!(
+                        "failed to initialize model runner project: {}",
+                        detail.trim()
+                    ));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("failed to create model runner directory: {error}"));
+            }
+        }
+    }
+
+    Err("could not allocate a unique model runner directory".to_owned())
 }
 
 fn handle_approval(stream: &mut TcpStream, body: &[u8], approvals: &ApprovalStore) {

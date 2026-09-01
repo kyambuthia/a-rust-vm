@@ -12,6 +12,8 @@ use a_rust_vm::agent::{
 use a_rust_vm::workspace::coding_tool_registry;
 use a_rust_vm::{Instruction, Vm};
 
+const MODEL_ATTEMPTS: usize = 2;
+
 fn main() {
     if env::args().nth(1).as_deref() == Some("agent-demo") {
         run_agent_demo();
@@ -404,46 +406,56 @@ fn run_model_bridge() {
     );
 
     let binary = env::var_os("A_RVM_OPENCODE_BIN").unwrap_or_else(|| "opencode".into());
-    let mut command = Command::new(binary);
-    command
-        .args(["run", "--pure", "--format", "json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Ok(model) = env::var("A_RVM_OPENCODE_MODEL") {
-        command.args(["--model", model.as_str()]);
-    }
-    command.arg(instruction);
-
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) => {
-            eprintln!("failed to start local model runner: {error}");
-            std::process::exit(1);
-        }
-    };
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        eprintln!("local model runner failed: {}", error.trim());
-        std::process::exit(1);
-    }
-
-    let mut text = String::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(event) = serde_json::from_str::<RunnerEvent>(line) else {
-            continue;
-        };
-        if event.event_type == "text"
-            && let Some(chunk) = event.text.or_else(|| event.part.and_then(|part| part.text))
-        {
-            text.push_str(&chunk);
-        }
-    }
-
-    let response = parse_bridge_response(&text).unwrap_or_else(|error| {
-        eprintln!("local model returned an invalid A/RVM response: {error}");
+    let model = env::var("A_RVM_OPENCODE_MODEL").ok();
+    let working_directory = env::current_dir().unwrap_or_else(|error| {
+        eprintln!("failed to resolve model runner directory: {error}");
         std::process::exit(1);
     });
+    let response = (0..MODEL_ATTEMPTS)
+        .find_map(|attempt| {
+            let mut command = Command::new(&binary);
+            command
+                .args(["run", "--pure", "--format", "json", "--dir"])
+                .arg(&working_directory)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(model) = &model {
+                command.args(["--model", model.as_str()]);
+            }
+            command.arg(&instruction);
+
+            let output = match command.output() {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("failed to start local model runner: {error}");
+                    std::process::exit(1);
+                }
+            };
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr);
+                eprintln!("local model runner failed: {}", error.trim());
+                std::process::exit(1);
+            }
+
+            match parse_bridge_response(&collect_runner_text(&output.stdout)) {
+                Ok(response) => Some(response),
+                Err(error)
+                    if error == "model response was empty" && attempt + 1 < MODEL_ATTEMPTS =>
+                {
+                    eprintln!("local model returned no content; retrying");
+                    None
+                }
+                Err(error) => {
+                    eprintln!("local model returned an invalid A/RVM response: {error}");
+                    std::process::exit(1);
+                }
+            }
+        })
+        .unwrap_or_else(|| {
+            eprintln!("local model returned no content after {MODEL_ATTEMPTS} attempts");
+            std::process::exit(1);
+        });
     match response {
         BridgeResponse::Text { text } => {
             emit_bridge_event(serde_json::json!({"type": "text_delta", "text": text}));
@@ -462,6 +474,21 @@ fn run_model_bridge() {
         }
     }
     emit_bridge_event(serde_json::json!({"type": "done"}));
+}
+
+fn collect_runner_text(output: &[u8]) -> String {
+    let mut text = String::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let Ok(event) = serde_json::from_str::<RunnerEvent>(line) else {
+            continue;
+        };
+        if matches!(event.event_type.as_str(), "text" | "text_delta")
+            && let Some(chunk) = event.text.or_else(|| event.part.and_then(|part| part.text))
+        {
+            text.push_str(&chunk);
+        }
+    }
+    text
 }
 
 fn parse_bridge_response(text: &str) -> Result<BridgeResponse, String> {
@@ -509,7 +536,13 @@ fn parse_bridge_response(text: &str) -> Result<BridgeResponse, String> {
         }
     }
 
-    Err("expected a JSON text or tool_call response".to_owned())
+    if !trimmed.is_empty() {
+        return Ok(BridgeResponse::Text {
+            text: trimmed.to_owned(),
+        });
+    }
+
+    Err("model response was empty".to_owned())
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -596,7 +629,7 @@ fn working_directory() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeResponse, parse_bridge_response};
+    use super::{BridgeResponse, collect_runner_text, parse_bridge_response};
 
     #[test]
     fn parses_bridge_text_response() {
@@ -611,6 +644,28 @@ mod tests {
         assert!(matches!(
             parse_bridge_response(r#"{"type":"text_delta","text":"hello"}"#),
             Ok(BridgeResponse::Text { text }) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn collects_text_and_text_delta_runner_events() {
+        let output = br#"
+            {"type":"text_delta","text":"{\"kind\":\"text\",\"text\":"}
+            {"type":"text","part":{"text":"hello"}}
+            {"type":"done"}
+        "#;
+
+        assert_eq!(
+            collect_runner_text(output),
+            "{\"kind\":\"text\",\"text\":hello"
+        );
+    }
+
+    #[test]
+    fn accepts_plain_runner_text_when_the_model_skips_the_json_envelope() {
+        assert!(matches!(
+            parse_bridge_response("4"),
+            Ok(BridgeResponse::Text { text }) if text == "4"
         ));
     }
 }
