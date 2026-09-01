@@ -70,9 +70,9 @@ starts without extra bridge configuration:
 cargo run -- agent
 ```
 
-Set `A_RVM_OPENCODE_MODEL` to choose a specific model. The built-in bridge
-only forwards requests and structured responses; credentials remain in the
-runner's protected configuration.
+The built-in bridge uses `openrouter/deepseek/deepseek-v4-flash` as its fixed
+model. It only forwards requests and structured responses; credentials remain
+in the runner's protected configuration.
 
 ## Connect an external model process
 

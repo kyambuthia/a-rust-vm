@@ -337,7 +337,7 @@ fn handle_agent(stream: &mut TcpStream, _root: &Path, body: &[u8], state: &Serve
             }
         },
     )
-    .with_system_prompt(guest_system_prompt())
+    .with_system_prompt(guest_system_prompt(&state.guest_vm))
     .with_route_request(RouteRequest {
         requires_tools: true,
         ..RouteRequest::default()
@@ -522,11 +522,28 @@ fn write_event(stream: &mut TcpStream, event: &AgentEvent) {
     let _ = stream.flush();
 }
 
-fn guest_system_prompt() -> String {
-    format!(
+fn guest_system_prompt(guest_vm: &SharedGuestVm) -> String {
+    let mut prompt = format!(
         "{}\n\nYou are operating inside an isolated guest VM. Use guest-prefixed tools for all files and processes. Guest files are not host files; do not claim host workspace changes.",
         crate::agent::DEFAULT_SYSTEM_PROMPT
-    )
+    );
+    if let Ok(vm) = guest_vm.lock()
+        && let Ok(entries) = vm.list_dir("/workspace/uploads")
+        && !entries.is_empty()
+    {
+        prompt.push_str(
+            "\n\nUploaded guest files currently available (use guest_read_file with the exact path when asked about their contents):",
+        );
+        for entry in entries {
+            if matches!(entry.kind, crate::runtime::EntryKind::File) {
+                prompt.push_str(&format!(
+                    "\n- /workspace/uploads/{} ({} bytes)",
+                    entry.name, entry.size
+                ));
+            }
+        }
+    }
+    prompt
 }
 
 fn serve_file(stream: &mut TcpStream, root: &Path, relative_path: &str, content_type: &str) {
@@ -561,9 +578,10 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalReply, ApprovalStore, guest_upload_path};
+    use super::{ApprovalReply, ApprovalStore, guest_system_prompt, guest_upload_path};
     use crate::agent::PermissionDecision;
-    use std::sync::Arc;
+    use crate::runtime::VmInstance;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -605,5 +623,18 @@ mod tests {
         assert!(guest_upload_path("../notes.txt").is_err());
         assert!(guest_upload_path("nested/notes.txt").is_err());
         assert!(guest_upload_path("\\notes.txt").is_err());
+    }
+
+    #[test]
+    fn guest_prompt_names_uploaded_files_without_exposing_host_paths() {
+        let mut initial_vm = VmInstance::new("prompt");
+        initial_vm.mkdir("/workspace/uploads", true).unwrap();
+        initial_vm
+            .write_file("/workspace/uploads/rag_review.md", vec![b'x'; 3])
+            .unwrap();
+        let vm = Arc::new(Mutex::new(initial_vm));
+        let prompt = guest_system_prompt(&vm);
+        assert!(prompt.contains("/workspace/uploads/rag_review.md (3 bytes)"));
+        assert!(!prompt.contains("/home/"));
     }
 }

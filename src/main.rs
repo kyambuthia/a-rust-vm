@@ -13,6 +13,7 @@ use a_rust_vm::workspace::coding_tool_registry;
 use a_rust_vm::{Instruction, Vm};
 
 const MODEL_ATTEMPTS: usize = 2;
+const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash";
 
 fn main() {
     if env::args().nth(1).as_deref() == Some("agent-demo") {
@@ -406,7 +407,6 @@ fn run_model_bridge() {
     );
 
     let binary = env::var_os("A_RVM_OPENCODE_BIN").unwrap_or_else(|| "opencode".into());
-    let model = env::var("A_RVM_OPENCODE_MODEL").ok();
     let working_directory = env::current_dir().unwrap_or_else(|error| {
         eprintln!("failed to resolve model runner directory: {error}");
         std::process::exit(1);
@@ -420,9 +420,7 @@ fn run_model_bridge() {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if let Some(model) = &model {
-                command.args(["--model", model.as_str()]);
-            }
+            command.args(["--model", DEFAULT_MODEL]);
             command.arg(&instruction);
 
             let output = match command.output() {
