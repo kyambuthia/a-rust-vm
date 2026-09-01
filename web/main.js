@@ -10,6 +10,10 @@ const expandButton = document.querySelector("#expand-terminal");
 const runtimeBadge = document.querySelector("#runtime-badge");
 const runtimeLabel = document.querySelector("#runtime-label");
 
+const state = {
+  program: null,
+};
+
 function writeLine(text, kind = "muted") {
   const line = document.createElement("div");
   line.className = `terminal-line ${kind}`;
@@ -21,11 +25,11 @@ function writeLine(text, kind = "muted") {
 function printWelcome() {
   writeLine("a/rvm v0.1.0 · Run /help for commands");
   writeLine("[ready] wasm runtime online", "result");
-  writeLine("[hint] try: run 2 + 3", "muted");
+  writeLine("[hint] try: /load 2 + 3 · /step", "muted");
 }
 
 function parseExpression(command) {
-  const expression = command.replace(/^run\s+/i, "").trim();
+  const expression = command.replace(/^(?:\/?run|\/?load)\s+/i, "").trim();
   const match = expression.match(/^(-?\d+)\s*(\+|−|\*|×|\/|÷|-)\s*(-?\d+)$/);
 
   if (!match) {
@@ -48,12 +52,138 @@ function parseExpression(command) {
   return { left, right, operation: operationBySymbol[symbol], symbol };
 }
 
-function printHelp() {
-  writeLine("commands:", "result");
-  writeLine("  run <a> <op> <b>   execute bytecode");
-  writeLine("  /status             inspect the runtime");
-  writeLine("  /clear              clear terminal output");
-  writeLine("examples: run 2 + 3 · run 8 * 5 · run 20 / 4");
+function formatStack(instance) {
+  const length = instance.exports.debug_stack_len();
+
+  if (length < 0) {
+    return "[]";
+  }
+
+  const values = Array.from({ length }, (_, index) => instance.exports.debug_stack_at(index));
+  return `[${values.join(", ")}]`;
+}
+
+function instructionList(program) {
+  return [
+    `PUSH ${program.left}`,
+    `PUSH ${program.right}`,
+    program.operation.label,
+    "HALT",
+  ];
+}
+
+function printProgram(program) {
+  instructionList(program).forEach((instruction, index) => {
+    writeLine(`${String(index).padStart(2, "0")}  ${instruction}`);
+  });
+}
+
+function debugErrorMessage(code) {
+  const messages = {
+    "-1": "no program is loaded",
+    "-2": "program ended without HALT",
+    "-3": "stack underflow",
+    "-4": "division by zero",
+    "-5": "integer overflow",
+    "-6": "HALT reached with an empty stack",
+    "-7": "the VM is already halted",
+    "-8": "unknown operation",
+  };
+
+  return messages[code] ?? `VM error (${code})`;
+}
+
+function validateProgram(program) {
+  if (!Number.isInteger(program.left) || !Number.isInteger(program.right) || program.left < i32Min || program.left > i32Max || program.right < i32Min || program.right > i32Max) {
+    return "values must be whole numbers within the i32 range";
+  }
+
+  if (program.operation.code === 3 && program.right === 0) {
+    return "division by zero is not permitted";
+  }
+
+  return null;
+}
+
+function loadProgram(program, instance) {
+  const validationError = validateProgram(program);
+
+  if (validationError) {
+    writeLine(`[error] ${validationError}`, "error");
+    return false;
+  }
+
+  const result = instance.exports.debug_load_binary(program.left, program.right, program.operation.code);
+
+  if (result !== 0) {
+    writeLine(`[error] ${debugErrorMessage(result)}`, "error");
+    return false;
+  }
+
+  state.program = program;
+  writeLine(`[loaded] ${program.left} ${program.symbol} ${program.right} · 4 instructions`, "result");
+  return true;
+}
+
+function runLoadedProgram(instance) {
+  if (!state.program) {
+    writeLine("[error] no program is loaded. Try /load 8 * 5", "error");
+    return;
+  }
+
+  const resetResult = instance.exports.debug_reset();
+
+  if (resetResult !== 0) {
+    writeLine(`[error] ${debugErrorMessage(resetResult)}`, "error");
+    return;
+  }
+
+  writeLine(`[run] ${state.program.left} ${state.program.symbol} ${state.program.right}`, "command");
+
+  const instructions = instructionList(state.program);
+  let status = 0;
+  let steps = 0;
+
+  while (status === 0 && steps < instructions.length) {
+    status = instance.exports.debug_step();
+    const stack = formatStack(instance);
+    const instruction = instructions[steps] ?? "UNKNOWN";
+
+    if (status < 0) {
+      writeLine(`[error] ${debugErrorMessage(status)}`, "error");
+      return;
+    }
+
+    writeLine(`  ${String(steps).padStart(2, "0")}  ${instruction.padEnd(8)} stack: ${stack}`);
+    steps += 1;
+  }
+
+  if (status === 1) {
+    writeLine(`[result]  ${state.program.left} ${state.program.symbol} ${state.program.right} = ${formatStack(instance).replace(/[\[\]]/g, "")}`, "result");
+  }
+}
+
+function stepProgram(instance) {
+  if (!state.program) {
+    writeLine("[error] no program is loaded. Try /load 8 * 5", "error");
+    return;
+  }
+
+  const pointer = instance.exports.debug_instruction_pointer();
+  const instruction = instructionList(state.program)[pointer] ?? "UNKNOWN";
+  const status = instance.exports.debug_step();
+
+  if (status < 0) {
+    writeLine(`[error] ${debugErrorMessage(status)}`, "error");
+    return;
+  }
+
+  writeLine(`[step] ip ${pointer} · ${instruction}`, "command");
+  writeLine(`[stack] ${formatStack(instance)}`, "result");
+
+  if (status === 1) {
+    writeLine("[halt] program complete", "result");
+  }
 }
 
 function executeCommand(rawCommand, instance) {
@@ -61,18 +191,62 @@ function executeCommand(rawCommand, instance) {
   const normalized = command.toLowerCase();
 
   if (normalized === "/help" || normalized === "help") {
-    printHelp();
+    writeLine("commands:", "result");
+    writeLine("  /load <a> <op> <b>  load a program");
+    writeLine("  /disassemble         inspect loaded bytecode");
+    writeLine("  /step                execute one instruction");
+    writeLine("  /run                 run the loaded program");
+    writeLine("  /stack               inspect the current stack");
+    writeLine("  /reset               reset without unloading");
+    writeLine("  /clear               clear terminal output");
+    writeLine("examples: /load 2 + 3 · /load 8 * 5");
     return;
   }
 
   if (normalized === "/status" || normalized === "status") {
-    writeLine("[status] wasm online · target wasm32-unknown-unknown", "result");
-    writeLine("[status] value stack: i32", "muted");
+    const loaded = state.program ? "loaded" : "empty";
+    const pointer = instance.exports.debug_instruction_pointer();
+    writeLine(`[status] wasm online · program: ${loaded} · ip: ${pointer}`, "result");
+    writeLine(`[status] stack: ${formatStack(instance)}`);
     return;
   }
 
   if (normalized === "/clear" || normalized === "clear") {
     terminalOutput.replaceChildren();
+    return;
+  }
+
+  if (normalized === "/stack" || normalized === "stack") {
+    writeLine(`[stack] ${formatStack(instance)}`, "result");
+    return;
+  }
+
+  if (normalized === "/reset" || normalized === "reset") {
+    const resetResult = instance.exports.debug_reset();
+    if (resetResult !== 0) {
+      writeLine(`[error] ${debugErrorMessage(resetResult)}`, "error");
+      return;
+    }
+    writeLine("[reset] instruction pointer: 0 · stack: []", "result");
+    return;
+  }
+
+  if (normalized === "/disassemble" || normalized === "disassemble") {
+    if (!state.program) {
+      writeLine("[error] no program is loaded. Try /load 8 * 5", "error");
+      return;
+    }
+    printProgram(state.program);
+    return;
+  }
+
+  if (normalized === "/step" || normalized === "step") {
+    stepProgram(instance);
+    return;
+  }
+
+  if (normalized === "/run" || normalized === "run") {
+    runLoadedProgram(instance);
     return;
   }
 
@@ -83,25 +257,11 @@ function executeCommand(rawCommand, instance) {
     return;
   }
 
-  const { left, right, operation, symbol } = parsed;
+  const hasLoaded = loadProgram(parsed, instance);
+  const isLoadCommand = /^(?:\/?load)\s+/i.test(command);
 
-  if (!Number.isInteger(left) || !Number.isInteger(right) || left < i32Min || left > i32Max || right < i32Min || right > i32Max) {
-    writeLine("[error] values must be whole numbers within the i32 range", "error");
-    return;
-  }
-
-  if (operation.code === 3 && right === 0) {
-    writeLine("[error] division by zero is not permitted", "error");
-    return;
-  }
-
-  try {
-    const answer = instance.exports.run_binary(left, right, operation.code);
-    writeLine(`[program] PUSH ${left} · PUSH ${right} · ${operation.label} · HALT`, "muted");
-    writeLine(`[stack]   [${answer}]`, "result");
-    writeLine(`[result]  ${left} ${symbol} ${right} = ${answer}`, "result");
-  } catch (error) {
-    writeLine(`[error] ${error.message}`, "error");
+  if (hasLoaded && !isLoadCommand) {
+    runLoadedProgram(instance);
   }
 }
 
@@ -135,13 +295,6 @@ try {
     event.preventDefault();
     submitCommand(instance, terminalInput.value);
     terminalInput.value = "";
-  });
-
-  document.querySelectorAll(".command-chip").forEach(button => {
-    button.addEventListener("click", () => {
-      submitCommand(instance, button.dataset.command);
-      terminalInput.focus();
-    });
   });
 } catch (error) {
   runtimeBadge.dataset.state = "error";

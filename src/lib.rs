@@ -20,6 +20,15 @@ pub enum Instruction {
     Halt,
 }
 
+/// The result of executing one instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepResult {
+    /// An instruction executed and the VM can continue.
+    Executed { instruction: Instruction },
+    /// `Halt` executed and produced a result.
+    Halted { result: i32 },
+}
+
 /// Errors that can occur while executing a program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
@@ -37,6 +46,8 @@ pub enum VmError {
     MissingHalt,
     /// `Halt` was reached without a result on the stack.
     EmptyStack,
+    /// The VM was stepped after it had already halted.
+    AlreadyHalted,
 }
 
 /// A simple integer stack virtual machine.
@@ -44,6 +55,7 @@ pub enum VmError {
 pub struct Vm {
     stack: Vec<i32>,
     instruction_pointer: usize,
+    halted: bool,
 }
 
 impl Vm {
@@ -52,53 +64,84 @@ impl Vm {
         Self::default()
     }
 
+    /// Reset the VM to its initial state.
+    pub fn reset(&mut self) {
+        self.stack.clear();
+        self.instruction_pointer = 0;
+        self.halted = false;
+    }
+
     /// Execute a program and return the value at the top of the stack when it
     /// reaches [`Instruction::Halt`].
     ///
     /// Each call starts with a clean stack and instruction pointer, so a VM
     /// can safely be reused for multiple programs.
     pub fn run(&mut self, program: &[Instruction]) -> Result<i32, VmError> {
-        self.stack.clear();
-        self.instruction_pointer = 0;
+        self.reset();
 
-        while let Some(&instruction) = program.get(self.instruction_pointer) {
-            self.instruction_pointer += 1;
+        loop {
+            match self.step(program)? {
+                StepResult::Executed { .. } => {}
+                StepResult::Halted { result } => return Ok(result),
+            }
+        }
+    }
 
-            match instruction {
-                Instruction::Push(value) => self.stack.push(value),
-                Instruction::Add => {
-                    self.binary_operation("add", |lhs, rhs| lhs.checked_add(rhs))?
-                }
-                Instruction::Sub => {
-                    self.binary_operation("subtract", |lhs, rhs| lhs.checked_sub(rhs))?
-                }
-                Instruction::Mul => {
-                    self.binary_operation("multiply", |lhs, rhs| lhs.checked_mul(rhs))?
-                }
-                Instruction::Div => {
-                    let (lhs, rhs) = self.pop_binary_operands("divide")?;
+    /// Execute exactly one instruction from the current instruction pointer.
+    pub fn step(&mut self, program: &[Instruction]) -> Result<StepResult, VmError> {
+        if self.halted {
+            return Err(VmError::AlreadyHalted);
+        }
 
-                    if rhs == 0 {
-                        return Err(VmError::DivisionByZero);
-                    }
+        let instruction = *program
+            .get(self.instruction_pointer)
+            .ok_or(VmError::MissingHalt)?;
+        self.instruction_pointer += 1;
 
-                    let result = lhs.checked_div(rhs).ok_or(VmError::IntegerOverflow {
-                        operation: "divide",
-                    })?;
-                    self.stack.push(result);
+        match instruction {
+            Instruction::Push(value) => self.stack.push(value),
+            Instruction::Add => self.binary_operation("add", |lhs, rhs| lhs.checked_add(rhs))?,
+            Instruction::Sub => {
+                self.binary_operation("subtract", |lhs, rhs| lhs.checked_sub(rhs))?
+            }
+            Instruction::Mul => {
+                self.binary_operation("multiply", |lhs, rhs| lhs.checked_mul(rhs))?
+            }
+            Instruction::Div => {
+                let (lhs, rhs) = self.pop_binary_operands("divide")?;
+
+                if rhs == 0 {
+                    return Err(VmError::DivisionByZero);
                 }
-                Instruction::Halt => {
-                    return self.stack.last().copied().ok_or(VmError::EmptyStack);
-                }
+
+                let result = lhs.checked_div(rhs).ok_or(VmError::IntegerOverflow {
+                    operation: "divide",
+                })?;
+                self.stack.push(result);
+            }
+            Instruction::Halt => {
+                let result = self.stack.last().copied().ok_or(VmError::EmptyStack)?;
+                self.halted = true;
+                return Ok(StepResult::Halted { result });
             }
         }
 
-        Err(VmError::MissingHalt)
+        Ok(StepResult::Executed { instruction })
     }
 
     /// Inspect the current value stack.
     pub fn stack(&self) -> &[i32] {
         &self.stack
+    }
+
+    /// Return the index of the next instruction to execute.
+    pub fn instruction_pointer(&self) -> usize {
+        self.instruction_pointer
+    }
+
+    /// Return whether the VM has executed `Halt`.
+    pub fn is_halted(&self) -> bool {
+        self.halted
     }
 
     fn binary_operation<F>(
@@ -179,9 +222,137 @@ pub extern "C" fn run_binary(lhs: i32, rhs: i32, operation: i32) -> i32 {
         .expect("the browser should validate the operation inputs")
 }
 
+#[cfg(target_arch = "wasm32")]
+struct DebugSession {
+    program: Vec<Instruction>,
+    vm: Vm,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static DEBUG_SESSION: std::cell::RefCell<Option<DebugSession>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn debug_error_code(error: VmError) -> i32 {
+    match error {
+        VmError::MissingHalt => -2,
+        VmError::StackUnderflow { .. } => -3,
+        VmError::DivisionByZero => -4,
+        VmError::IntegerOverflow { .. } => -5,
+        VmError::EmptyStack => -6,
+        VmError::AlreadyHalted => -7,
+    }
+}
+
+/// Load a binary program into the browser debugger session.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_load_binary(lhs: i32, rhs: i32, operation: i32) -> i32 {
+    let instruction = match operation {
+        0 => Instruction::Add,
+        1 => Instruction::Sub,
+        2 => Instruction::Mul,
+        3 => Instruction::Div,
+        _ => return -8,
+    };
+
+    DEBUG_SESSION.with(|session| {
+        *session.borrow_mut() = Some(DebugSession {
+            program: vec![
+                Instruction::Push(lhs),
+                Instruction::Push(rhs),
+                instruction,
+                Instruction::Halt,
+            ],
+            vm: Vm::new(),
+        });
+    });
+
+    0
+}
+
+/// Execute one instruction in the browser debugger session.
+///
+/// Returns `0` when execution can continue, `1` when the VM halted, and a
+/// negative value for an execution error.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_step() -> i32 {
+    DEBUG_SESSION.with(|session| {
+        let mut session = session.borrow_mut();
+        let Some(session) = session.as_mut() else {
+            return -1;
+        };
+
+        match session.vm.step(&session.program) {
+            Ok(StepResult::Executed { .. }) => 0,
+            Ok(StepResult::Halted { .. }) => 1,
+            Err(error) => debug_error_code(error),
+        }
+    })
+}
+
+/// Reset the browser debugger session without unloading its program.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_reset() -> i32 {
+    DEBUG_SESSION.with(|session| {
+        let mut session = session.borrow_mut();
+        let Some(session) = session.as_mut() else {
+            return -1;
+        };
+        session.vm.reset();
+        0
+    })
+}
+
+/// Return the next instruction index in the browser debugger session.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_instruction_pointer() -> i32 {
+    DEBUG_SESSION.with(|session| {
+        session
+            .borrow()
+            .as_ref()
+            .map(|session| session.vm.instruction_pointer() as i32)
+            .unwrap_or(-1)
+    })
+}
+
+/// Return the number of values on the browser debugger stack.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_stack_len() -> i32 {
+    DEBUG_SESSION.with(|session| {
+        session
+            .borrow()
+            .as_ref()
+            .map(|session| session.vm.stack().len() as i32)
+            .unwrap_or(-1)
+    })
+}
+
+/// Return a value from the browser debugger stack by index.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_stack_at(index: i32) -> i32 {
+    if index < 0 {
+        return 0;
+    }
+
+    DEBUG_SESSION.with(|session| {
+        session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.vm.stack().get(index as usize).copied())
+            .unwrap_or(0)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, Vm, VmError};
+    use super::{Instruction, StepResult, Vm, VmError};
 
     #[test]
     fn adds_two_values() {
@@ -295,5 +466,65 @@ mod tests {
             ]),
             Err(VmError::IntegerOverflow { operation: "add" })
         );
+    }
+
+    #[test]
+    fn steps_through_a_program() {
+        let program = [
+            Instruction::Push(2),
+            Instruction::Push(3),
+            Instruction::Add,
+            Instruction::Halt,
+        ];
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            vm.step(&program),
+            Ok(StepResult::Executed {
+                instruction: Instruction::Push(2)
+            })
+        );
+        assert_eq!(vm.instruction_pointer(), 1);
+        assert_eq!(vm.stack(), &[2]);
+
+        assert_eq!(
+            vm.step(&program),
+            Ok(StepResult::Executed {
+                instruction: Instruction::Push(3)
+            })
+        );
+        assert_eq!(
+            vm.step(&program),
+            Ok(StepResult::Executed {
+                instruction: Instruction::Add
+            })
+        );
+        assert_eq!(vm.stack(), &[5]);
+        assert_eq!(vm.step(&program), Ok(StepResult::Halted { result: 5 }));
+        assert!(vm.is_halted());
+    }
+
+    #[test]
+    fn reset_rewinds_a_debug_session() {
+        let program = [Instruction::Push(7), Instruction::Halt];
+        let mut vm = Vm::new();
+
+        vm.step(&program).unwrap();
+        assert_eq!(vm.stack(), &[7]);
+        vm.reset();
+
+        assert_eq!(vm.instruction_pointer(), 0);
+        assert!(vm.stack().is_empty());
+        assert!(!vm.is_halted());
+    }
+
+    #[test]
+    fn rejects_stepping_after_halt() {
+        let program = [Instruction::Push(7), Instruction::Halt];
+        let mut vm = Vm::new();
+
+        vm.run(&program).unwrap();
+
+        assert_eq!(vm.step(&program), Err(VmError::AlreadyHalted));
     }
 }
