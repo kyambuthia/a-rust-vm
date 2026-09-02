@@ -9,6 +9,7 @@ use a_rust_vm::agent::{
     RouteRequest, ScriptedModel, ToolArguments, ToolCall, ToolValue, load_project_instructions,
     system_prompt_with_instructions,
 };
+use a_rust_vm::program::Program;
 use a_rust_vm::workspace::coding_tool_registry;
 use a_rust_vm::{Instruction, Vm};
 
@@ -16,35 +17,150 @@ const MODEL_ATTEMPTS: usize = 2;
 const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash";
 
 fn main() {
-    if env::args().nth(1).as_deref() == Some("agent-demo") {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    let command = arguments.first().map(String::as_str);
+    if matches!(command, None | Some("help" | "--help" | "-h")) {
+        print_help();
+        return;
+    }
+    if matches!(command, Some("version" | "--version" | "-V")) {
+        println!("arvm {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if matches!(command, Some("run" | "check" | "disassemble" | "trace")) {
+        run_program_command(command.expect("matched above"), &arguments[1..]);
+        return;
+    }
+    if command == Some("demo") {
+        run_vm_demo();
+        return;
+    }
+    if command == Some("agent-demo") {
         run_agent_demo();
         return;
     }
-    if env::args().nth(1).as_deref() == Some("runtime-demo") {
+    if command == Some("runtime-demo") {
         run_runtime_demo();
         return;
     }
-    if env::args().nth(1).as_deref() == Some("guest-demo") {
+    if command == Some("guest-demo") {
         run_guest_demo();
         return;
     }
-    if env::args().nth(1).as_deref() == Some("coding-demo") {
+    if command == Some("coding-demo") {
         run_coding_demo();
         return;
     }
-    if env::args().nth(1).as_deref() == Some("agent") {
+    if command == Some("agent") {
         run_live_agent();
         return;
     }
-    if env::args().nth(1).as_deref() == Some("model-bridge") {
+    if command == Some("model-bridge") {
         run_model_bridge();
         return;
     }
-    if env::args().nth(1).as_deref() == Some("serve") {
+    if command == Some("serve") {
         a_rust_vm::server::run(working_directory());
         return;
     }
 
+    eprintln!("unknown command: {}\n", command.unwrap_or_default());
+    print_help();
+    std::process::exit(2);
+}
+
+fn print_help() {
+    println!(
+        "A/RVM - a deterministic stack VM and agent runtime\n\n\
+Usage: arvm <command> [options]\n\n\
+Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
+Product commands:\n  agent                   Start the interactive coding agent\n  serve                   Host the browser and agent API\n  version                 Print version information\n  help                    Show this help\n\n\
+Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
+Use '-' to read a program from standard input; '#' starts a comment."
+    );
+}
+
+fn run_program_command(command: &str, arguments: &[String]) {
+    let json = arguments.iter().any(|argument| argument == "--json");
+    let paths = arguments
+        .iter()
+        .filter(|argument| argument.as_str() != "--json")
+        .collect::<Vec<_>>();
+    if paths.len() != 1 || (command != "run" && json) {
+        eprintln!(
+            "usage: arvm {command} <file|->{}",
+            if command == "run" { " [--json]" } else { "" }
+        );
+        std::process::exit(2);
+    }
+    let path = paths[0];
+    let source = if path.as_str() == "-" {
+        let mut source = String::new();
+        io::stdin()
+            .read_to_string(&mut source)
+            .unwrap_or_else(|error| {
+                eprintln!("cannot read program from stdin: {error}");
+                std::process::exit(2);
+            });
+        source
+    } else {
+        std::fs::read_to_string(path).unwrap_or_else(|error| {
+            eprintln!("cannot read program '{path}': {error}");
+            std::process::exit(2);
+        })
+    };
+    let program = source.parse::<Program>().unwrap_or_else(|error| {
+        eprintln!("invalid program: {error}");
+        std::process::exit(2);
+    });
+    match command {
+        "check" => println!(
+            "valid: {} instructions, max stack depth {}",
+            program.instructions().len(),
+            program.max_stack_depth()
+        ),
+        "disassemble" => println!("{}", program.disassemble()),
+        "trace" => {
+            let entries = Vm::new().trace(&program).unwrap_or_else(|error| {
+                eprintln!("VM error: {error:?}");
+                std::process::exit(1);
+            });
+            for entry in entries {
+                match entry.result {
+                    Some(result) => println!(
+                        "ip={} instruction=HALT result={result} stack={:?}",
+                        entry.instruction_pointer, entry.stack
+                    ),
+                    None => println!(
+                        "ip={} instruction={} stack={:?}",
+                        entry.instruction_pointer, entry.instruction, entry.stack
+                    ),
+                }
+            }
+        }
+        "run" => {
+            let result = Vm::new().run_program(&program).unwrap_or_else(|error| {
+                eprintln!("VM error: {error:?}");
+                std::process::exit(1);
+            });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": result,
+                        "instructions": program.instructions().len(),
+                        "max_stack_depth": program.max_stack_depth()
+                    })
+                );
+            } else {
+                println!("{result}");
+            }
+        }
+        _ => unreachable!("command validated by caller"),
+    }
+}
+
+fn run_vm_demo() {
     let program = [
         Instruction::Push(2),
         Instruction::Push(3),

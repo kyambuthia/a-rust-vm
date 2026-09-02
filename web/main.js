@@ -288,6 +288,9 @@ function formatStack(instance) {
 }
 
 function instructionList(program) {
+  if (program.instructions) {
+    return program.instructions.map(instruction => instruction.text);
+  }
   return [
     `PUSH ${program.left}`,
     `PUSH ${program.right}`,
@@ -312,9 +315,50 @@ function debugErrorMessage(code) {
     "-6": "HALT reached with an empty stack",
     "-7": "the VM is already halted",
     "-8": "unknown operation",
+    "-9": "program failed validation or exceeds the instruction limit",
   };
 
   return messages[code] ?? `VM error (${code})`;
+}
+
+function loadAssembly(source, instance) {
+  const opcodeByName = { ADD: 1, SUB: 2, MUL: 3, DIV: 4, HALT: 5 };
+  const lines = source.split(/;|\n/).map(line => line.trim()).filter(Boolean);
+  const instructions = [];
+  for (const line of lines) {
+    const fields = line.split(/\s+/);
+    const name = fields[0].toUpperCase();
+    if (name === "PUSH" && fields.length === 2) {
+      const operand = Number(fields[1]);
+      if (!Number.isInteger(operand) || operand < i32Min || operand > i32Max) {
+        writeLine(`[error] PUSH operand must be an i32: ${fields[1]}`, "error");
+        return false;
+      }
+      instructions.push({ opcode: 0, operand, text: `PUSH ${operand}` });
+    } else if (Object.hasOwn(opcodeByName, name) && fields.length === 1) {
+      instructions.push({ opcode: opcodeByName[name], operand: 0, text: name });
+    } else {
+      writeLine(`[error] invalid assembly instruction: ${line}`, "error");
+      return false;
+    }
+  }
+
+  instance.exports.debug_program_begin();
+  for (const instruction of instructions) {
+    const status = instance.exports.debug_program_push(instruction.opcode, instruction.operand);
+    if (status !== 0) {
+      writeLine(`[error] ${debugErrorMessage(status)}`, "error");
+      return false;
+    }
+  }
+  const status = instance.exports.debug_program_finish();
+  if (status !== 0) {
+    writeLine(`[error] ${debugErrorMessage(status)}`, "error");
+    return false;
+  }
+  state.program = { instructions, label: "assembly program" };
+  writeLine(`[loaded] validated assembly · ${instructions.length} instructions`, "result");
+  return true;
 }
 
 function validateProgram(program) {
@@ -362,7 +406,8 @@ function runLoadedProgram(instance) {
     return;
   }
 
-  writeLine(`[run] ${state.program.left} ${state.program.symbol} ${state.program.right}`, "command");
+  const label = state.program.label ?? `${state.program.left} ${state.program.symbol} ${state.program.right}`;
+  writeLine(`[run] ${label}`, "command");
 
   const instructions = instructionList(state.program);
   let status = 0;
@@ -383,7 +428,7 @@ function runLoadedProgram(instance) {
   }
 
   if (status === 1) {
-    writeLine(`[result]  ${state.program.left} ${state.program.symbol} ${state.program.right} = ${formatStack(instance).replace(/[\[\]]/g, "")}`, "result");
+    writeLine(`[result] ${formatStack(instance).replace(/[\[\]]/g, "")}`, "result");
   }
 }
 
@@ -422,13 +467,14 @@ function executeCommand(rawCommand, instance) {
     writeLine("  /pdf <file>           validate an uploaded PDF safely");
     writeLine("  /jobs                 list data-processing jobs");
     writeLine("  /load <a> <op> <b>  load a program");
+    writeLine("  /asm <instructions>  load ';'-separated assembly");
     writeLine("  /disassemble         inspect loaded bytecode");
     writeLine("  /step                execute one instruction");
     writeLine("  /run                 run the loaded program");
     writeLine("  /stack               inspect the current stack");
     writeLine("  /reset               reset without unloading");
     writeLine("  /clear               clear terminal output");
-    writeLine("examples: /load 2 + 3 · /load 8 * 5");
+    writeLine("examples: /load 8 * 5 · /asm PUSH 6; PUSH 7; MUL; HALT");
     return;
   }
 
@@ -508,6 +554,17 @@ function executeCommand(rawCommand, instance) {
 
   if (normalized === "/run" || normalized === "run") {
     runLoadedProgram(instance);
+    return;
+  }
+
+  if (normalized === "/asm" || normalized === "asm") {
+    writeLine("[error] usage: /asm PUSH 6; PUSH 7; MUL; HALT", "error");
+    return;
+  }
+
+  if (normalized.startsWith("/asm ") || normalized.startsWith("asm ")) {
+    const prefixLength = normalized.startsWith("/asm ") ? 5 : 4;
+    loadAssembly(command.slice(prefixLength), instance);
     return;
   }
 

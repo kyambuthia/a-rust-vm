@@ -8,6 +8,7 @@ pub mod guest_tools;
 pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod persistent_model;
+pub mod program;
 pub mod runtime;
 pub mod session;
 pub mod workspace;
@@ -32,6 +33,28 @@ pub enum Instruction {
     Halt,
 }
 
+impl Instruction {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Push(_) => "PUSH",
+            Self::Add => "ADD",
+            Self::Sub => "SUB",
+            Self::Mul => "MUL",
+            Self::Div => "DIV",
+            Self::Halt => "HALT",
+        }
+    }
+}
+
+impl std::fmt::Display for Instruction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Push(value) => write!(formatter, "PUSH {value}"),
+            instruction => formatter.write_str(instruction.name()),
+        }
+    }
+}
+
 /// The result of executing one instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResult {
@@ -39,6 +62,15 @@ pub enum StepResult {
     Executed { instruction: Instruction },
     /// `Halt` executed and produced a result.
     Halted { result: i32 },
+}
+
+/// A deterministic snapshot captured after one instruction executes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEntry {
+    pub instruction_pointer: usize,
+    pub instruction: Instruction,
+    pub stack: Vec<i32>,
+    pub result: Option<i32>,
 }
 
 /// Errors that can occur while executing a program.
@@ -95,6 +127,34 @@ impl Vm {
             match self.step(program)? {
                 StepResult::Executed { .. } => {}
                 StepResult::Halted { result } => return Ok(result),
+            }
+        }
+    }
+
+    /// Execute a program that was validated at its input boundary.
+    pub fn run_program(&mut self, program: &program::Program) -> Result<i32, VmError> {
+        self.run(program.instructions())
+    }
+
+    /// Execute a validated program and return a complete, inspectable trace.
+    pub fn trace(&mut self, program: &program::Program) -> Result<Vec<TraceEntry>, VmError> {
+        self.reset();
+        let mut entries = Vec::with_capacity(program.instructions().len());
+        loop {
+            let instruction_pointer = self.instruction_pointer;
+            let step = self.step(program.instructions())?;
+            let (instruction, result) = match step {
+                StepResult::Executed { instruction } => (instruction, None),
+                StepResult::Halted { result } => (Instruction::Halt, Some(result)),
+            };
+            entries.push(TraceEntry {
+                instruction_pointer,
+                instruction,
+                stack: self.stack.clone(),
+                result,
+            });
+            if result.is_some() {
+                return Ok(entries);
             }
         }
     }
@@ -243,6 +303,7 @@ struct DebugSession {
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static DEBUG_SESSION: std::cell::RefCell<Option<DebugSession>> = const { std::cell::RefCell::new(None) };
+    static PROGRAM_BUILDER: std::cell::RefCell<Vec<Instruction>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -282,6 +343,56 @@ pub extern "C" fn debug_load_binary(lhs: i32, rhs: i32, operation: i32) -> i32 {
     });
 
     0
+}
+
+/// Begin loading an arbitrary program through the allocation-free Wasm ABI.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_program_begin() {
+    PROGRAM_BUILDER.with(|builder| builder.borrow_mut().clear());
+}
+
+/// Append an instruction. Codes are `0 = PUSH`, `1 = ADD`, `2 = SUB`,
+/// `3 = MUL`, `4 = DIV`, and `5 = HALT`; only PUSH uses `operand`.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
+    let instruction = match opcode {
+        0 => Instruction::Push(operand),
+        1 => Instruction::Add,
+        2 => Instruction::Sub,
+        3 => Instruction::Mul,
+        4 => Instruction::Div,
+        5 => Instruction::Halt,
+        _ => return -8,
+    };
+    PROGRAM_BUILDER.with(|builder| {
+        let mut builder = builder.borrow_mut();
+        if builder.len() >= program::MAX_PROGRAM_INSTRUCTIONS {
+            return -9;
+        }
+        builder.push(instruction);
+        0
+    })
+}
+
+/// Validate and install the program assembled with `debug_program_push`.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_program_finish() -> i32 {
+    PROGRAM_BUILDER.with(|builder| {
+        let instructions = builder.borrow().clone();
+        let Ok(program) = program::Program::new(instructions) else {
+            return -9;
+        };
+        DEBUG_SESSION.with(|session| {
+            *session.borrow_mut() = Some(DebugSession {
+                program: program.instructions().to_vec(),
+                vm: Vm::new(),
+            });
+        });
+        0
+    })
 }
 
 /// Execute one instruction in the browser debugger session.
@@ -456,6 +567,15 @@ mod tests {
         let mut vm = Vm::new();
 
         assert_eq!(vm.run(&[Instruction::Push(1)]), Err(VmError::MissingHalt));
+    }
+
+    #[test]
+    fn trace_captures_post_instruction_stack_and_halt_result() {
+        let program: crate::program::Program = "PUSH 2\nPUSH 3\nADD\nHALT".parse().unwrap();
+        let entries = Vm::new().trace(&program).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[2].stack, vec![5]);
+        assert_eq!(entries[3].result, Some(5));
     }
 
     #[test]

@@ -3,6 +3,10 @@ name = "a-rust-vm"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "arvm"
+path = "src/main.rs"
+
 [lib]
 name = "a_rust_vm"
 path = "src/lib.rs"

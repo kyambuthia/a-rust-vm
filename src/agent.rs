@@ -1257,30 +1257,26 @@ impl Tool for TraceProgramTool {
         ensure_arguments(arguments, &["program"])?;
         let source = required_text(arguments, "program")?;
         let program = parse_program(source)?;
+        let program = crate::program::Program::new(program)
+            .map_err(|error| ToolError::new(error.to_string()))?;
         let mut vm = Vm::new();
-        let mut trace = Vec::new();
-
-        for _ in 0..=program.len() {
-            let instruction_pointer = vm.instruction_pointer();
-            match vm.step(&program).map_err(vm_tool_error)? {
-                StepResult::Executed { instruction } => trace.push(format!(
-                    "ip={instruction_pointer} instruction={} stack={:?}",
-                    format_instruction(instruction),
-                    vm.stack()
-                )),
-                StepResult::Halted { result } => {
-                    trace.push(format!(
-                        "ip={instruction_pointer} instruction=HALT result={result} stack={:?}",
-                        vm.stack()
-                    ));
-                    return Ok(trace.join("\n"));
-                }
-            }
-        }
-
-        Err(ToolError::new(
-            "program trace exceeded the instruction limit",
-        ))
+        let trace = vm.trace(&program).map_err(vm_tool_error)?;
+        Ok(trace
+            .into_iter()
+            .map(|entry| match entry.result {
+                Some(result) => format!(
+                    "ip={} instruction=HALT result={result} stack={:?}",
+                    entry.instruction_pointer, entry.stack
+                ),
+                None => format!(
+                    "ip={} instruction={} stack={:?}",
+                    entry.instruction_pointer,
+                    format_instruction(entry.instruction),
+                    entry.stack
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 }
 
@@ -1472,69 +1468,14 @@ fn ensure_arguments(arguments: &ToolArguments, allowed: &[&str]) -> Result<(), T
 }
 
 pub(crate) fn parse_program(source: &str) -> Result<Vec<Instruction>, ToolError> {
-    let mut program = Vec::new();
-
-    for (line_number, line) in source.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let opcode = parts
-            .next()
-            .ok_or_else(|| ToolError::new(format!("line {} is empty", line_number + 1)))?;
-        let instruction = match opcode.to_ascii_uppercase().as_str() {
-            "PUSH" => {
-                let value = parts
-                    .next()
-                    .ok_or_else(|| {
-                        ToolError::new(format!("line {}: PUSH needs a value", line_number + 1))
-                    })?
-                    .parse::<i32>()
-                    .map_err(|_| {
-                        ToolError::new(format!("line {}: invalid PUSH value", line_number + 1))
-                    })?;
-                Instruction::Push(value)
-            }
-            "ADD" => Instruction::Add,
-            "SUB" => Instruction::Sub,
-            "MUL" => Instruction::Mul,
-            "DIV" => Instruction::Div,
-            "HALT" => Instruction::Halt,
-            _ => {
-                return Err(ToolError::new(format!(
-                    "line {}: unknown instruction '{opcode}'",
-                    line_number + 1
-                )));
-            }
-        };
-
-        if parts.next().is_some() {
-            return Err(ToolError::new(format!(
-                "line {}: unexpected arguments after {opcode}",
-                line_number + 1
-            )));
-        }
-        program.push(instruction);
-    }
-
-    if program.is_empty() {
-        return Err(ToolError::new("program cannot be empty"));
-    }
-
-    Ok(program)
+    source
+        .parse::<crate::program::Program>()
+        .map(|program| program.instructions().to_vec())
+        .map_err(|error| ToolError::new(error.to_string()))
 }
 
 fn format_instruction(instruction: Instruction) -> String {
-    match instruction {
-        Instruction::Push(value) => format!("PUSH {value}"),
-        Instruction::Add => "ADD".to_owned(),
-        Instruction::Sub => "SUB".to_owned(),
-        Instruction::Mul => "MUL".to_owned(),
-        Instruction::Div => "DIV".to_owned(),
-        Instruction::Halt => "HALT".to_owned(),
-    }
+    instruction.to_string()
 }
 
 fn format_program(program: &[Instruction]) -> String {
