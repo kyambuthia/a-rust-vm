@@ -25,6 +25,7 @@ const quickUpload = document.querySelector("#quick-upload");
 const quickClear = document.querySelector("#quick-clear");
 const railFilesRefresh = document.querySelector("#rail-files-refresh");
 const railJobsRefresh = document.querySelector("#rail-jobs-refresh");
+const copyInstall = document.querySelector("#copy-install");
 
 const maxUploadBytes = 1024 * 1024;
 
@@ -802,6 +803,17 @@ railFilesRefresh?.addEventListener("click", () => {
 railJobsRefresh?.addEventListener("click", () => {
   void listJobs();
   terminalInput.focus();
+});
+
+copyInstall?.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText("git clone https://github.com/kyambuthia/a-rust-vm.git");
+    copyInstall.textContent = "copied";
+    window.setTimeout(() => { copyInstall.textContent = "install"; }, 1600);
+  } catch {
+    copyInstall.textContent = "copy unavailable";
+    window.setTimeout(() => { copyInstall.textContent = "install"; }, 1600);
+  }
 });
 
 for (const chip of document.querySelectorAll(".chip[data-insert]")) {

@@ -19,31 +19,32 @@
         </a>
         <nav class="site-links" aria-label="A/RVM links">
           <a href="#about">docs</a>
+          <a href="#about">cli</a>
+          <a href="#about">lib</a>
           <a href="#terminal">try</a>
           <a href="https://github.com/kyambuthia/a-rust-vm">source</a>
         </nav>
+        <button class="nav-install" type="button" id="copy-install" aria-label="Copy install command">install</button>
       </header>
 
-      <main class="try-layout">
-        <section class="intro" id="about" aria-label="About A/RVM">
-          <p>A small, open, deterministic virtual machine.</p>
-          <p>Run expressions and bytecode in a browser workspace. Ask an agent when you want a second pair of hands.</p>
-          <p class="intro-meta">v0.1.0 · experimental · anonymous and ephemeral</p>
+      <main class="try-layout" id="about">
+        <section class="demo-note" aria-label="About this demo">
+          <div>
+            <p>This demo runs the A/RVM bytecode runtime as WebAssembly in your browser.</p>
+            <p>Network access is delegated to the server-side model gateway, and every guest workspace is ephemeral.</p>
+          </div>
+          <div class="demo-actions">
+            <label class="demo-action upload-button" for="file-input">upload</label>
+            <input id="file-input" class="upload-input" type="file" multiple aria-label="Upload files to the guest VM">
+            <button class="demo-action" id="expand-terminal" type="button" aria-expanded="false" aria-controls="terminal-body">expand ↗</button>
+            <details class="about-toggle">
+              <summary aria-label="About this demo">(i)</summary>
+              <p>No account is required. Uploaded files and jobs stay in memory for this browser session and are cleared when it expires or restarts.</p>
+            </details>
+          </div>
         </section>
 
         <section class="terminal-window" id="terminal" aria-label="A/RVM terminal">
-          <div class="terminal-bar">
-            <div class="terminal-identity">
-              <span class="terminal-title">a/rvm</span>
-              <span class="terminal-version">v0.1.0 · Run /help for commands</span>
-            </div>
-            <div class="terminal-actions">
-              <label class="terminal-action upload-button" for="file-input">upload</label>
-              <input id="file-input" class="upload-input" type="file" multiple aria-label="Upload files to the guest VM">
-              <button class="terminal-action" id="expand-terminal" type="button" aria-expanded="false" aria-controls="terminal-body">expand ↗</button>
-            </div>
-          </div>
-
           <div class="terminal-body" id="terminal-body">
             <div class="terminal-output" id="terminal-output" role="log" aria-live="polite" aria-label="Terminal output"></div>
             <form class="terminal-form" id="terminal-form" aria-label="Terminal input">
@@ -64,7 +65,6 @@
           </div>
         </section>
 
-        <p class="below-note">The VM is local and deterministic. Files, jobs, and model context live only in this anonymous browser session.</p>
       </main>
     </div>
 
