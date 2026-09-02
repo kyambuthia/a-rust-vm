@@ -851,7 +851,7 @@ try {
   writeLine(`[error] ${error.message}`, "error");
 }
 
-expandButton.addEventListener("click", () => {
+expandButton?.addEventListener("click", () => {
   const expanded = terminalWindow.classList.toggle("expanded");
   expandButton.setAttribute("aria-expanded", String(expanded));
   expandButton.textContent = expanded ? "collapse ↗" : "expand ↗";
