@@ -974,7 +974,7 @@ fn append_security_headers(header: &mut String) {
     header.push_str("X-Content-Type-Options: nosniff\r\n");
     header.push_str("X-Frame-Options: DENY\r\n");
     header.push_str("Referrer-Policy: no-referrer\r\n");
-    header.push_str("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n");
+    header.push_str("Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n");
     header.push_str("Cross-Origin-Opener-Policy: same-origin\r\n");
     header.push_str("Cross-Origin-Resource-Policy: same-origin\r\n");
     header.push_str("Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n");
