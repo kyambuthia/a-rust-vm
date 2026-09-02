@@ -14,7 +14,10 @@ use crate::agent::{Model, ModelError, ModelRequest, ModelResponse, ToolArguments
 
 const FIXED_PROVIDER: &str = "openrouter";
 const FIXED_MODEL: &str = "deepseek/deepseek-v4-flash";
-const STARTUP_RETRIES: usize = 30;
+// Local model runners can take several seconds to initialize their plugin and
+// credential state. Keep the browser host's startup deterministic while giving
+// them a bounded readiness window.
+const STARTUP_RETRIES: usize = 150;
 
 #[derive(Clone)]
 pub struct PersistentModel {
@@ -62,7 +65,7 @@ impl PersistentModelService {
             .port();
         drop(listener);
 
-        let process = Command::new("opencode")
+        let mut process = Command::new("opencode")
             .args([
                 "serve",
                 "--pure",
@@ -116,6 +119,8 @@ impl PersistentModelService {
             thread::sleep(Duration::from_millis(100));
         }
 
+        let _ = process.kill();
+        let _ = process.wait();
         Err("model service did not become ready".to_owned())
     }
 }

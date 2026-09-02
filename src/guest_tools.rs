@@ -28,6 +28,7 @@ pub fn guest_tool_registry_shared(vm: SharedGuestVm) -> Result<ToolRegistry, Too
     registry.register(GuestReadFileTool::new(vm.clone()))?;
     registry.register(GuestWriteFileTool::new(vm.clone()))?;
     registry.register(GuestMakeDirectoryTool::new(vm.clone()))?;
+    registry.register(GuestTabulateFileTool::new(vm.clone()))?;
     registry.register(GuestSpawnTool::new(vm.clone()))?;
     registry.register(GuestTickTool::new(vm.clone()))?;
     registry.register(GuestRunTool::new(vm.clone()))?;
@@ -165,6 +166,35 @@ impl Tool for GuestMakeDirectoryTool {
 
 struct GuestSpawnTool {
     vm: SharedGuestVm,
+}
+
+struct GuestTabulateFileTool {
+    vm: SharedGuestVm,
+}
+
+impl GuestTabulateFileTool {
+    fn new(vm: SharedGuestVm) -> Self {
+        Self { vm }
+    }
+}
+
+impl Tool for GuestTabulateFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "guest_tabulate_file",
+            "Tabulate an uploaded CSV or TSV guest file and write a JSON summary to /workspace/output.",
+            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+        )
+    }
+
+    fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
+        ensure_arguments(arguments, &["path"])?;
+        let path = required_text(arguments, "path")?;
+        let mut vm = lock_guest_mut(&self.vm)?;
+        let summary = crate::jobs::tabulate_uploaded_file(&mut vm, path).map_err(ToolError::new)?;
+        serde_json::to_string(&summary)
+            .map_err(|error| ToolError::new(format!("failed to encode table summary: {error}")))
+    }
 }
 
 impl GuestSpawnTool {

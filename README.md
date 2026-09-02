@@ -62,6 +62,16 @@ lets follow-up requests reuse provider context. The local model service runs
 against an empty temporary project with its built-in tools denied; browser
 requests retain access only to the guest-prefixed A/RVM tools.
 
+Uploaded CSV and TSV files can be processed through the browser terminal with
+`/tabulate <filename>`, for example `/tabulate sales.csv`. The built-in,
+deterministic tabulation job validates a rectangular UTF-8 table, reports row,
+column, and numeric-cell counts, and writes its JSON summary to
+`/workspace/output/<filename>.table.json`. Use `/jobs` to inspect the job
+records. The agent can invoke the same bounded operation with
+`guest_tabulate_file` after inspecting an upload. Jobs and output artifacts
+currently live only for the local server process; they are deliberately not a
+host-shell or arbitrary-executable facility.
+
 The local browser server currently creates one guest VM per server process and
 binds to loopback. Authenticated multi-user VM selection is not wired into the
 browser protocol yet. Host workspace tools remain available to native coding

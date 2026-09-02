@@ -77,6 +77,55 @@ async function listGuestFiles() {
   }
 }
 
+async function tabulateFile(value) {
+  const file = value.trim();
+  if (!file) {
+    writeLine("[error] usage: /tabulate <uploaded filename>", "error");
+    return;
+  }
+  const path = file.startsWith("/") ? file : `/workspace/uploads/${file}`;
+  try {
+    const response = await fetch("../api/tabulate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error ?? `tabulation failed: ${response.status}`);
+    }
+    const columns = payload.table.columns
+      .map(column => `${column.name}: ${column.non_empty}/${payload.table.rows} present, ${column.numeric} numeric`)
+      .join(" · ");
+    writeLine(`[job ${payload.job.id}] tabulated ${payload.table.source_path}`, "result");
+    writeLine(`[table] ${payload.table.rows} rows · ${payload.table.columns.length} columns · ${payload.table.delimiter.toUpperCase()}`, "result");
+    writeLine(`[columns] ${columns || "no columns"}`, "muted");
+    writeLine(`[output] ${payload.table.output_path}`, "muted");
+  } catch (error) {
+    writeLine(`[tabulate error] ${error.message}`, "error");
+  }
+}
+
+async function listJobs() {
+  try {
+    const response = await fetch("../api/jobs");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error ?? `job listing failed: ${response.status}`);
+    }
+    if (!payload.jobs?.length) {
+      writeLine("[jobs] no jobs", "muted");
+      return;
+    }
+    for (const job of payload.jobs) {
+      const detail = job.output_path ?? job.error ?? job.input_path;
+      writeLine(`[job ${job.id}] ${job.state} · ${job.executor} · ${detail}`, job.state === "failed" ? "error" : "muted");
+    }
+  } catch (error) {
+    writeLine(`[jobs error] ${error.message}`, "error");
+  }
+}
+
 fileInput.addEventListener("change", () => {
   const files = Array.from(fileInput.files ?? []);
   fileInput.value = "";
@@ -343,6 +392,8 @@ function executeCommand(rawCommand, instance) {
     writeLine("commands:", "result");
     writeLine("  /ask <prompt>         ask the server-side LLM agent");
     writeLine("  /files                list files in the guest VM");
+    writeLine("  /tabulate <file>      summarize an uploaded CSV or TSV");
+    writeLine("  /jobs                 list data-processing jobs");
     writeLine("  /load <a> <op> <b>  load a program");
     writeLine("  /disassemble         inspect loaded bytecode");
     writeLine("  /step                execute one instruction");
@@ -364,6 +415,22 @@ function executeCommand(rawCommand, instance) {
 
   if (normalized === "/files" || normalized === "files") {
     void listGuestFiles();
+    return;
+  }
+
+  if (normalized === "/jobs" || normalized === "jobs") {
+    void listJobs();
+    return;
+  }
+
+  if (normalized === "/tabulate" || normalized === "tabulate") {
+    void tabulateFile("");
+    return;
+  }
+
+  if (normalized.startsWith("/tabulate ") || normalized.startsWith("tabulate ")) {
+    const prefixLength = normalized.startsWith("/tabulate ") ? 11 : 10;
+    void tabulateFile(command.slice(prefixLength));
     return;
   }
 
