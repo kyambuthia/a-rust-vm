@@ -75,10 +75,7 @@ function writeLine(text, kind = "muted") {
 }
 
 function printWelcome() {
-  writeLine("a/rvm v0.1.0 · anonymous session · in-memory", "result");
-  writeLine("[ready] wasm runtime online — VM is local and deterministic", "result");
-  writeLine("[scope] anonymous session · in-memory · clears when the session expires/restarts", "muted");
-  writeLine("[hint] ask the agent, run 8 * 5, or try /help · files and jobs are ephemeral", "muted");
+  writeLine("a/rvm v0.1.0 · Run /help for commands", "muted");
 }
 
 async function printSystemInfo() {
@@ -86,8 +83,6 @@ async function printSystemInfo() {
     const response = await fetch("../api/v1/system");
     if (!response.ok) throw new Error(`status ${response.status}`);
     const info = await response.json();
-    const workspaceMode = info.features?.workspaces?.durable ? "durable" : "in-memory";
-    writeLine(`[platform] API ${info.api_version} · workspaces ${workspaceMode} · bytecode executor ready`, "muted");
     if (info.model_gateway?.configured) {
       setGatewayState("ready", "model gateway online");
     } else {

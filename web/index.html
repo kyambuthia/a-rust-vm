@@ -3,120 +3,71 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#101010">
-    <meta name="description" content="A/RVM — ephemeral workspace for deterministic bytecode and lightweight agent tools.">
-    <title>A/RVM · anonymous workspace</title>
+    <meta name="theme-color" content="#000000">
+    <meta name="description" content="A/RVM — a small deterministic Rust virtual machine with an ephemeral browser workspace.">
+    <title>A/RVM · try</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="./styles.css?v=ws-1">
+    <link rel="stylesheet" href="./styles.css?v=fx-1">
   </head>
   <body>
-    <div class="workspace-shell">
-      <header class="workspace-header" aria-label="Workspace header">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true">𝒂</span>
-          <div class="brand-text">
-            <span class="brand-name">a/rvm</span>
-            <span class="brand-meta">anonymous session · in-memory · clears when the session expires/restarts</span>
-          </div>
-        </div>
-        <div class="header-status" aria-label="Runtime status">
-          <span class="runtime-badge" id="runtime-badge" data-state="loading">
-            <span class="runtime-dot" aria-hidden="true"></span>
-            <span id="runtime-label">loading runtime</span>
-          </span>
-          <span class="runtime-badge gateway-badge" id="gateway-badge" data-state="loading">
-            <span class="runtime-dot" aria-hidden="true"></span>
-            <span id="gateway-label">checking model gateway</span>
-          </span>
-          <span class="session-chip" aria-label="Session scope">ephemeral</span>
-        </div>
+    <div class="site-shell">
+      <header class="site-nav" aria-label="Primary navigation">
+        <a class="site-brand" href="/web/" aria-label="A/RVM home">
+          <span class="brand-mark" aria-hidden="true">▲</span>
+          <span class="brand-slash" aria-hidden="true">/</span>
+          <span class="brand-name">a/rvm</span>
+        </a>
+        <nav class="site-links" aria-label="A/RVM links">
+          <a href="#about">docs</a>
+          <a href="#terminal">try</a>
+          <a href="https://github.com/kyambuthia/a-rust-vm">source</a>
+        </nav>
       </header>
 
-      <div class="workspace-layout">
-        <main class="workspace-main" aria-label="Terminal workspace">
-          <section class="terminal-window" id="terminal-window" aria-label="A/RVM terminal">
-            <div class="terminal-bar">
-              <div class="terminal-identity">
-                <span class="terminal-title">terminal</span>
-                <span class="terminal-version">v0.1.0 · terminal-first · Run /help for commands</span>
-              </div>
-              <div class="terminal-actions">
-                <label class="ghost-button upload-button" for="file-input">upload</label>
-                <input id="file-input" class="upload-input" type="file" multiple aria-label="Upload files to the guest VM">
-                <button class="ghost-button" id="expand-terminal" type="button" aria-expanded="false" aria-controls="terminal-body">expand ↗</button>
-              </div>
-            </div>
+      <main class="try-layout">
+        <section class="intro" id="about" aria-label="About A/RVM">
+          <p>A small, open, deterministic virtual machine.</p>
+          <p>Run expressions and bytecode in a browser workspace. Ask an agent when you want a second pair of hands.</p>
+          <p class="intro-meta">v0.1.0 · experimental · anonymous and ephemeral</p>
+        </section>
 
-            <div class="quick-actions" role="toolbar" aria-label="Quick actions">
-              <button type="button" class="quick-button" id="quick-help" aria-label="Insert help command">/help</button>
-              <button type="button" class="quick-button" id="quick-files" aria-label="List guest files">/files</button>
-              <button type="button" class="quick-button" id="quick-jobs" aria-label="List recent jobs">/jobs</button>
-              <button type="button" class="quick-button" id="quick-upload" aria-label="Choose files to upload">upload</button>
-              <button type="button" class="quick-button" id="quick-clear" aria-label="Clear terminal output">clear</button>
+        <section class="terminal-window" id="terminal" aria-label="A/RVM terminal">
+          <div class="terminal-bar">
+            <div class="terminal-identity">
+              <span class="terminal-title">a/rvm</span>
+              <span class="terminal-version">v0.1.0 · Run /help for commands</span>
             </div>
-
-            <div class="empty-state" id="empty-state" aria-live="polite">
-              <p class="empty-title">Start in the terminal — everything runs here.</p>
-              <p class="empty-copy">Try an expression, a slash command, or ask the agent. This anonymous session is in-memory and clears when the session expires or restarts — no account, no durable storage.</p>
-              <div class="chip-row" role="group" aria-label="Example prompts">
-                <button type="button" class="chip" data-insert="12 * 7">12 * 7</button>
-                <button type="button" class="chip" data-insert="/help">/help</button>
-                <button type="button" class="chip" data-insert="/files">/files</button>
-                <button type="button" class="chip" data-insert="ask what can you do with my uploaded files?">ask the agent</button>
-              </div>
+            <div class="terminal-actions">
+              <label class="terminal-action upload-button" for="file-input">upload</label>
+              <input id="file-input" class="upload-input" type="file" multiple aria-label="Upload files to the guest VM">
+              <button class="terminal-action" id="expand-terminal" type="button" aria-expanded="false" aria-controls="terminal-body">expand ↗</button>
             </div>
+          </div>
 
-            <div class="terminal-body" id="terminal-body">
-              <div class="terminal-output" id="terminal-output" role="log" aria-live="polite" aria-label="Terminal output"></div>
-              <form class="terminal-form" id="terminal-form" aria-label="Terminal input">
-                <label class="prompt" for="terminal-input">›</label>
-                <input id="terminal-input" name="command" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Terminal input" placeholder="ask the agent or run 8 * 5 — ↑/↓ history, Esc to clear" disabled>
-                <button type="submit" class="sr-only">Run command</button>
-              </form>
-            </div>
+          <div class="terminal-body" id="terminal-body">
+            <div class="terminal-output" id="terminal-output" role="log" aria-live="polite" aria-label="Terminal output"></div>
+            <form class="terminal-form" id="terminal-form" aria-label="Terminal input">
+              <label class="prompt" for="terminal-input">┃</label>
+              <input id="terminal-input" name="command" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Terminal input" placeholder="" disabled>
+              <button type="submit" class="sr-only">Run command</button>
+            </form>
+          </div>
 
-            <div class="terminal-foot">
-              <span>anonymous session · in-memory</span>
-              <span>VM tools work offline; model gateway is optional</span>
-            </div>
-          </section>
-        </main>
+          <div class="terminal-foot" aria-label="Runtime status">
+            <span class="status-inline" id="runtime-badge" data-state="loading">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="runtime-label">checking runtime</span>
+            </span>
+            <span class="status-inline" id="gateway-badge" data-state="loading">
+              <span id="gateway-label">checking model</span>
+            </span>
+          </div>
+        </section>
 
-        <aside class="workspace-rail" aria-label="Context and operations">
-          <section class="rail-card" aria-labelledby="rail-session-title">
-            <h2 class="rail-title" id="rail-session-title">session scope</h2>
-            <p class="rail-copy">Anonymous ephemeral session. Files and jobs live in-memory for this browser session and clear when the session expires or restarts.</p>
-            <dl class="rail-meta">
-              <div><dt>scope</dt><dd>anonymous session</dd></div>
-              <div><dt>storage</dt><dd>in-memory</dd></div>
-              <div><dt>persistence</dt><dd>clears on expire / restart</dd></div>
-            </dl>
-            <p class="rail-status" id="rail-gateway-copy" aria-live="polite">Checking model gateway…</p>
-          </section>
-
-          <section class="rail-card" aria-labelledby="rail-files-title">
-            <div class="rail-card-head">
-              <h2 class="rail-title" id="rail-files-title">guest files</h2>
-              <button type="button" class="rail-action" id="rail-files-refresh" aria-label="Refresh guest files">refresh</button>
-            </div>
-            <p class="rail-copy muted" id="rail-files-empty">No uploaded files yet. Use upload to add a CSV or PDF to the guest VM.</p>
-            <ul class="rail-list" id="rail-files-list" aria-label="Uploaded guest files"></ul>
-            <p class="rail-hint">Stored ephemerally under <code>/workspace/uploads</code>.</p>
-          </section>
-
-          <section class="rail-card" aria-labelledby="rail-jobs-title">
-            <div class="rail-card-head">
-              <h2 class="rail-title" id="rail-jobs-title">recent jobs</h2>
-              <button type="button" class="rail-action" id="rail-jobs-refresh" aria-label="Refresh recent jobs">refresh</button>
-            </div>
-            <p class="rail-copy muted" id="rail-jobs-empty">No jobs yet. Tabulate a CSV or inspect a PDF to see activity here.</p>
-            <ul class="rail-list" id="rail-jobs-list" aria-label="Recent jobs"></ul>
-            <p class="rail-hint">Jobs are in-memory and observable from the terminal via <code>/jobs</code>.</p>
-          </section>
-        </aside>
-      </div>
+        <p class="below-note">The VM is local and deterministic. Files, jobs, and model context live only in this anonymous browser session.</p>
+      </main>
     </div>
 
-    <script type="module" src="./main.js?v=ws-1"></script>
+    <script type="module" src="./main.js?v=fx-1"></script>
   </body>
 </html>
