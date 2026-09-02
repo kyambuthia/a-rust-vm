@@ -9,27 +9,76 @@ const terminalInput = document.querySelector("#terminal-input");
 const expandButton = document.querySelector("#expand-terminal");
 const runtimeBadge = document.querySelector("#runtime-badge");
 const runtimeLabel = document.querySelector("#runtime-label");
+const gatewayBadge = document.querySelector("#gateway-badge");
+const gatewayLabel = document.querySelector("#gateway-label");
+const railGatewayCopy = document.querySelector("#rail-gateway-copy");
 const fileInput = document.querySelector("#file-input");
+const emptyState = document.querySelector("#empty-state");
+const railFilesList = document.querySelector("#rail-files-list");
+const railFilesEmpty = document.querySelector("#rail-files-empty");
+const railJobsList = document.querySelector("#rail-jobs-list");
+const railJobsEmpty = document.querySelector("#rail-jobs-empty");
+const quickHelp = document.querySelector("#quick-help");
+const quickFiles = document.querySelector("#quick-files");
+const quickJobs = document.querySelector("#quick-jobs");
+const quickUpload = document.querySelector("#quick-upload");
+const quickClear = document.querySelector("#quick-clear");
+const railFilesRefresh = document.querySelector("#rail-files-refresh");
+const railJobsRefresh = document.querySelector("#rail-jobs-refresh");
 
 const maxUploadBytes = 1024 * 1024;
 
 const state = {
   program: null,
   agentBusy: false,
+  history: [],
+  historyIndex: -1,
+  draft: "",
 };
+
+function setGatewayState(tone, label) {
+  if (!gatewayBadge || !gatewayLabel) return;
+  gatewayBadge.dataset.state = tone;
+  gatewayLabel.textContent = label;
+  if (railGatewayCopy) {
+    railGatewayCopy.textContent = label === "model gateway online"
+      ? "Model gateway online — agent tools and file helpers are available. VM tools always work."
+      : label === "model gateway unavailable"
+        ? "Model gateway unavailable; VM tools still work. Retry /ask later or use local VM commands."
+        : label;
+    railGatewayCopy.dataset.tone = tone === "ready" ? "ok" : tone === "error" || tone === "unavailable" ? "error" : "";
+  }
+}
+
+function syncEmptyState() {
+  if (!emptyState) return;
+  const hasOutput = terminalOutput.children.length > 0;
+  emptyState.classList.toggle("hidden", hasOutput);
+}
 
 function writeLine(text, kind = "muted") {
   const line = document.createElement("div");
+  const labelMap = {
+    command: "cmd",
+    result: "out",
+    muted: "info",
+    tool: "tool",
+    error: "error",
+  };
   line.className = `terminal-line ${kind}`;
+  line.dataset.kind = labelMap[kind] ?? kind;
+  line.setAttribute("aria-label", `${labelMap[kind] ?? kind}: ${text}`);
   line.textContent = text;
   terminalOutput.append(line);
   terminalOutput.scrollTop = terminalOutput.scrollHeight;
+  syncEmptyState();
 }
 
 function printWelcome() {
-  writeLine("a/rvm v0.1.0 · Run /help for commands");
-  writeLine("[ready] wasm runtime online", "result");
-  writeLine("[hint] ask anything · upload files · /load 2 + 3", "muted");
+  writeLine("a/rvm v0.1.0 · anonymous session · in-memory", "result");
+  writeLine("[ready] wasm runtime online — VM is local and deterministic", "result");
+  writeLine("[scope] anonymous session · in-memory · clears when the session expires/restarts", "muted");
+  writeLine("[hint] ask the agent, run 8 * 5, or try /help · files and jobs are ephemeral", "muted");
 }
 
 async function printSystemInfo() {
@@ -39,8 +88,54 @@ async function printSystemInfo() {
     const info = await response.json();
     const workspaceMode = info.features?.workspaces?.durable ? "durable" : "in-memory";
     writeLine(`[platform] API ${info.api_version} · workspaces ${workspaceMode} · bytecode executor ready`, "muted");
+    if (info.model_gateway?.configured) {
+      setGatewayState("ready", "model gateway online");
+    } else {
+      setGatewayState("unavailable", "model gateway unavailable");
+    }
   } catch (error) {
     writeLine(`[platform warning] system API unavailable: ${error.message}`, "error");
+    writeLine("[gateway] model gateway unavailable; VM tools still work", "muted");
+    setGatewayState("unavailable", "model gateway unavailable");
+  }
+}
+
+function renderFiles(files) {
+  if (!railFilesList || !railFilesEmpty) return;
+  railFilesList.replaceChildren();
+  if (!files.length) {
+    railFilesEmpty.classList.remove("hidden");
+    return;
+  }
+  railFilesEmpty.classList.add("hidden");
+  for (const file of files.slice(0, 8)) {
+    const item = document.createElement("li");
+    const name = document.createElement("strong");
+    name.textContent = file.path;
+    const meta = document.createElement("span");
+    meta.textContent = `${file.bytes} bytes`;
+    item.append(name, meta);
+    railFilesList.append(item);
+  }
+}
+
+function renderJobs(jobs) {
+  if (!railJobsList || !railJobsEmpty) return;
+  railJobsList.replaceChildren();
+  if (!jobs.length) {
+    railJobsEmpty.classList.remove("hidden");
+    return;
+  }
+  railJobsEmpty.classList.add("hidden");
+  for (const job of jobs.slice(0, 6)) {
+    const item = document.createElement("li");
+    item.dataset.state = job.state;
+    const title = document.createElement("strong");
+    title.textContent = `job ${job.id} · ${job.state}`;
+    const detail = document.createElement("span");
+    detail.textContent = job.output_path ?? job.error ?? job.input_path ?? job.executor;
+    item.append(title, detail);
+    railJobsList.append(item);
   }
 }
 
@@ -79,11 +174,13 @@ async function listGuestFiles() {
     }
     if (!payload.files?.length) {
       writeLine("[guest] no uploaded files", "muted");
+      renderFiles([]);
       return;
     }
     for (const file of payload.files) {
       writeLine(`[guest] ${file.path} · ${file.bytes} bytes`, "muted");
     }
+    renderFiles(payload.files);
   } catch (error) {
     writeLine(`[guest files error] ${error.message}`, "error");
   }
@@ -113,6 +210,7 @@ async function tabulateFile(value) {
     writeLine(`[table] ${payload.table.rows} rows · ${payload.table.columns.length} columns · ${payload.table.delimiter.toUpperCase()}`, "result");
     writeLine(`[columns] ${columns || "no columns"}`, "muted");
     writeLine(`[output] ${payload.table.output_path}`, "muted");
+    await listJobs();
   } catch (error) {
     writeLine(`[tabulate error] ${error.message}`, "error");
   }
@@ -139,6 +237,7 @@ async function inspectPdf(value) {
     writeLine(`[pdf] version ${payload.pdf.version} · ${payload.pdf.bytes} bytes · ${payload.pdf.page_objects_estimate} page objects estimated`, "result");
     writeLine(`[output] ${payload.pdf.output_path}`, "muted");
     writeLine("[pdf] text extraction requires a dedicated parser sandbox and is not enabled yet", "muted");
+    await listJobs();
   } catch (error) {
     writeLine(`[pdf error] ${error.message}`, "error");
   }
@@ -153,12 +252,14 @@ async function listJobs() {
     }
     if (!payload.jobs?.length) {
       writeLine("[jobs] no jobs", "muted");
+      renderJobs([]);
       return;
     }
     for (const job of payload.jobs) {
       const detail = job.output_path ?? job.error ?? job.input_path;
       writeLine(`[job ${job.id}] ${job.state} · ${job.executor} · ${detail}`, job.state === "failed" ? "error" : "muted");
     }
+    renderJobs(payload.jobs);
   } catch (error) {
     writeLine(`[jobs error] ${error.message}`, "error");
   }
@@ -179,7 +280,7 @@ function printAgentEvent(event) {
       writeLine(event.content, "result");
       break;
     case "tool_call":
-      writeLine(`[tool] ${event.name}`, "command");
+      writeLine(`[tool] ${event.name}`, "tool");
       break;
     case "tool_result":
       writeLine(`[tool result] ${event.content}`, event.is_error ? "error" : "muted");
@@ -532,6 +633,7 @@ function executeCommand(rawCommand, instance) {
 
   if (normalized === "/clear" || normalized === "clear") {
     terminalOutput.replaceChildren();
+    syncEmptyState();
     return;
   }
 
@@ -615,6 +717,13 @@ function executeCommand(rawCommand, instance) {
   }
 }
 
+function pushHistory(value) {
+  if (!value.trim()) return;
+  if (state.history[state.history.length - 1] === value) return;
+  state.history.push(value);
+  if (state.history.length > 80) state.history.shift();
+}
+
 function submitCommand(instance, command) {
   if (state.agentBusy) {
     return;
@@ -625,8 +734,86 @@ function submitCommand(instance, command) {
     return;
   }
 
+  pushHistory(trimmedCommand);
+  state.historyIndex = -1;
+  state.draft = "";
   writeLine(`› ${trimmedCommand}`, "command");
   executeCommand(trimmedCommand, instance);
+}
+
+function insertCommand(text) {
+  terminalInput.value = text;
+  terminalInput.focus();
+}
+
+terminalInput.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    state.historyIndex = -1;
+    terminalInput.value = "";
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    if (state.history.length === 0) return;
+    if (state.historyIndex === -1) {
+      state.draft = terminalInput.value;
+      state.historyIndex = state.history.length - 1;
+    } else if (state.historyIndex > 0) {
+      state.historyIndex -= 1;
+    }
+    terminalInput.value = state.history[state.historyIndex] ?? "";
+    requestAnimationFrame(() => terminalInput.setSelectionRange(terminalInput.value.length, terminalInput.value.length));
+  } else if (event.key === "ArrowDown") {
+    event.preventDefault();
+    if (state.historyIndex === -1) return;
+    if (state.historyIndex === state.history.length - 1) {
+      state.historyIndex = -1;
+      terminalInput.value = state.draft;
+    } else {
+      state.historyIndex += 1;
+      terminalInput.value = state.history[state.historyIndex] ?? "";
+    }
+    requestAnimationFrame(() => terminalInput.setSelectionRange(terminalInput.value.length, terminalInput.value.length));
+  }
+});
+
+quickHelp?.addEventListener("click", () => {
+  insertCommand("/help");
+});
+quickFiles?.addEventListener("click", () => {
+  insertCommand("/files");
+  if (terminalInput.value.trim().toLowerCase() === "/files") {
+    const form = terminalForm;
+    form.requestSubmit();
+  }
+});
+quickJobs?.addEventListener("click", () => {
+  insertCommand("/jobs");
+  if (terminalInput.value.trim().toLowerCase() === "/jobs") {
+    terminalForm.requestSubmit();
+  }
+});
+quickUpload?.addEventListener("click", () => fileInput.click());
+quickClear?.addEventListener("click", () => {
+  insertCommand("/clear");
+  terminalForm.requestSubmit();
+  terminalInput.focus();
+});
+railFilesRefresh?.addEventListener("click", () => {
+  void listGuestFiles();
+  terminalInput.focus();
+});
+railJobsRefresh?.addEventListener("click", () => {
+  void listJobs();
+  terminalInput.focus();
+});
+
+for (const chip of document.querySelectorAll(".chip[data-insert]")) {
+  chip.addEventListener("click", () => {
+    const value = chip.getAttribute("data-insert") ?? "";
+    insertCommand(value);
+  });
 }
 
 try {
@@ -653,6 +840,7 @@ try {
 } catch (error) {
   runtimeBadge.dataset.state = "error";
   runtimeLabel.textContent = "runtime unavailable";
+  setGatewayState("unavailable", "model gateway unavailable");
   writeLine(`[error] ${error.message}`, "error");
 }
 

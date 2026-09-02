@@ -388,7 +388,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
             "application/wasm",
             set_cookie.as_deref(),
         ),
-        ("GET", "/api/v1/system") => handle_system_info(&mut stream, set_cookie.as_deref()),
+        ("GET", "/api/v1/system") => handle_system_info(&mut stream, state, set_cookie.as_deref()),
         ("POST", "/api/agent") => handle_agent(
             &mut stream,
             &request.body,
@@ -414,11 +414,19 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
     }
 }
 
-fn handle_system_info(stream: &mut TcpStream, set_cookie: Option<&str>) {
-    match serde_json::to_vec(&crate::protocol::SystemInfo::current()) {
+fn handle_system_info(stream: &mut TcpStream, state: &ServerState, set_cookie: Option<&str>) {
+    match system_info_payload(state.model.is_some()) {
         Ok(body) => write_response(stream, 200, "application/json", &body, set_cookie),
         Err(_) => write_error(stream, 500, "internal error", set_cookie),
     }
+}
+
+fn system_info_payload(model_configured: bool) -> Result<Vec<u8>, serde_json::Error> {
+    let mut info = serde_json::to_value(crate::protocol::SystemInfo::current())?;
+    info["model_gateway"] = serde_json::json!({
+        "configured": model_configured,
+    });
+    serde_json::to_vec(&info)
 }
 
 struct HttpRequest {
@@ -1222,5 +1230,14 @@ mod tests {
         assert!(header.contains("X-Frame-Options: DENY"));
         assert!(header.contains("Content-Security-Policy:"));
         assert!(header.contains("Cross-Origin-Opener-Policy: same-origin"));
+    }
+
+    #[test]
+    fn system_info_reports_model_configuration_without_secrets() {
+        let configured = String::from_utf8(super::system_info_payload(true).unwrap()).unwrap();
+        let unavailable = String::from_utf8(super::system_info_payload(false).unwrap()).unwrap();
+        assert!(configured.contains(r#""model_gateway":{"configured":true}"#));
+        assert!(unavailable.contains(r#""model_gateway":{"configured":false}"#));
+        assert!(!configured.contains("OPENROUTER_API_KEY"));
     }
 }
