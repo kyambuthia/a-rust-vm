@@ -53,14 +53,34 @@ alongside it. Agent events arrive as newline-delimited JSON while the turn is
 running. Use the `upload` control to copy files into the guest VM at
 `/workspace/uploads/<filename>`. Uploads are binary-safe, limited to 1 MiB per
 file, and accept only a single filename component. The browser agent uses the
-same process-lifetime guest VM, so it can inspect uploaded files without
+same anonymous guest session, so it can inspect uploaded files without
 receiving a host filesystem path.
 
-Use `/files` to list the uploaded guest files independently of the agent. The
-browser host keeps one local, fixed-model session warm for its lifetime, which
-lets follow-up requests reuse provider context. The local model service runs
-against an empty temporary project with its built-in tools denied; browser
-requests retain access only to the guest-prefixed A/RVM tools.
+Use `/files` to list the uploaded guest files independently of the agent.
+Browser requests retain access only to the guest-prefixed A/RVM tools.
+
+### Browser server OpenRouter configuration
+
+The hosted browser server calls OpenRouter directly from the server process
+via `POST https://openrouter.ai/api/v1/chat/completions` using a cloned,
+server-side adapter per request. It does not require the `opencode`
+executable and does not shell out to `curl`.
+
+```bash
+export OPENROUTER_API_KEY=sk-or-v1-...
+export OPENROUTER_MODEL=~openai/gpt-latest
+cargo run -- serve
+```
+
+- `OPENROUTER_API_KEY` (required): read from the server process environment only. Never put the key in browser responses, source, logs, command arguments, or persisted files.
+- `OPENROUTER_MODEL` (optional): explicit model id; defaults to `~openai/gpt-latest` when unset.
+- `OPENROUTER_SITE_URL` / `OPENROUTER_SITE_TITLE` (optional): attribution headers sent as `HTTP-Referer` / `X-OpenRouter-Title`; default to `https://asiliano.online` / `A/RVM` when unset.
+- `OPENROUTER_TIMEOUT_SECS` (optional): bounded request timeout 1-120s, default 30s with a 10s connect timeout; no unsafe automatic retries.
+- `OPENROUTER_MAX_TOKENS` (optional): bounded completion budget 128-4096, default 2048.
+
+If the key is missing or the provider is unavailable, the server still serves
+`/web/` and the static Wasm artifact, but `POST /api/agent` returns a bounded
+`503` with a sanitized error and no secret leakage.
 
 Uploaded CSV and TSV files can be processed through the browser terminal with
 `/tabulate <filename>`, for example `/tabulate sales.csv`. The built-in,
@@ -133,9 +153,9 @@ cargo run -- agent
 ```
 
 The hosted browser service must load its OpenRouter key from an AWS-managed
-secret and must call the provider from the server side. OpenCode and Muse are
-development-time orchestration tools and are not required by the hosted
-runtime.
+secret or server process environment and must call the provider from the
+server side. OpenCode and Muse remain optional development orchestration
+tools and are not required by the hosted runtime.
 
 ## Connect an external model process
 

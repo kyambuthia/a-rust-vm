@@ -10,6 +10,8 @@ pub mod control_plane_store;
 pub mod guest_tools;
 pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod openrouter;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod persistent_model;
 pub mod program;
 pub mod protocol;

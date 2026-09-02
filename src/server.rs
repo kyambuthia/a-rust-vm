@@ -6,10 +6,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +20,7 @@ use crate::guest_tools::guest_coding_tool_registry_shared;
 use crate::jobs::{
     JobRecord, JobStore, PdfSummary, TableSummary, inspect_uploaded_pdf, tabulate_uploaded_file,
 };
-use crate::persistent_model::PersistentModelService;
+use crate::openrouter::OpenRouterModel;
 use crate::runtime::VmInstance;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -130,7 +129,7 @@ struct AnonStore {
 
 struct ServerState {
     anon: Arc<AnonStore>,
-    model_service: Arc<PersistentModelService>,
+    model: Option<OpenRouterModel>,
     global_agents: Arc<Mutex<usize>>,
     allowed_origin: String,
 }
@@ -279,20 +278,20 @@ pub fn run(root: PathBuf) {
         eprintln!("failed to bind browser host on port {port}: {e}");
         std::process::exit(2);
     });
-    let model_directory = create_model_working_directory().unwrap_or_else(|e| {
-        eprintln!("failed to create model runner directory: {e}");
-        std::process::exit(2);
-    });
     println!("A/RVM browser host: http://127.0.0.1:{port}/web/");
-    let model_service = Arc::new(
-        PersistentModelService::start(&model_directory).unwrap_or_else(|e| {
-            eprintln!("failed to start persistent model service: {e}");
-            std::process::exit(2);
-        }),
-    );
+    let model = match OpenRouterModel::from_env() {
+        Ok(model) => {
+            println!("A/RVM model: {} via OpenRouter", model.model_name());
+            Some(model)
+        }
+        Err(error) => {
+            eprintln!("A/RVM model unavailable: {error}; /api/agent will return 503");
+            None
+        }
+    };
     let state = Arc::new(ServerState {
         anon: Arc::new(AnonStore::with_secure_cookie(secure_cookie)),
-        model_service,
+        model,
         global_agents: Arc::new(Mutex::new(0)),
         allowed_origin,
     });
@@ -541,7 +540,12 @@ fn handle_agent(
         }
         *global += 1;
     }
-    let model = state.model_service.model.clone();
+    let Some(model) = state.model.clone() else {
+        *session.agent_active.lock().unwrap() = false;
+        *state.global_agents.lock().unwrap() -= 1;
+        write_error(stream, 503, "model is not configured", set_cookie);
+        return;
+    };
     let mut router = ModelRouter::new();
     if let Err(e) = router
         .register_model("guest", ModelCapabilities::STREAMING_TOOLS, model)
@@ -822,40 +826,6 @@ fn guest_upload_path(name: &str) -> Result<String, String> {
         return Err("file name contains a control character".to_owned());
     }
     Ok(format!("/workspace/uploads/{name}"))
-}
-
-fn create_model_working_directory() -> Result<PathBuf, String> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system clock is before the Unix epoch: {e}"))?
-        .as_nanos();
-    let base = env::temp_dir();
-    let process_id = std::process::id();
-    for attempt in 0..16 {
-        let path = base.join(format!(
-            "a-rust-vm-model-{process_id}-{timestamp}-{attempt}"
-        ));
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                let output = Command::new("git")
-                    .args(["init", "--quiet"])
-                    .current_dir(&path)
-                    .output()
-                    .map_err(|e| format!("failed to initialize model runner project: {e}"))?;
-                if !output.status.success() {
-                    let detail = String::from_utf8_lossy(&output.stderr);
-                    return Err(format!(
-                        "failed to initialize model runner project: {}",
-                        detail.trim()
-                    ));
-                }
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("failed to create model runner directory: {e}")),
-        }
-    }
-    Err("could not allocate a unique model runner directory".to_owned())
 }
 
 fn handle_approval(
