@@ -31,6 +31,10 @@ fn main() {
         run_doctor(&arguments[1..]);
         return;
     }
+    if command == Some("workspace") {
+        run_workspace_command(&arguments[1..]);
+        return;
+    }
     if matches!(command, Some("run" | "check" | "disassemble" | "trace")) {
         run_program_command(command.expect("matched above"), &arguments[1..]);
         return;
@@ -78,10 +82,118 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent                   Start the interactive coding agent\n  serve                   Host the browser and agent API\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent                   Start the interactive coding agent\n  serve                   Host the browser and agent API\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
+}
+
+fn run_workspace_command(arguments: &[String]) {
+    use a_rust_vm::control_plane::CapabilityGrant;
+    use a_rust_vm::control_plane_store::ControlPlaneStore;
+    use a_rust_vm::runtime::ResourceLimits;
+
+    let owner = env::var("A_RVM_OWNER")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_else(|_| "local".to_owned());
+    let store = ControlPlaneStore::new(control_plane_path(), 64, ResourceLimits::default());
+    let mut plane = store.load().unwrap_or_else(|error| {
+        eprintln!("cannot load workspace state: {error}");
+        std::process::exit(1);
+    });
+    let command = arguments.first().map(String::as_str);
+    let result = match command {
+        Some("create") if arguments.len() == 2 => {
+            plane.create_workspace(&owner, &arguments[1]).map(|()| {
+                store.save(&plane).unwrap_or_else(|error| {
+                    eprintln!("cannot save workspace state: {error}");
+                    std::process::exit(1);
+                });
+                println!("created workspace {owner}/{}", arguments[1]);
+            })
+        }
+        Some("list") if arguments.len() == 1 => {
+            let workspaces = plane.list(&owner);
+            if workspaces.is_empty() {
+                println!("no workspaces for {owner}");
+            } else {
+                for workspace in workspaces {
+                    println!(
+                        "{}\t{:?}\t{} capabilities\t{} observations",
+                        workspace.id,
+                        workspace.state,
+                        workspace.capabilities.len(),
+                        workspace.observations.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some("show") if arguments.len() == 2 => {
+            plane.inspect(&owner, &arguments[1]).map(|workspace| {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&workspace)
+                        .expect("workspace view is serializable")
+                );
+            })
+        }
+        Some("grant") if arguments.len() >= 6 => {
+            let grant = CapabilityGrant::new(
+                &arguments[2],
+                &arguments[3],
+                &arguments[4],
+                arguments[5..].iter().cloned(),
+            );
+            grant
+                .and_then(|grant| plane.grant_capability(&owner, &arguments[1], grant))
+                .map(|()| {
+                    store.save(&plane).unwrap_or_else(|error| {
+                        eprintln!("cannot save workspace state: {error}");
+                        std::process::exit(1);
+                    });
+                    println!(
+                        "granted capability {} to {owner}/{}",
+                        arguments[2], arguments[1]
+                    );
+                })
+        }
+        Some("revoke") if arguments.len() == 3 => plane
+            .revoke_capability(&owner, &arguments[1], &arguments[2])
+            .map(|()| {
+                store.save(&plane).unwrap_or_else(|error| {
+                    eprintln!("cannot save workspace state: {error}");
+                    std::process::exit(1);
+                });
+                println!(
+                    "revoked capability {} from {owner}/{}",
+                    arguments[2], arguments[1]
+                );
+            }),
+        _ => {
+            eprintln!(
+                "usage:\n  arvm workspace create <id>\n  arvm workspace list\n  arvm workspace show <id>\n  arvm workspace grant <workspace> <capability> <kind> <resource> <action>...\n  arvm workspace revoke <workspace> <capability>\n\nSet A_RVM_OWNER to select the local principal."
+            );
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("workspace error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn control_plane_path() -> std::path::PathBuf {
+    if let Some(directory) = env::var_os("A_RVM_STATE_DIR") {
+        return std::path::PathBuf::from(directory).join("control-plane.json");
+    }
+    if let Some(directory) = env::var_os("XDG_STATE_HOME") {
+        return std::path::PathBuf::from(directory).join("a-rust-vm/control-plane.json");
+    }
+    env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".local/state/a-rust-vm/control-plane.json")
 }
 
 fn run_doctor(arguments: &[String]) {

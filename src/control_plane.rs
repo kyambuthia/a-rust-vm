@@ -7,18 +7,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::runtime::{ResourceLimits, VmManager, VmManagerError, VmSummary};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceState {
     Active,
     Suspended,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityGrant {
     pub id: String,
     pub kind: String,
@@ -55,7 +55,7 @@ impl CapabilityGrant {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     pub sequence: u64,
     pub capability_id: String,
@@ -63,7 +63,7 @@ pub struct Observation {
     pub action: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditKind {
     WorkspaceCreated,
@@ -75,7 +75,7 @@ pub enum AuditKind {
     AccessDenied,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub sequence: u64,
     pub workspace_id: String,
@@ -95,7 +95,7 @@ pub struct WorkspaceView {
     pub audit: Vec<AuditEvent>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceRecord {
     id: String,
     owner: String,
@@ -112,6 +112,15 @@ pub struct ControlPlane {
     next_sequence: u64,
 }
 
+pub const CONTROL_PLANE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlaneSnapshot {
+    pub schema_version: u32,
+    next_sequence: u64,
+    workspaces: Vec<WorkspaceRecord>,
+}
+
 impl ControlPlane {
     pub fn new(max_workspaces: usize, runtime_limits: ResourceLimits) -> Self {
         Self {
@@ -119,6 +128,41 @@ impl ControlPlane {
             runtimes: VmManager::with_max_instances(max_workspaces, runtime_limits),
             next_sequence: 0,
         }
+    }
+
+    pub fn snapshot(&self) -> ControlPlaneSnapshot {
+        ControlPlaneSnapshot {
+            schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+            next_sequence: self.next_sequence,
+            workspaces: self.workspaces.values().cloned().collect(),
+        }
+    }
+
+    pub fn restore(
+        snapshot: ControlPlaneSnapshot,
+        max_workspaces: usize,
+        runtime_limits: ResourceLimits,
+    ) -> Result<Self, ControlPlaneError> {
+        if snapshot.schema_version != CONTROL_PLANE_SCHEMA_VERSION {
+            return Err(ControlPlaneError::UnsupportedSchema {
+                expected: CONTROL_PLANE_SCHEMA_VERSION,
+                actual: snapshot.schema_version,
+            });
+        }
+        let mut plane = Self::new(max_workspaces, runtime_limits);
+        plane.next_sequence = snapshot.next_sequence;
+        for record in snapshot.workspaces {
+            let key = (record.owner.clone(), record.id.clone());
+            if plane.workspaces.contains_key(&key) {
+                return Err(ControlPlaneError::AlreadyExists {
+                    owner: record.owner,
+                    workspace_id: record.id,
+                });
+            }
+            plane.runtimes.create(&record.owner, &record.id)?;
+            plane.workspaces.insert(key, record);
+        }
+        Ok(plane)
     }
 
     pub fn create_workspace(&mut self, owner: &str, id: &str) -> Result<(), ControlPlaneError> {
@@ -386,6 +430,10 @@ pub enum ControlPlaneError {
     },
     WorkspaceSuspended,
     Runtime(String),
+    UnsupportedSchema {
+        expected: u32,
+        actual: u32,
+    },
 }
 
 impl fmt::Display for ControlPlaneError {
@@ -412,6 +460,10 @@ impl fmt::Display for ControlPlaneError {
             ),
             Self::WorkspaceSuspended => f.write_str("workspace is suspended"),
             Self::Runtime(message) => f.write_str(message),
+            Self::UnsupportedSchema { expected, actual } => write!(
+                f,
+                "unsupported control-plane schema: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -471,5 +523,19 @@ mod tests {
         assert_eq!(plane.list("alice").len(), 1);
         assert_eq!(plane.list("bob").len(), 1);
         assert!(plane.inspect("mallory", "shared-name").is_err());
+    }
+
+    #[test]
+    fn snapshots_restore_policy_and_audit_with_fresh_runtimes() {
+        let limits = ResourceLimits::default();
+        let mut plane = ControlPlane::new(4, limits);
+        plane.create_workspace("alice", "research").unwrap();
+        let grant =
+            CapabilityGrant::new("issues", "github", "repo:a/rvm", ["read_issues"]).unwrap();
+        plane.grant_capability("alice", "research", grant).unwrap();
+        let restored = ControlPlane::restore(plane.snapshot(), 4, limits).unwrap();
+        let workspace = restored.inspect("alice", "research").unwrap();
+        assert_eq!(workspace.capabilities.len(), 1);
+        assert_eq!(workspace.runtime.process_count, 0);
     }
 }

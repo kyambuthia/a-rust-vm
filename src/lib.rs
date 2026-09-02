@@ -5,6 +5,8 @@
 
 pub mod agent;
 pub mod control_plane;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod control_plane_store;
 pub mod guest_tools;
 pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
