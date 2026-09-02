@@ -48,12 +48,17 @@ summary:focus-visible {
 }
 
 .site-nav {
-  order: 2;
+  position: fixed;
+  z-index: 20;
+  right: 32px;
+  bottom: 0;
+  left: 32px;
   display: flex;
   align-items: center;
   gap: 24px;
   min-height: 64px;
   border-top: 1px solid var(--line);
+  background: var(--background);
   color: var(--muted);
 }
 
@@ -102,6 +107,7 @@ summary:focus-visible {
   flex-direction: column;
   width: 100%;
   min-height: 0;
+  padding-bottom: 64px;
   margin: 0;
 }
 
@@ -244,7 +250,7 @@ summary:focus-visible {
 
 @media (max-width: 720px) {
   .site-shell { padding: 0 16px; }
-  .site-nav { gap: 16px; }
+  .site-nav { right: 16px; left: 16px; gap: 16px; }
   .site-links { gap: 16px; }
   .site-links a:nth-child(2), .site-links a:nth-child(3) { display: none; }
   .demo-actions { gap: 14px; }
@@ -253,7 +259,7 @@ summary:focus-visible {
 
 @media (max-width: 420px) {
   .site-shell { padding: 0 12px; }
-  .site-nav { min-height: 56px; }
+  .site-nav { right: 12px; left: 12px; min-height: 56px; }
   .site-links { margin-left: auto; }
   .site-links a:first-child { display: none; }
   .demo-note { gap: 12px; font-size: 12px; }
