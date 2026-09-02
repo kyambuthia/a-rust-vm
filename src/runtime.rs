@@ -8,6 +8,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
+use serde::Serialize;
+
 use crate::{Instruction, StepResult, Vm, VmError};
 
 const DEFAULT_MAX_INODES: usize = 4_096;
@@ -19,7 +21,7 @@ const DEFAULT_MAX_STEPS: usize = 100_000;
 pub type Pid = u32;
 
 /// Limits applied independently to one guest VM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ResourceLimits {
     pub max_inodes: usize,
     pub max_bytes: usize,
@@ -844,7 +846,7 @@ impl From<RuntimeError> for VmManagerError {
 }
 
 /// A read-only summary used by a control plane to list a user's VMs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VmSummary {
     pub owner: String,
     pub id: String,
