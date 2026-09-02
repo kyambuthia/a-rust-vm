@@ -79,18 +79,14 @@ summary:focus-visible {
 .brand-slash { color: var(--quiet); font-size: 16px; }
 .brand-name { color: var(--text); font-size: 18px; letter-spacing: -0.06em; }
 
-.site-links {
+.app-deck {
   display: flex;
   align-items: center;
   gap: 24px;
   font-size: 13px;
 }
 
-.site-links a { color: var(--muted); }
-.site-links a:hover { color: var(--text); }
-
-.nav-install {
-  margin-left: auto;
+.app-deck-item {
   padding: 0;
   border: 0;
   color: var(--muted);
@@ -98,7 +94,8 @@ summary:focus-visible {
   font-size: 13px;
 }
 
-.nav-install:hover { color: var(--text); }
+.app-deck-item:hover,
+.app-deck-item[data-active="true"] { color: var(--text); }
 
 .try-layout {
   order: 1;
@@ -166,15 +163,6 @@ summary:focus-visible {
   inset: 16px;
   min-height: auto;
   border: 1px solid var(--line);
-}
-
-.upload-input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
 }
 
 .terminal-body { display: flex; flex: 1; flex-direction: column; min-height: 0; }
@@ -251,8 +239,7 @@ summary:focus-visible {
 @media (max-width: 720px) {
   .site-shell { padding: 0 16px; }
   .site-nav { right: 16px; left: 16px; gap: 16px; }
-  .site-links { gap: 16px; }
-  .site-links a:nth-child(2), .site-links a:nth-child(3) { display: none; }
+  .app-deck { gap: 16px; }
   .demo-actions { gap: 14px; }
   .demo-note { min-height: 78px; }
 }
@@ -260,8 +247,7 @@ summary:focus-visible {
 @media (max-width: 420px) {
   .site-shell { padding: 0 12px; }
   .site-nav { right: 12px; left: 12px; min-height: 56px; }
-  .site-links { margin-left: auto; }
-  .site-links a:first-child { display: none; }
+  .app-deck { margin-left: auto; }
   .demo-note { gap: 12px; font-size: 12px; }
   .demo-action { font-size: 11px; }
 }

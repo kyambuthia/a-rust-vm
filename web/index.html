@@ -11,20 +11,16 @@
   </head>
   <body>
     <div class="site-shell">
-      <header class="site-nav" aria-label="Primary navigation">
-        <a class="site-brand" href="/web/" aria-label="A/RVM home">
+      <header class="site-nav" aria-label="Application deck">
+        <div class="site-brand" aria-label="A/RVM">
           <span class="brand-mark" aria-hidden="true">▲</span>
           <span class="brand-slash" aria-hidden="true">/</span>
           <span class="brand-name">a/rvm</span>
-        </a>
-        <nav class="site-links" aria-label="A/RVM links">
-          <a href="#about">docs</a>
-          <a href="#about">cli</a>
-          <a href="#about">lib</a>
-          <a href="#terminal">try</a>
-          <a href="https://github.com/kyambuthia/a-rust-vm">source</a>
+        </div>
+        <nav class="app-deck" aria-label="Built-in applications">
+          <button class="app-deck-item" type="button" data-app="docs">docs</button>
+          <button class="app-deck-item" type="button" data-app="sheets">sheets</button>
         </nav>
-        <button class="nav-install" type="button" id="copy-install" aria-label="Copy install command">install</button>
       </header>
 
       <main class="try-layout" id="about">
@@ -33,7 +29,6 @@
             <p>Deterministic Rust VM in WebAssembly · ephemeral browser workspace · agent via OpenRouter.</p>
           </div>
           <div class="demo-actions">
-            <input id="file-input" class="upload-input" type="file" multiple aria-label="Upload files to the guest VM">
             <details class="about-toggle">
               <summary aria-label="About this demo">(i)</summary>
               <p>No account is required. Uploaded files and jobs stay in memory for this browser session and are cleared when it expires or restarts.</p>

@@ -52,6 +52,20 @@ impl JobStore {
         self.start(owner, "builtin.pdf_inspect.v1", input_path)
     }
 
+    /// Record one operation from a fixed built-in guest application.
+    ///
+    /// The caller supplies only server-selected app identifiers and fixed guest
+    /// paths; this is not an arbitrary executor registration API.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_builtin_app(
+        &mut self,
+        owner: &str,
+        app: &str,
+        input_path: &str,
+    ) -> JobRecord {
+        self.start(owner, &format!("builtin.{app}.v1"), input_path)
+    }
+
     fn start(&mut self, owner: &str, executor: &str, input_path: &str) -> JobRecord {
         self.next_id += 1;
         let job = JobRecord {

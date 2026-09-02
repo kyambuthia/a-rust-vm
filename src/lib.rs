@@ -4,6 +4,7 @@
 //! evaluates them from left to right and leaves the result on its value stack.
 
 pub mod agent;
+pub mod apps;
 pub mod control_plane;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control_plane_store;

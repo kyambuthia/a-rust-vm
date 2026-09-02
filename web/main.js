@@ -25,7 +25,7 @@ const quickUpload = document.querySelector("#quick-upload");
 const quickClear = document.querySelector("#quick-clear");
 const railFilesRefresh = document.querySelector("#rail-files-refresh");
 const railJobsRefresh = document.querySelector("#rail-jobs-refresh");
-const copyInstall = document.querySelector("#copy-install");
+const appDeckButtons = document.querySelectorAll(".app-deck-item[data-app]");
 
 const maxUploadBytes = 1024 * 1024;
 
@@ -35,6 +35,7 @@ const state = {
   history: [],
   historyIndex: -1,
   draft: "",
+  activeApp: null,
 };
 
 function setGatewayState(tone, label) {
@@ -261,7 +262,99 @@ async function listJobs() {
   }
 }
 
-fileInput.addEventListener("change", () => {
+function setActiveApp(app) {
+  state.activeApp = app;
+  for (const button of appDeckButtons) {
+    button.dataset.active = String(button.dataset.app === app);
+  }
+}
+
+function printDocument(document, operation) {
+  writeLine(`[docs] ${operation} · ${document.bytes} bytes · ${document.lines} lines`, "result");
+  if (document.text) {
+    writeLine(document.text, "muted");
+  } else {
+    writeLine("[docs] empty document · use /docs replace <text>", "muted");
+  }
+}
+
+function printSheet(sheet, operation) {
+  const columns = sheet.columns.map(column => column.name).join(" · ");
+  writeLine(`[sheets] ${operation} · ${sheet.rows} rows · ${sheet.columns.length} columns · ${sheet.delimiter.toUpperCase()}`, "result");
+  writeLine(`[columns] ${columns}`, "muted");
+  writeLine(`[output] ${sheet.output_path}`, "muted");
+}
+
+async function operateApp(request) {
+  try {
+    const response = await fetch("../api/apps/operate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error ?? `app operation failed: ${response.status}`);
+    }
+    setActiveApp(payload.app);
+    if (payload.document) printDocument(payload.document, payload.operation);
+    if (payload.sheet) printSheet(payload.sheet, payload.operation);
+    await listJobs();
+  } catch (error) {
+    writeLine(`[${request.app} error] ${error.message}`, "error");
+  }
+}
+
+function openApp(app) {
+  void operateApp({ app, operation: "open" });
+}
+
+function decodeInlineText(value) {
+  return value.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+}
+
+function executeDocsCommand(argumentsText) {
+  const [operation = "open", ...parts] = argumentsText.trim().split(/\s+/);
+  const text = parts.join(" ");
+  if (!argumentsText.trim()) {
+    openApp("docs");
+    return;
+  }
+  if (!new Set(["open", "read", "replace", "append"]).has(operation.toLowerCase())) {
+    writeLine("[error] docs commands: /docs [open|read|replace <text>|append <text>]", "error");
+    return;
+  }
+  if (["replace", "append"].includes(operation.toLowerCase()) && !text) {
+    writeLine(`[error] usage: /docs ${operation.toLowerCase()} <text>`, "error");
+    return;
+  }
+  void operateApp({
+    app: "docs",
+    operation: operation.toLowerCase(),
+    ...(text ? { text: decodeInlineText(text) } : {}),
+  });
+}
+
+function executeSheetsCommand(argumentsText) {
+  const value = argumentsText.trim();
+  if (!value || value.toLowerCase() === "open") {
+    openApp("sheets");
+    return;
+  }
+  const match = value.match(/^import\s+(csv|tsv)\s+([\s\S]+)$/i);
+  if (!match) {
+    writeLine("[error] usage: /sheets import <csv|tsv> <text with \\n and \\t escapes>", "error");
+    return;
+  }
+  void operateApp({
+    app: "sheets",
+    operation: "import",
+    format: match[1].toLowerCase(),
+    text: decodeInlineText(match[2]),
+  });
+}
+
+fileInput?.addEventListener("change", () => {
   const files = Array.from(fileInput.files ?? []);
   fileInput.value = "";
   void uploadFiles(files);
@@ -574,6 +667,8 @@ function executeCommand(rawCommand, instance) {
     writeLine("  /files                list files in the guest VM");
     writeLine("  /tabulate <file>      summarize an uploaded CSV or TSV");
     writeLine("  /pdf <file>           validate an uploaded PDF safely");
+    writeLine("  /docs [operation]     open or edit the built-in document app");
+    writeLine("  /sheets [operation]   open or import a bounded data sheet");
     writeLine("  /jobs                 list data-processing jobs");
     writeLine("  /load <a> <op> <b>  load a program");
     writeLine("  /asm <instructions>  load ';'-separated assembly");
@@ -584,6 +679,18 @@ function executeCommand(rawCommand, instance) {
     writeLine("  /reset               reset without unloading");
     writeLine("  /clear               clear terminal output");
     writeLine("examples: /load 8 * 5 · /asm PUSH 6; PUSH 7; MUL; HALT");
+    return;
+  }
+
+  const docsCommand = command.match(/^\/?docs(?:\s+([\s\S]*))?$/i);
+  if (docsCommand) {
+    executeDocsCommand(docsCommand[1] ?? "");
+    return;
+  }
+
+  const sheetsCommand = command.match(/^\/?sheets(?:\s+([\s\S]*))?$/i);
+  if (sheetsCommand) {
+    executeSheetsCommand(sheetsCommand[1] ?? "");
     return;
   }
 
@@ -790,7 +897,7 @@ quickJobs?.addEventListener("click", () => {
     terminalForm.requestSubmit();
   }
 });
-quickUpload?.addEventListener("click", () => fileInput.click());
+quickUpload?.addEventListener("click", () => fileInput?.click());
 quickClear?.addEventListener("click", () => {
   insertCommand("/clear");
   terminalForm.requestSubmit();
@@ -803,17 +910,6 @@ railFilesRefresh?.addEventListener("click", () => {
 railJobsRefresh?.addEventListener("click", () => {
   void listJobs();
   terminalInput.focus();
-});
-
-copyInstall?.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText("git clone https://github.com/kyambuthia/a-rust-vm.git");
-    copyInstall.textContent = "copied";
-    window.setTimeout(() => { copyInstall.textContent = "install"; }, 1600);
-  } catch {
-    copyInstall.textContent = "copy unavailable";
-    window.setTimeout(() => { copyInstall.textContent = "install"; }, 1600);
-  }
 });
 
 for (const chip of document.querySelectorAll(".chip[data-insert]")) {
@@ -844,6 +940,9 @@ try {
     submitCommand(instance, terminalInput.value);
     terminalInput.value = "";
   });
+  for (const button of appDeckButtons) {
+    button.addEventListener("click", () => openApp(button.dataset.app));
+  }
 } catch (error) {
   runtimeBadge.dataset.state = "error";
   runtimeLabel.textContent = "runtime unavailable";

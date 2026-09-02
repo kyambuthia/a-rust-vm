@@ -16,6 +16,11 @@ use crate::agent::{Agent, AgentEvent, ModelCapabilities, ModelRouter, RouteReque
 use crate::anon_session::{
     check_origin, cookie_header, extract_sid, generate_sid, is_valid_sid_format,
 };
+use crate::apps::{
+    AppDescriptor, AppId, DOCS_DOCUMENT_PATH, Document, SHEETS_INPUT_PATH, SheetFormat,
+    SheetSummary, app_descriptors, append_document, import_sheet, open_docs, open_sheets,
+    read_document, replace_document,
+};
 use crate::guest_tools::guest_coding_tool_registry_shared;
 use crate::jobs::{
     JobRecord, JobStore, PdfSummary, TableSummary, inspect_uploaded_pdf, tabulate_uploaded_file,
@@ -71,6 +76,28 @@ struct PdfInspectionRequest {
 struct PdfInspectionResponse {
     job: JobRecord,
     pdf: PdfSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppOperationRequest {
+    app: AppId,
+    operation: String,
+    text: Option<String>,
+    format: Option<SheetFormat>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppsResponse {
+    apps: [AppDescriptor; 2],
+}
+
+#[derive(Debug, Serialize)]
+struct AppOperationResponse {
+    job: JobRecord,
+    app: AppId,
+    operation: String,
+    document: Option<Document>,
+    sheet: Option<SheetSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -406,6 +433,10 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
             handle_upload(&mut stream, &request.body, &session, set_cookie.as_deref())
         }
         ("GET", "/api/files") => handle_files(&mut stream, &session, set_cookie.as_deref()),
+        ("GET", "/api/apps") => handle_apps(&mut stream, set_cookie.as_deref()),
+        ("POST", "/api/apps/operate") => {
+            handle_app_operation(&mut stream, &request.body, &session, set_cookie.as_deref())
+        }
         ("POST", "/api/tabulate") => {
             handle_tabulate(&mut stream, &request.body, &session, set_cookie.as_deref())
         }
@@ -696,6 +727,115 @@ fn handle_files(stream: &mut TcpStream, session: &Arc<SessionData>, set_cookie: 
     }
 }
 
+fn handle_apps(stream: &mut TcpStream, set_cookie: Option<&str>) {
+    match serde_json::to_vec(&AppsResponse {
+        apps: app_descriptors(),
+    }) {
+        Ok(body) => write_response(stream, 200, "application/json", &body, set_cookie),
+        Err(_) => write_error(stream, 500, "internal error", set_cookie),
+    }
+}
+
+fn handle_app_operation(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session: &Arc<SessionData>,
+    set_cookie: Option<&str>,
+) {
+    let request = match serde_json::from_slice::<AppOperationRequest>(body) {
+        Ok(request) if !request.operation.trim().is_empty() => request,
+        _ => {
+            write_error(stream, 400, "invalid app operation", set_cookie);
+            return;
+        }
+    };
+    let operation = request.operation.to_ascii_lowercase();
+    let (executor, input_path) = match request.app {
+        AppId::Docs => ("docs", DOCS_DOCUMENT_PATH),
+        AppId::Sheets => ("sheets", SHEETS_INPUT_PATH),
+    };
+    if session
+        .jobs
+        .lock()
+        .map(|jobs| jobs.list(&session.id).len() >= MAX_JOBS_PER_SESSION)
+        .unwrap_or(true)
+    {
+        write_error(stream, 400, "job limit exceeded", set_cookie);
+        return;
+    }
+    let job = match session.jobs.lock() {
+        Ok(mut jobs) => {
+            let job = jobs.start_builtin_app(&session.id, executor, input_path);
+            jobs.mark_running(&job.id);
+            job
+        }
+        Err(_) => {
+            write_error(stream, 500, "internal error", set_cookie);
+            return;
+        }
+    };
+
+    let result = match session.vm.lock() {
+        Ok(mut vm) => match (request.app, operation.as_str()) {
+            (AppId::Docs, "open") => open_docs(&mut vm).map(|document| (Some(document), None)),
+            (AppId::Docs, "read") => read_document(&vm).map(|document| (Some(document), None)),
+            (AppId::Docs, "replace") => request
+                .text
+                .as_deref()
+                .ok_or_else(|| "document text is required".to_owned())
+                .and_then(|text| replace_document(&mut vm, text))
+                .map(|document| (Some(document), None)),
+            (AppId::Docs, "append") => request
+                .text
+                .as_deref()
+                .ok_or_else(|| "document text is required".to_owned())
+                .and_then(|text| append_document(&mut vm, text))
+                .map(|document| (Some(document), None)),
+            (AppId::Sheets, "open") => open_sheets(&mut vm).map(|sheet| (None, Some(sheet))),
+            (AppId::Sheets, "import") => match (request.text.as_deref(), request.format) {
+                (Some(text), Some(format)) => {
+                    import_sheet(&mut vm, text, format).map(|sheet| (None, Some(sheet)))
+                }
+                (None, _) => Err("sheet text is required".to_owned()),
+                (_, None) => Err("sheet format must be 'csv' or 'tsv'".to_owned()),
+            },
+            (AppId::Docs, _) => Err("unsupported Docs operation".to_owned()),
+            (AppId::Sheets, _) => Err("unsupported Sheets operation".to_owned()),
+        },
+        Err(_) => Err("internal error".to_owned()),
+    };
+    match result {
+        Ok((document, sheet)) => {
+            let output_path = document
+                .as_ref()
+                .map(|document| document.path)
+                .or_else(|| sheet.as_ref().map(|sheet| sheet.output_path));
+            let completed = session.jobs.lock().ok().and_then(|mut jobs| {
+                jobs.finish(&job.id, output_path.ok_or("missing output path"))
+            });
+            match completed {
+                Some(job) => match serde_json::to_vec(&AppOperationResponse {
+                    job,
+                    app: request.app,
+                    operation,
+                    document,
+                    sheet,
+                }) {
+                    Ok(body) => write_response(stream, 200, "application/json", &body, set_cookie),
+                    Err(_) => write_error(stream, 500, "internal error", set_cookie),
+                },
+                None => write_error(stream, 500, "internal error", set_cookie),
+            }
+        }
+        Err(error) => {
+            if let Ok(mut jobs) = session.jobs.lock() {
+                jobs.finish(&job.id, Err(&error));
+            }
+            write_error(stream, 400, &error, set_cookie);
+        }
+    }
+}
+
 fn handle_tabulate(
     stream: &mut TcpStream,
     body: &[u8],
@@ -974,7 +1114,7 @@ fn append_security_headers(header: &mut String) {
     header.push_str("X-Content-Type-Options: nosniff\r\n");
     header.push_str("X-Frame-Options: DENY\r\n");
     header.push_str("Referrer-Policy: no-referrer\r\n");
-    header.push_str("Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n");
+    header.push_str("Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n");
     header.push_str("Cross-Origin-Opener-Policy: same-origin\r\n");
     header.push_str("Cross-Origin-Resource-Policy: same-origin\r\n");
     header.push_str("Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n");
@@ -1253,6 +1393,7 @@ mod tests {
         assert!(header.contains("X-Content-Type-Options: nosniff"));
         assert!(header.contains("X-Frame-Options: DENY"));
         assert!(header.contains("Content-Security-Policy:"));
+        assert!(header.contains("img-src 'self' data:"));
         assert!(header.contains("Cross-Origin-Opener-Policy: same-origin"));
     }
 
