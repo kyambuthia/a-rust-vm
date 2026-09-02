@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, AgentEvent, ModelCapabilities, ModelRouter, RouteRequest};
 use crate::guest_tools::{SharedGuestVm, guest_coding_tool_registry_shared};
-use crate::jobs::{JobRecord, JobStore, TableSummary, tabulate_uploaded_file};
+use crate::jobs::{
+    JobRecord, JobStore, PdfSummary, TableSummary, inspect_uploaded_pdf, tabulate_uploaded_file,
+};
 use crate::persistent_model::PersistentModelService;
 use crate::runtime::VmInstance;
 
@@ -47,6 +49,17 @@ struct TabulateRequest {
 struct TabulateResponse {
     job: JobRecord,
     table: TableSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct PdfInspectionRequest {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PdfInspectionResponse {
+    job: JobRecord,
+    pdf: PdfSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,6 +268,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         ("POST", "/api/upload") => handle_upload(&mut stream, &request.body, state),
         ("GET", "/api/files") => handle_files(&mut stream, state),
         ("POST", "/api/tabulate") => handle_tabulate(&mut stream, &request.body, state),
+        ("POST", "/api/pdf/inspect") => handle_pdf_inspection(&mut stream, &request.body, state),
         ("GET", "/api/jobs") => handle_jobs(&mut stream, state),
         ("POST", "/api/approval") => handle_approval(&mut stream, &request.body, &state.approvals),
         _ => write_response(&mut stream, 404, "text/plain; charset=utf-8", b"not found"),
@@ -573,6 +587,78 @@ fn handle_jobs(stream: &mut TcpStream, state: &ServerState) {
         Err(error) => {
             let body = format!(r#"{{"error":"failed to encode jobs response: {error}"}}"#);
             write_response(stream, 500, "application/json", body.as_bytes());
+        }
+    }
+}
+
+fn handle_pdf_inspection(stream: &mut TcpStream, body: &[u8], state: &ServerState) {
+    let request = match serde_json::from_slice::<PdfInspectionRequest>(body) {
+        Ok(request) if !request.path.trim().is_empty() => request,
+        Ok(_) => {
+            write_response(
+                stream,
+                400,
+                "application/json",
+                br#"{"error":"path is empty"}"#,
+            );
+            return;
+        }
+        Err(error) => {
+            let body = format!(r#"{{"error":"invalid PDF inspection request: {error}"}}"#);
+            write_response(stream, 400, "application/json", body.as_bytes());
+            return;
+        }
+    };
+    let job = match state.jobs.lock() {
+        Ok(mut jobs) => {
+            let job = jobs.start_pdf_inspection("local", &request.path);
+            jobs.mark_running(&job.id);
+            job
+        }
+        Err(_) => {
+            write_response(
+                stream,
+                500,
+                "application/json",
+                br#"{"error":"job store lock is poisoned"}"#,
+            );
+            return;
+        }
+    };
+    let result = match state.guest_vm.lock() {
+        Ok(mut vm) => inspect_uploaded_pdf(&mut vm, &request.path),
+        Err(_) => Err("guest VM lock is poisoned".to_owned()),
+    };
+    match result {
+        Ok(pdf) => {
+            let completed = state
+                .jobs
+                .lock()
+                .ok()
+                .and_then(|mut jobs| jobs.finish(&job.id, Ok(&pdf.output_path)));
+            match completed {
+                Some(job) => match serde_json::to_vec(&PdfInspectionResponse { job, pdf }) {
+                    Ok(body) => write_response(stream, 200, "application/json", &body),
+                    Err(error) => {
+                        let body =
+                            format!(r#"{{"error":"failed to encode PDF response: {error}"}}"#);
+                        write_response(stream, 500, "application/json", body.as_bytes());
+                    }
+                },
+                None => write_response(
+                    stream,
+                    500,
+                    "application/json",
+                    br#"{"error":"failed to complete job"}"#,
+                ),
+            }
+        }
+        Err(error) => {
+            if let Ok(mut jobs) = state.jobs.lock() {
+                jobs.finish(&job.id, Err(&error));
+            }
+            let body = format!(r#"{{"error":{}}}"#, serde_json::json!(error));
+            write_response(stream, 400, "application/json", body.as_bytes());
         }
     }
 }

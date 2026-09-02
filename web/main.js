@@ -106,6 +106,32 @@ async function tabulateFile(value) {
   }
 }
 
+async function inspectPdf(value) {
+  const file = value.trim();
+  if (!file) {
+    writeLine("[error] usage: /pdf <uploaded filename>", "error");
+    return;
+  }
+  const path = file.startsWith("/") ? file : `/workspace/uploads/${file}`;
+  try {
+    const response = await fetch("../api/pdf/inspect", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error ?? `PDF inspection failed: ${response.status}`);
+    }
+    writeLine(`[job ${payload.job.id}] inspected ${payload.pdf.source_path}`, "result");
+    writeLine(`[pdf] version ${payload.pdf.version} · ${payload.pdf.bytes} bytes · ${payload.pdf.page_objects_estimate} page objects estimated`, "result");
+    writeLine(`[output] ${payload.pdf.output_path}`, "muted");
+    writeLine("[pdf] text extraction requires a dedicated parser sandbox and is not enabled yet", "muted");
+  } catch (error) {
+    writeLine(`[pdf error] ${error.message}`, "error");
+  }
+}
+
 async function listJobs() {
   try {
     const response = await fetch("../api/jobs");
@@ -393,6 +419,7 @@ function executeCommand(rawCommand, instance) {
     writeLine("  /ask <prompt>         ask the server-side LLM agent");
     writeLine("  /files                list files in the guest VM");
     writeLine("  /tabulate <file>      summarize an uploaded CSV or TSV");
+    writeLine("  /pdf <file>           validate an uploaded PDF safely");
     writeLine("  /jobs                 list data-processing jobs");
     writeLine("  /load <a> <op> <b>  load a program");
     writeLine("  /disassemble         inspect loaded bytecode");
@@ -431,6 +458,17 @@ function executeCommand(rawCommand, instance) {
   if (normalized.startsWith("/tabulate ") || normalized.startsWith("tabulate ")) {
     const prefixLength = normalized.startsWith("/tabulate ") ? 11 : 10;
     void tabulateFile(command.slice(prefixLength));
+    return;
+  }
+
+  if (normalized === "/pdf" || normalized === "pdf") {
+    void inspectPdf("");
+    return;
+  }
+
+  if (normalized.startsWith("/pdf ") || normalized.startsWith("pdf ")) {
+    const prefixLength = normalized.startsWith("/pdf ") ? 5 : 4;
+    void inspectPdf(command.slice(prefixLength));
     return;
   }
 

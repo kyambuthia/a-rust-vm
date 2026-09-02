@@ -29,6 +29,7 @@ pub fn guest_tool_registry_shared(vm: SharedGuestVm) -> Result<ToolRegistry, Too
     registry.register(GuestWriteFileTool::new(vm.clone()))?;
     registry.register(GuestMakeDirectoryTool::new(vm.clone()))?;
     registry.register(GuestTabulateFileTool::new(vm.clone()))?;
+    registry.register(GuestInspectPdfTool::new(vm.clone()))?;
     registry.register(GuestSpawnTool::new(vm.clone()))?;
     registry.register(GuestTickTool::new(vm.clone()))?;
     registry.register(GuestRunTool::new(vm.clone()))?;
@@ -194,6 +195,35 @@ impl Tool for GuestTabulateFileTool {
         let summary = crate::jobs::tabulate_uploaded_file(&mut vm, path).map_err(ToolError::new)?;
         serde_json::to_string(&summary)
             .map_err(|error| ToolError::new(format!("failed to encode table summary: {error}")))
+    }
+}
+
+struct GuestInspectPdfTool {
+    vm: SharedGuestVm,
+}
+
+impl GuestInspectPdfTool {
+    fn new(vm: SharedGuestVm) -> Self {
+        Self { vm }
+    }
+}
+
+impl Tool for GuestInspectPdfTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "guest_inspect_pdf",
+            "Validate an uploaded PDF and write safe document metadata to /workspace/output. This does not extract document text.",
+            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+        )
+    }
+
+    fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
+        ensure_arguments(arguments, &["path"])?;
+        let path = required_text(arguments, "path")?;
+        let mut vm = lock_guest_mut(&self.vm)?;
+        let summary = crate::jobs::inspect_uploaded_pdf(&mut vm, path).map_err(ToolError::new)?;
+        serde_json::to_string(&summary)
+            .map_err(|error| ToolError::new(format!("failed to encode PDF summary: {error}")))
     }
 }
 

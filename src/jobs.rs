@@ -45,11 +45,19 @@ pub struct JobStore {
 
 impl JobStore {
     pub fn start_tabulation(&mut self, owner: &str, input_path: &str) -> JobRecord {
+        self.start(owner, "builtin.tabulate.v1", input_path)
+    }
+
+    pub fn start_pdf_inspection(&mut self, owner: &str, input_path: &str) -> JobRecord {
+        self.start(owner, "builtin.pdf_inspect.v1", input_path)
+    }
+
+    fn start(&mut self, owner: &str, executor: &str, input_path: &str) -> JobRecord {
         self.next_id += 1;
         let job = JobRecord {
             id: format!("job-{}", self.next_id),
             owner: owner.to_owned(),
-            executor: "builtin.tabulate.v1".to_owned(),
+            executor: executor.to_owned(),
             input_path: input_path.to_owned(),
             output_path: None,
             state: JobState::Queued,
@@ -103,6 +111,18 @@ pub struct TableSummary {
     pub rows: usize,
     pub columns: Vec<ColumnSummary>,
     pub preview: Vec<Vec<String>>,
+    pub output_path: String,
+}
+
+/// Metadata collected from a PDF without invoking a PDF parser in the browser
+/// host. Page count is an estimate based on page dictionaries, not a promise
+/// about rendered pages; text extraction belongs in a dedicated parser sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PdfSummary {
+    pub source_path: String,
+    pub bytes: usize,
+    pub version: String,
+    pub page_objects_estimate: usize,
     pub output_path: String,
 }
 
@@ -176,9 +196,69 @@ pub fn tabulate_uploaded_file(vm: &mut VmInstance, path: &str) -> Result<TableSu
     Ok(summary)
 }
 
+/// Validate an uploaded PDF and persist a metadata artifact. This intentionally
+/// does not parse page streams or execute embedded content in the web server.
+pub fn inspect_uploaded_pdf(vm: &mut VmInstance, path: &str) -> Result<PdfSummary, String> {
+    let path = validate_upload_path(path)?;
+    let bytes = vm.read_file(&path).map_err(runtime_error)?;
+    let version = pdf_version(&bytes)?;
+    let output_path = format!("/workspace/output/{}.pdf.json", upload_filename(&path)?);
+    let summary = PdfSummary {
+        source_path: path,
+        bytes: bytes.len(),
+        version,
+        page_objects_estimate: page_object_count(&bytes),
+        output_path: output_path.clone(),
+    };
+    let encoded = serde_json::to_vec_pretty(&summary)
+        .map_err(|error| format!("failed to encode PDF output: {error}"))?;
+    vm.mkdir("/workspace/output", true).map_err(runtime_error)?;
+    vm.write_file(&output_path, encoded)
+        .map_err(runtime_error)?;
+    Ok(summary)
+}
+
 fn validate_upload_path(path: &str) -> Result<String, String> {
     let filename = upload_filename(path)?;
     Ok(format!("/workspace/uploads/{filename}"))
+}
+
+fn pdf_version(bytes: &[u8]) -> Result<String, String> {
+    let version = bytes
+        .get(0..8)
+        .filter(|header| header.starts_with(b"%PDF-"))
+        .and_then(|header| std::str::from_utf8(&header[5..]).ok())
+        .filter(|version| {
+            let mut parts = version.split('.');
+            matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some(major), Some(minor), None)
+                    if major.len() == 1
+                        && minor.len() == 1
+                        && major.as_bytes()[0].is_ascii_digit()
+                        && minor.as_bytes()[0].is_ascii_digit()
+            )
+        })
+        .ok_or_else(|| "upload is not a supported PDF header".to_owned())?;
+    Ok(version.to_owned())
+}
+
+fn page_object_count(bytes: &[u8]) -> usize {
+    bytes
+        .windows(b"/Type".len())
+        .enumerate()
+        .filter_map(|(offset, value)| (value == b"/Type").then_some(offset + b"/Type".len()))
+        .filter_map(|offset| {
+            let remaining = bytes.get(offset..)?;
+            let whitespace = remaining
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+            let value = remaining.get(whitespace..)?;
+            value.starts_with(b"/Page").then_some(value.get(5).copied())
+        })
+        .filter(|next| !matches!(next, Some(b'A'..=b'Z' | b'a'..=b'z')))
+        .count()
 }
 
 fn upload_filename(path: &str) -> Result<&str, String> {
@@ -295,7 +375,7 @@ fn parse_delimited(input: &str, delimiter: char) -> Result<Vec<Vec<String>>, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{JobState, JobStore, tabulate_uploaded_file};
+    use super::{JobState, JobStore, inspect_uploaded_pdf, tabulate_uploaded_file};
     use crate::runtime::VmInstance;
 
     #[test]
@@ -339,5 +419,35 @@ mod tests {
             .unwrap();
         assert_eq!(completed.state, JobState::Succeeded);
         assert_eq!(store.list("local").len(), 1);
+    }
+
+    #[test]
+    fn inspects_a_pdf_without_parsing_its_content_streams() {
+        let mut vm = VmInstance::new("pdf");
+        vm.mkdir("/workspace/uploads", true).unwrap();
+        vm.write_file(
+            "/workspace/uploads/guide.pdf",
+            b"%PDF-1.7\n1 0 obj << /Type /Page >> endobj\n2 0 obj << /Type /Pages >> endobj",
+        )
+        .unwrap();
+
+        let summary = inspect_uploaded_pdf(&mut vm, "/workspace/uploads/guide.pdf").unwrap();
+
+        assert_eq!(summary.version, "1.7");
+        assert_eq!(summary.page_objects_estimate, 1);
+        assert!(
+            vm.read_text(&summary.output_path)
+                .unwrap()
+                .contains("guide.pdf")
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_pdf_upload() {
+        let mut vm = VmInstance::new("pdf");
+        vm.mkdir("/workspace/uploads", true).unwrap();
+        vm.write_file("/workspace/uploads/notes.txt", "not a PDF")
+            .unwrap();
+        assert!(inspect_uploaded_pdf(&mut vm, "/workspace/uploads/notes.txt").is_err());
     }
 }

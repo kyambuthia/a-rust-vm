@@ -72,6 +72,13 @@ records. The agent can invoke the same bounded operation with
 currently live only for the local server process; they are deliberately not a
 host-shell or arbitrary-executable facility.
 
+Use `/pdf <filename>` to validate that an uploaded file has a PDF header and
+create a metadata artifact at `/workspace/output/<filename>.pdf.json`. It
+reports the PDF version and a best-effort count of page dictionaries without
+parsing document streams. It does **not** extract text: PDF parsing and OCR
+remain future isolated job runners, rather than running untrusted document
+parsers in the browser host.
+
 The local browser server currently creates one guest VM per server process and
 binds to loopback. Authenticated multi-user VM selection is not wired into the
 browser protocol yet. Host workspace tools remain available to native coding
