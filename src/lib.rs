@@ -18,6 +18,8 @@ pub mod session;
 pub mod workspace;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod anon_session;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod server;
 
 /// The instructions understood by the VM.

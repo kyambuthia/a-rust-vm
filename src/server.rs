@@ -1,5 +1,6 @@
 //! Local HTTP host for the browser terminal and server-side guest agent.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -8,12 +9,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, AgentEvent, ModelCapabilities, ModelRouter, RouteRequest};
-use crate::guest_tools::{SharedGuestVm, guest_coding_tool_registry_shared};
+use crate::anon_session::{
+    check_origin, cookie_header, extract_sid, generate_sid, is_valid_sid_format,
+};
+use crate::guest_tools::guest_coding_tool_registry_shared;
 use crate::jobs::{
     JobRecord, JobStore, PdfSummary, TableSummary, inspect_uploaded_pdf, tabulate_uploaded_file,
 };
@@ -22,6 +26,14 @@ use crate::runtime::VmInstance;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UPLOAD_BYTES: usize = 1024 * 1024;
+const MAX_PROMPT_CHARS: usize = 8 * 1024;
+const MAX_FILES_PER_SESSION: usize = 32;
+const MAX_TOTAL_BYTES_PER_SESSION: usize = 8 * 1024 * 1024;
+const MAX_JOBS_PER_SESSION: usize = 64;
+const MAX_GLOBAL_SESSIONS: usize = 128;
+const AGENT_TTL_STEP_LIMIT: usize = 8;
+const SESSION_TTL: Duration = Duration::from_secs(1800);
+const MAX_GLOBAL_CONCURRENT_AGENTS: usize = 32;
 
 #[derive(Debug, Deserialize)]
 struct AgentRequest {
@@ -95,45 +107,56 @@ enum ApprovalState {
     Resolved(ApprovalReply),
 }
 
-struct ApprovalStore {
-    states: Mutex<std::collections::BTreeMap<String, ApprovalState>>,
+pub struct ApprovalStore {
+    states: Mutex<BTreeMap<String, ApprovalState>>,
     changed: Condvar,
 }
 
-#[derive(Clone)]
-struct ServerState {
-    approvals: Arc<ApprovalStore>,
-    guest_vm: SharedGuestVm,
+struct SessionData {
+    id: String,
+    vm: Arc<Mutex<VmInstance>>,
     jobs: Arc<Mutex<JobStore>>,
+    approvals: Arc<ApprovalStore>,
+    last_seen: Mutex<Instant>,
+    agent_active: Mutex<bool>,
+    rate_window: Mutex<Instant>,
+    rate_count: Mutex<usize>,
+}
+
+struct AnonStore {
+    sessions: Mutex<BTreeMap<String, Arc<SessionData>>>,
+    secure_cookie: bool,
+}
+
+struct ServerState {
+    anon: Arc<AnonStore>,
     model_service: Arc<PersistentModelService>,
+    global_agents: Arc<Mutex<usize>>,
+    allowed_origin: String,
 }
 
 impl Default for ApprovalStore {
     fn default() -> Self {
         Self {
-            states: Mutex::new(std::collections::BTreeMap::new()),
+            states: Mutex::new(BTreeMap::new()),
             changed: Condvar::new(),
         }
     }
 }
 
 impl ApprovalStore {
-    fn wait(&self, id: &str) -> crate::agent::PermissionDecision {
-        let mut states = self
-            .states
-            .lock()
-            .expect("approval store lock should not poison");
+    pub fn wait(&self, id: &str) -> crate::agent::PermissionDecision {
+        let mut states = self.states.lock().expect("approval poisoned");
         states
             .entry(id.to_owned())
             .or_insert(ApprovalState::Pending);
-
         loop {
             if matches!(states.get(id), Some(ApprovalState::Pending)) {
-                let (next_states, timeout) = self
+                let (next, timeout) = self
                     .changed
                     .wait_timeout(states, Duration::from_secs(120))
-                    .expect("approval store lock should not poison");
-                states = next_states;
+                    .expect("condvar");
+                states = next;
                 if timeout.timed_out() {
                     states.remove(id);
                     return crate::agent::PermissionDecision::Deny {
@@ -142,7 +165,6 @@ impl ApprovalStore {
                 }
                 continue;
             }
-
             match states.remove(id) {
                 Some(ApprovalState::Resolved(ApprovalReply::Allow)) => {
                     return crate::agent::PermissionDecision::Allow;
@@ -152,21 +174,15 @@ impl ApprovalStore {
                         reason: "approval denied in browser".to_owned(),
                     };
                 }
-                Some(ApprovalState::Pending) | None => {
-                    unreachable!("approval state changed unexpectedly")
-                }
+                _ => unreachable!(),
             }
         }
     }
-
     fn resolve(&self, id: String, reply: ApprovalReply) -> Result<(), String> {
         if id.trim().is_empty() {
             return Err("approval id is empty".to_owned());
         }
-        let mut states = self
-            .states
-            .lock()
-            .expect("approval store lock should not poison");
+        let mut states = self.states.lock().expect("approval poisoned");
         match states.get_mut(&id) {
             Some(state @ ApprovalState::Pending) => *state = ApprovalState::Resolved(reply),
             Some(ApprovalState::Resolved(_)) => {
@@ -181,37 +197,105 @@ impl ApprovalStore {
     }
 }
 
-/// Serve the browser terminal and a local server-side agent endpoint.
+impl AnonStore {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_secure_cookie(false)
+    }
+
+    fn with_secure_cookie(secure_cookie: bool) -> Self {
+        Self {
+            sessions: Mutex::new(BTreeMap::new()),
+            secure_cookie,
+        }
+    }
+    fn resolve(
+        &self,
+        cookie_header_value: Option<&str>,
+    ) -> Result<(Arc<SessionData>, Option<String>), String> {
+        let now = Instant::now();
+        let mut map = self.sessions.lock().expect("anon store poisoned");
+        let expired: Vec<String> = map
+            .iter()
+            .filter(|(_, s)| now.duration_since(*s.last_seen.lock().unwrap()) > SESSION_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in expired {
+            map.remove(&k);
+        }
+        #[allow(clippy::collapsible_if)]
+        if let Some(raw) = cookie_header_value.and_then(extract_sid) {
+            if is_valid_sid_format(&raw) {
+                if let Some(sess) = map.get(&raw).cloned() {
+                    if now.duration_since(*sess.last_seen.lock().unwrap()) <= SESSION_TTL {
+                        *sess.last_seen.lock().unwrap() = now;
+                        return Ok((sess, None));
+                    }
+                    map.remove(&raw);
+                }
+            }
+        }
+        #[allow(clippy::collapsible_if)]
+        if map.len() >= MAX_GLOBAL_SESSIONS {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, s)| *s.last_seen.lock().unwrap())
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        let id = generate_sid()
+            .ok_or_else(|| "secure anonymous session generation unavailable".to_owned())?;
+        let sess = Arc::new(SessionData {
+            id: id.clone(),
+            vm: Arc::new(Mutex::new(VmInstance::new(id.clone()))),
+            jobs: Arc::new(Mutex::new(JobStore::default())),
+            approvals: Arc::new(ApprovalStore::default()),
+            last_seen: Mutex::new(now),
+            agent_active: Mutex::new(false),
+            rate_window: Mutex::new(now),
+            rate_count: Mutex::new(0),
+        });
+        map.insert(id.clone(), sess.clone());
+        Ok((sess, Some(cookie_header(&id, self.secure_cookie))))
+    }
+}
+
 pub fn run(root: PathBuf) {
     let port = env::var("A_RVM_WEB_PORT")
         .ok()
-        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(8080);
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
-        eprintln!("failed to bind browser host on port {port}: {error}");
+    let allowed_origin = env::var("A_RVM_ALLOWED_ORIGIN")
+        .ok()
+        .filter(|origin| !origin.trim().is_empty())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+    let secure_cookie = env::var("A_RVM_SECURE_COOKIES")
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or_else(|| allowed_origin.starts_with("https://"));
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+        eprintln!("failed to bind browser host on port {port}: {e}");
         std::process::exit(2);
     });
-    let model_directory = create_model_working_directory().unwrap_or_else(|error| {
-        eprintln!("failed to create model runner directory: {error}");
+    let model_directory = create_model_working_directory().unwrap_or_else(|e| {
+        eprintln!("failed to create model runner directory: {e}");
         std::process::exit(2);
     });
     println!("A/RVM browser host: http://127.0.0.1:{port}/web/");
-    println!("Agent endpoint: http://127.0.0.1:{port}/api/agent");
-    println!("Upload endpoint: http://127.0.0.1:{port}/api/upload");
-    println!("Approval endpoint: http://127.0.0.1:{port}/api/approval");
     let model_service = Arc::new(
-        PersistentModelService::start(&model_directory).unwrap_or_else(|error| {
-            eprintln!("failed to start persistent model service: {error}");
+        PersistentModelService::start(&model_directory).unwrap_or_else(|e| {
+            eprintln!("failed to start persistent model service: {e}");
             std::process::exit(2);
         }),
     );
-    let state = ServerState {
-        approvals: Arc::new(ApprovalStore::default()),
-        guest_vm: Arc::new(Mutex::new(VmInstance::new("browser"))),
-        jobs: Arc::new(Mutex::new(JobStore::default())),
+    let state = Arc::new(ServerState {
+        anon: Arc::new(AnonStore::with_secure_cookie(secure_cookie)),
         model_service,
-    };
-
+        global_agents: Arc::new(Mutex::new(0)),
+        allowed_origin,
+    });
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -219,70 +303,122 @@ pub fn run(root: PathBuf) {
                 let state = state.clone();
                 thread::spawn(move || handle_connection(stream, &root, &state));
             }
-            Err(error) => eprintln!("browser connection failed: {error}"),
+            Err(e) => eprintln!("browser connection failed: {e}"),
         }
     }
 }
 
 fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
     let request = match read_request(&mut stream) {
-        Ok(request) => request,
-        Err(error) => {
-            write_response(
-                &mut stream,
-                400,
-                "text/plain; charset=utf-8",
-                error.as_bytes(),
-            );
+        Ok(r) => r,
+        Err(e) => {
+            write_error(&mut stream, 400, &e, None);
             return;
         }
     };
-
+    let cookie_val = request.headers.get("cookie").map(|s| s.as_str());
+    let is_state_changing = matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    if is_state_changing && !check_origin(&request.headers, &state.allowed_origin) {
+        write_error(&mut stream, 403, "origin not allowed", None);
+        return;
+    }
+    let has_valid_session = cookie_val
+        .and_then(extract_sid)
+        .is_some_and(|sid| is_valid_sid_format(&sid));
+    if is_state_changing && !has_valid_session {
+        write_error(&mut stream, 401, "anonymous session required", None);
+        return;
+    }
+    let (session, set_cookie) = match state.anon.resolve(cookie_val) {
+        Ok(value) => value,
+        Err(_) => {
+            write_error(&mut stream, 503, "anonymous sessions unavailable", None);
+            return;
+        }
+    };
+    let rate_hit = {
+        let now = Instant::now();
+        let mut w = session.rate_window.lock().unwrap();
+        let mut c = session.rate_count.lock().unwrap();
+        if now.duration_since(*w) > Duration::from_secs(60) {
+            *w = now;
+            *c = 1;
+            false
+        } else {
+            *c += 1;
+            *c > 60
+        }
+    };
+    if rate_hit && is_state_changing {
+        write_error(
+            &mut stream,
+            429,
+            "rate limit exceeded",
+            set_cookie.as_deref(),
+        );
+        return;
+    }
+    *session.last_seen.lock().unwrap() = Instant::now();
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET" | "HEAD", "/") => write_redirect(&mut stream, "/web/"),
+        ("GET" | "HEAD", "/") => write_redirect(&mut stream, "/web/", set_cookie.as_deref()),
         ("GET" | "HEAD", "/web/") | ("GET" | "HEAD", "/web/index.html") => serve_file(
             &mut stream,
             root,
             "web/index.html",
             "text/html; charset=utf-8",
+            set_cookie.as_deref(),
         ),
         ("GET" | "HEAD", "/web/main.js") => serve_file(
             &mut stream,
             root,
             "web/main.js",
             "text/javascript; charset=utf-8",
+            set_cookie.as_deref(),
         ),
         ("GET" | "HEAD", "/web/styles.css") => serve_file(
             &mut stream,
             root,
             "web/styles.css",
             "text/css; charset=utf-8",
+            set_cookie.as_deref(),
         ),
         ("GET" | "HEAD", "/target/wasm32-unknown-unknown/debug/a_rust_vm.wasm") => serve_file(
             &mut stream,
             root,
             "target/wasm32-unknown-unknown/debug/a_rust_vm.wasm",
             "application/wasm",
+            set_cookie.as_deref(),
         ),
-        ("GET", "/api/v1/system") => handle_system_info(&mut stream),
-        ("POST", "/api/agent") => handle_agent(&mut stream, root, &request.body, state),
-        ("POST", "/api/upload") => handle_upload(&mut stream, &request.body, state),
-        ("GET", "/api/files") => handle_files(&mut stream, state),
-        ("POST", "/api/tabulate") => handle_tabulate(&mut stream, &request.body, state),
-        ("POST", "/api/pdf/inspect") => handle_pdf_inspection(&mut stream, &request.body, state),
-        ("GET", "/api/jobs") => handle_jobs(&mut stream, state),
-        ("POST", "/api/approval") => handle_approval(&mut stream, &request.body, &state.approvals),
-        _ => write_response(&mut stream, 404, "text/plain; charset=utf-8", b"not found"),
+        ("GET", "/api/v1/system") => handle_system_info(&mut stream, set_cookie.as_deref()),
+        ("POST", "/api/agent") => handle_agent(
+            &mut stream,
+            &request.body,
+            &session,
+            state,
+            set_cookie.as_deref(),
+        ),
+        ("POST", "/api/upload") => {
+            handle_upload(&mut stream, &request.body, &session, set_cookie.as_deref())
+        }
+        ("GET", "/api/files") => handle_files(&mut stream, &session, set_cookie.as_deref()),
+        ("POST", "/api/tabulate") => {
+            handle_tabulate(&mut stream, &request.body, &session, set_cookie.as_deref())
+        }
+        ("POST", "/api/pdf/inspect") => {
+            handle_pdf_inspection(&mut stream, &request.body, &session, set_cookie.as_deref())
+        }
+        ("GET", "/api/jobs") => handle_jobs(&mut stream, &session, set_cookie.as_deref()),
+        ("POST", "/api/approval") => {
+            handle_approval(&mut stream, &request.body, &session, set_cookie.as_deref())
+        }
+        _ => write_error(&mut stream, 404, "not found", set_cookie.as_deref()),
     }
 }
 
-fn handle_system_info(stream: &mut TcpStream) {
+fn handle_system_info(stream: &mut TcpStream, set_cookie: Option<&str>) {
     match serde_json::to_vec(&crate::protocol::SystemInfo::current()) {
-        Ok(body) => write_response(stream, 200, "application/json", &body),
-        Err(error) => {
-            let body = serde_json::json!({ "error": error.to_string() }).to_string();
-            write_response(stream, 500, "application/json", body.as_bytes());
-        }
+        Ok(body) => write_response(stream, 200, "application/json", &body, set_cookie),
+        Err(_) => write_error(stream, 500, "internal error", set_cookie),
     }
 }
 
@@ -290,20 +426,21 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    headers: BTreeMap<String, String>,
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut reader = BufReader::new(
         stream
             .try_clone()
-            .map_err(|error| format!("failed to clone connection: {error}"))?,
+            .map_err(|e| format!("failed to clone connection: {e}"))?,
     );
     let mut header_bytes = Vec::new();
     loop {
         let mut line = Vec::new();
         reader
             .read_until(b'\n', &mut line)
-            .map_err(|error| format!("failed to read request: {error}"))?;
+            .map_err(|e| format!("failed to read request: {e}"))?;
         if line.is_empty() {
             return Err("request ended before headers".to_owned());
         }
@@ -315,176 +452,213 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             break;
         }
     }
-
     let header_text = String::from_utf8(header_bytes)
         .map_err(|_| "request headers are not valid UTF-8".to_owned())?;
     let mut lines = header_text.lines();
     let request_line = lines
         .next()
         .ok_or_else(|| "missing request line".to_owned())?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts
+    let mut parts = request_line.split_whitespace();
+    let method = parts
         .next()
         .ok_or_else(|| "missing HTTP method".to_owned())?
         .to_owned();
-    let path = request_parts
+    let path = parts
         .next()
         .ok_or_else(|| "missing HTTP path".to_owned())?
         .split('?')
         .next()
         .unwrap_or_default()
         .to_owned();
-    let content_length = lines
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            (name.eq_ignore_ascii_case("content-length"))
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(0);
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+    let content_length = match headers.get("content-length") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "content-length is invalid".to_owned())?,
+        None => 0,
+    };
     if content_length > MAX_REQUEST_BYTES {
         return Err("request body is too large".to_owned());
     }
-
     let mut body = vec![0; content_length];
     reader
         .read_exact(&mut body)
-        .map_err(|error| format!("failed to read request body: {error}"))?;
-    Ok(HttpRequest { method, path, body })
+        .map_err(|e| format!("failed to read request body: {e}"))?;
+    Ok(HttpRequest {
+        method,
+        path,
+        body,
+        headers,
+    })
 }
 
-fn handle_agent(stream: &mut TcpStream, _root: &Path, body: &[u8], state: &ServerState) {
+fn handle_agent(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session: &Arc<SessionData>,
+    state: &ServerState,
+    set_cookie: Option<&str>,
+) {
     let request = match serde_json::from_slice::<AgentRequest>(body) {
-        Ok(request) if !request.prompt.trim().is_empty() => request,
+        Ok(r) if !r.prompt.trim().is_empty() => r,
         Ok(_) => {
-            write_response(
-                stream,
-                400,
-                "application/json",
-                br#"{"error":"prompt is empty"}"#,
-            );
+            write_error(stream, 400, "prompt is empty", set_cookie);
             return;
         }
-        Err(error) => {
-            let body = format!(r#"{{"error":"invalid request: {error}"}}"#);
-            write_response(stream, 400, "application/json", body.as_bytes());
+        Err(_) => {
+            write_error(stream, 400, "invalid request", set_cookie);
             return;
         }
     };
-
-    let model_name = "guest";
-    let model = state.model_service.model.clone();
-    let mut router = ModelRouter::new();
-    if let Err(error) = router
-        .register_model(model_name, ModelCapabilities::STREAMING_TOOLS, model)
-        .and_then(|_| router.set_default(model_name))
-    {
-        let body = format!(r#"{{"error":"failed to configure model route: {error}"}}"#);
-        write_response(stream, 500, "application/json", body.as_bytes());
+    if request.prompt.chars().count() > MAX_PROMPT_CHARS {
+        write_error(stream, 400, "prompt exceeds limit", set_cookie);
         return;
     }
-
+    {
+        let mut active = session.agent_active.lock().unwrap();
+        if *active {
+            write_error(
+                stream,
+                429,
+                "agent already running for this session",
+                set_cookie,
+            );
+            return;
+        }
+        *active = true;
+    }
+    {
+        let mut global = state.global_agents.lock().unwrap();
+        if *global >= MAX_GLOBAL_CONCURRENT_AGENTS {
+            *session.agent_active.lock().unwrap() = false;
+            write_error(stream, 429, "too many concurrent agents", set_cookie);
+            return;
+        }
+        *global += 1;
+    }
+    let model = state.model_service.model.clone();
+    let mut router = ModelRouter::new();
+    if let Err(e) = router
+        .register_model("guest", ModelCapabilities::STREAMING_TOOLS, model)
+        .and_then(|_| router.set_default("guest"))
+    {
+        *session.agent_active.lock().unwrap() = false;
+        *state.global_agents.lock().unwrap() -= 1;
+        write_error(stream, 500, "internal error", set_cookie);
+        let _ = e;
+        return;
+    }
+    let vm_clone = session.vm.clone();
     let mut agent = Agent::new(
         router,
-        match guest_coding_tool_registry_shared(state.guest_vm.clone()) {
-            Ok(tools) => tools,
-            Err(error) => {
-                let body = format!(r#"{{"error":"failed to configure tools: {error}"}}"#);
-                write_response(stream, 500, "application/json", body.as_bytes());
+        match guest_coding_tool_registry_shared(vm_clone.clone()) {
+            Ok(t) => t,
+            Err(_) => {
+                *session.agent_active.lock().unwrap() = false;
+                *state.global_agents.lock().unwrap() -= 1;
+                write_error(stream, 500, "internal error", set_cookie);
                 return;
             }
         },
     )
-    .with_system_prompt(guest_system_prompt(&state.guest_vm))
+    .with_system_prompt(guest_system_prompt(&vm_clone))
     .with_route_request(RouteRequest {
         requires_tools: true,
         ..RouteRequest::default()
-    });
-
-    write_stream_headers(stream);
+    })
+    .with_max_steps(AGENT_TTL_STEP_LIMIT);
+    write_stream_headers(stream, set_cookie);
+    let approvals = session.approvals.clone();
     let result = agent.run_streaming_with_approval(
         request.prompt,
-        |permission| state.approvals.wait(&permission.id),
+        |p| approvals.wait(&p.id),
         |event| write_event(stream, &event),
     );
-    if let Err(error) = result {
+    if let Err(e) = result {
         write_event(
             stream,
             &AgentEvent::Error {
-                message: format!("agent error: {error}"),
+                message: format!("agent error: {e}"),
             },
         );
     }
+    *session.agent_active.lock().unwrap() = false;
+    *state.global_agents.lock().unwrap() -= 1;
 }
 
-fn handle_upload(stream: &mut TcpStream, body: &[u8], state: &ServerState) {
+fn handle_upload(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session: &Arc<SessionData>,
+    set_cookie: Option<&str>,
+) {
     let request = match serde_json::from_slice::<UploadRequest>(body) {
-        Ok(request) => request,
-        Err(error) => {
-            let body = format!(r#"{{"error":"invalid upload request: {error}"}}"#);
-            write_response(stream, 400, "application/json", body.as_bytes());
+        Ok(r) => r,
+        Err(_) => {
+            write_error(stream, 400, "invalid upload request", set_cookie);
             return;
         }
     };
     if request.bytes.len() > MAX_UPLOAD_BYTES {
-        let body = format!(
-            r#"{{"error":"upload exceeds the {} byte limit"}}"#,
-            MAX_UPLOAD_BYTES
-        );
-        write_response(stream, 400, "application/json", body.as_bytes());
+        write_error(stream, 400, "upload exceeds limit", set_cookie);
         return;
     }
     let path = match guest_upload_path(&request.name) {
-        Ok(path) => path,
-        Err(error) => {
-            let body = format!(r#"{{"error":"{error}"}}"#);
-            write_response(stream, 400, "application/json", body.as_bytes());
+        Ok(p) => p,
+        Err(e) => {
+            write_error(stream, 400, &e, set_cookie);
             return;
         }
     };
-    let mut vm = match state.guest_vm.lock() {
-        Ok(vm) => vm,
+    let mut vm = match session.vm.lock() {
+        Ok(v) => v,
         Err(_) => {
-            write_response(
-                stream,
-                500,
-                "application/json",
-                br#"{"error":"guest VM lock is poisoned"}"#,
-            );
+            write_error(stream, 500, "internal error", set_cookie);
             return;
         }
     };
-    if let Err(error) = vm
-        .mkdir("/workspace/uploads", true)
-        .and_then(|()| vm.write_file(&path, &request.bytes))
-    {
-        let body = format!(r#"{{"error":"failed to store upload: {error}"}}"#);
-        write_response(stream, 400, "application/json", body.as_bytes());
+    let existing_files = vm
+        .list_dir("/workspace/uploads")
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| matches!(e.kind, crate::runtime::EntryKind::File))
+        .count();
+    if existing_files >= MAX_FILES_PER_SESSION && vm.read_file(&path).is_err() {
+        write_error(stream, 400, "file limit exceeded", set_cookie);
         return;
     }
-    let response = UploadResponse {
+    if vm.filesystem().byte_count() + request.bytes.len() > MAX_TOTAL_BYTES_PER_SESSION {
+        write_error(stream, 400, "session storage limit exceeded", set_cookie);
+        return;
+    }
+    if let Err(e) = vm
+        .mkdir("/workspace/uploads", true)
+        .and_then(|_| vm.write_file(&path, &request.bytes))
+    {
+        write_error(stream, 400, "failed to store upload", set_cookie);
+        let _ = e;
+        return;
+    }
+    let resp = UploadResponse {
         path,
         bytes: request.bytes.len(),
     };
-    match serde_json::to_vec(&response) {
-        Ok(body) => write_response(stream, 200, "application/json", &body),
-        Err(error) => {
-            let body = format!(r#"{{"error":"failed to encode upload response: {error}"}}"#);
-            write_response(stream, 500, "application/json", body.as_bytes());
-        }
+    match serde_json::to_vec(&resp) {
+        Ok(b) => write_response(stream, 200, "application/json", &b, set_cookie),
+        Err(_) => write_error(stream, 500, "internal error", set_cookie),
     }
 }
 
-fn handle_files(stream: &mut TcpStream, state: &ServerState) {
-    let vm = match state.guest_vm.lock() {
-        Ok(vm) => vm,
+fn handle_files(stream: &mut TcpStream, session: &Arc<SessionData>, set_cookie: Option<&str>) {
+    let vm = match session.vm.lock() {
+        Ok(v) => v,
         Err(_) => {
-            write_response(
-                stream,
-                500,
-                "application/json",
-                br#"{"error":"guest VM lock is poisoned"}"#,
-            );
+            write_error(stream, 500, "internal error", set_cookie);
             return;
         }
     };
@@ -492,184 +666,144 @@ fn handle_files(stream: &mut TcpStream, state: &ServerState) {
         .list_dir("/workspace/uploads")
         .unwrap_or_default()
         .into_iter()
-        .filter(|entry| matches!(entry.kind, crate::runtime::EntryKind::File))
-        .map(|entry| GuestFile {
-            path: format!("/workspace/uploads/{}", entry.name),
-            bytes: entry.size,
+        .filter(|e| matches!(e.kind, crate::runtime::EntryKind::File))
+        .map(|e| GuestFile {
+            path: format!("/workspace/uploads/{}", e.name),
+            bytes: e.size,
         })
         .collect();
     match serde_json::to_vec(&GuestFilesResponse { files }) {
-        Ok(body) => write_response(stream, 200, "application/json", &body),
-        Err(error) => {
-            let body = format!(r#"{{"error":"failed to encode guest files: {error}"}}"#);
-            write_response(stream, 500, "application/json", body.as_bytes());
-        }
+        Ok(b) => write_response(stream, 200, "application/json", &b, set_cookie),
+        Err(_) => write_error(stream, 500, "internal error", set_cookie),
     }
 }
 
-fn handle_tabulate(stream: &mut TcpStream, body: &[u8], state: &ServerState) {
+fn handle_tabulate(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session: &Arc<SessionData>,
+    set_cookie: Option<&str>,
+) {
     let request = match serde_json::from_slice::<TabulateRequest>(body) {
-        Ok(request) if !request.path.trim().is_empty() => request,
+        Ok(r) if !r.path.trim().is_empty() => r,
         Ok(_) => {
-            write_response(
-                stream,
-                400,
-                "application/json",
-                br#"{"error":"path is empty"}"#,
-            );
+            write_error(stream, 400, "path is empty", set_cookie);
             return;
-        }
-        Err(error) => {
-            let body = format!(r#"{{"error":"invalid tabulation request: {error}"}}"#);
-            write_response(stream, 400, "application/json", body.as_bytes());
-            return;
-        }
-    };
-    let job = match state.jobs.lock() {
-        Ok(mut jobs) => {
-            let job = jobs.start_tabulation("local", &request.path);
-            jobs.mark_running(&job.id);
-            job
         }
         Err(_) => {
-            write_response(
-                stream,
-                500,
-                "application/json",
-                br#"{"error":"job store lock is poisoned"}"#,
-            );
+            write_error(stream, 400, "invalid request", set_cookie);
             return;
         }
     };
-    let result = match state.guest_vm.lock() {
+    {
+        let jobs = session.jobs.lock().unwrap();
+        if jobs.list(&session.id).len() >= MAX_JOBS_PER_SESSION {
+            write_error(stream, 400, "job limit exceeded", set_cookie);
+            return;
+        }
+    }
+    let job = {
+        let mut jobs = session.jobs.lock().unwrap();
+        let j = jobs.start_tabulation(&session.id, &request.path);
+        jobs.mark_running(&j.id);
+        j
+    };
+    let result = match session.vm.lock() {
         Ok(mut vm) => tabulate_uploaded_file(&mut vm, &request.path),
-        Err(_) => Err("guest VM lock is poisoned".to_owned()),
+        Err(_) => Err("internal error".to_owned()),
     };
     match result {
         Ok(table) => {
-            let completed = state
+            let completed = session
                 .jobs
                 .lock()
                 .ok()
-                .and_then(|mut jobs| jobs.finish(&job.id, Ok(&table.output_path)));
+                .and_then(|mut j| j.finish(&job.id, Ok(&table.output_path)));
             match completed {
                 Some(job) => match serde_json::to_vec(&TabulateResponse { job, table }) {
-                    Ok(body) => write_response(stream, 200, "application/json", &body),
-                    Err(error) => {
-                        let body = format!(
-                            r#"{{"error":"failed to encode tabulation response: {error}"}}"#
-                        );
-                        write_response(stream, 500, "application/json", body.as_bytes());
-                    }
+                    Ok(b) => write_response(stream, 200, "application/json", &b, set_cookie),
+                    Err(_) => write_error(stream, 500, "internal error", set_cookie),
                 },
-                None => write_response(
-                    stream,
-                    500,
-                    "application/json",
-                    br#"{"error":"failed to complete job"}"#,
-                ),
+                None => write_error(stream, 500, "internal error", set_cookie),
             }
         }
-        Err(error) => {
-            if let Ok(mut jobs) = state.jobs.lock() {
-                jobs.finish(&job.id, Err(&error));
+        Err(e) => {
+            if let Ok(mut jobs) = session.jobs.lock() {
+                jobs.finish(&job.id, Err(&e));
             }
-            let body = format!(r#"{{"error":{}}}"#, serde_json::json!(error));
-            write_response(stream, 400, "application/json", body.as_bytes());
+            write_error(stream, 400, &e, set_cookie);
         }
     }
 }
 
-fn handle_jobs(stream: &mut TcpStream, state: &ServerState) {
-    let jobs = match state.jobs.lock() {
-        Ok(jobs) => jobs.list("local"),
+fn handle_jobs(stream: &mut TcpStream, session: &Arc<SessionData>, set_cookie: Option<&str>) {
+    let jobs = match session.jobs.lock() {
+        Ok(j) => j.list(&session.id),
         Err(_) => {
-            write_response(
-                stream,
-                500,
-                "application/json",
-                br#"{"error":"job store lock is poisoned"}"#,
-            );
+            write_error(stream, 500, "internal error", set_cookie);
             return;
         }
     };
     match serde_json::to_vec(&JobsResponse { jobs }) {
-        Ok(body) => write_response(stream, 200, "application/json", &body),
-        Err(error) => {
-            let body = format!(r#"{{"error":"failed to encode jobs response: {error}"}}"#);
-            write_response(stream, 500, "application/json", body.as_bytes());
-        }
+        Ok(b) => write_response(stream, 200, "application/json", &b, set_cookie),
+        Err(_) => write_error(stream, 500, "internal error", set_cookie),
     }
 }
 
-fn handle_pdf_inspection(stream: &mut TcpStream, body: &[u8], state: &ServerState) {
+fn handle_pdf_inspection(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session: &Arc<SessionData>,
+    set_cookie: Option<&str>,
+) {
     let request = match serde_json::from_slice::<PdfInspectionRequest>(body) {
-        Ok(request) if !request.path.trim().is_empty() => request,
+        Ok(r) if !r.path.trim().is_empty() => r,
         Ok(_) => {
-            write_response(
-                stream,
-                400,
-                "application/json",
-                br#"{"error":"path is empty"}"#,
-            );
+            write_error(stream, 400, "path is empty", set_cookie);
             return;
-        }
-        Err(error) => {
-            let body = format!(r#"{{"error":"invalid PDF inspection request: {error}"}}"#);
-            write_response(stream, 400, "application/json", body.as_bytes());
-            return;
-        }
-    };
-    let job = match state.jobs.lock() {
-        Ok(mut jobs) => {
-            let job = jobs.start_pdf_inspection("local", &request.path);
-            jobs.mark_running(&job.id);
-            job
         }
         Err(_) => {
-            write_response(
-                stream,
-                500,
-                "application/json",
-                br#"{"error":"job store lock is poisoned"}"#,
-            );
+            write_error(stream, 400, "invalid request", set_cookie);
             return;
         }
     };
-    let result = match state.guest_vm.lock() {
+    {
+        let jobs = session.jobs.lock().unwrap();
+        if jobs.list(&session.id).len() >= MAX_JOBS_PER_SESSION {
+            write_error(stream, 400, "job limit exceeded", set_cookie);
+            return;
+        }
+    }
+    let job = {
+        let mut jobs = session.jobs.lock().unwrap();
+        let j = jobs.start_pdf_inspection(&session.id, &request.path);
+        jobs.mark_running(&j.id);
+        j
+    };
+    let result = match session.vm.lock() {
         Ok(mut vm) => inspect_uploaded_pdf(&mut vm, &request.path),
-        Err(_) => Err("guest VM lock is poisoned".to_owned()),
+        Err(_) => Err("internal error".to_owned()),
     };
     match result {
         Ok(pdf) => {
-            let completed = state
+            let completed = session
                 .jobs
                 .lock()
                 .ok()
-                .and_then(|mut jobs| jobs.finish(&job.id, Ok(&pdf.output_path)));
+                .and_then(|mut j| j.finish(&job.id, Ok(&pdf.output_path)));
             match completed {
                 Some(job) => match serde_json::to_vec(&PdfInspectionResponse { job, pdf }) {
-                    Ok(body) => write_response(stream, 200, "application/json", &body),
-                    Err(error) => {
-                        let body =
-                            format!(r#"{{"error":"failed to encode PDF response: {error}"}}"#);
-                        write_response(stream, 500, "application/json", body.as_bytes());
-                    }
+                    Ok(b) => write_response(stream, 200, "application/json", &b, set_cookie),
+                    Err(_) => write_error(stream, 500, "internal error", set_cookie),
                 },
-                None => write_response(
-                    stream,
-                    500,
-                    "application/json",
-                    br#"{"error":"failed to complete job"}"#,
-                ),
+                None => write_error(stream, 500, "internal error", set_cookie),
             }
         }
-        Err(error) => {
-            if let Ok(mut jobs) = state.jobs.lock() {
-                jobs.finish(&job.id, Err(&error));
+        Err(e) => {
+            if let Ok(mut jobs) = session.jobs.lock() {
+                jobs.finish(&job.id, Err(&e));
             }
-            let body = format!(r#"{{"error":{}}}"#, serde_json::json!(error));
-            write_response(stream, 400, "application/json", body.as_bytes());
+            write_error(stream, 400, &e, set_cookie);
         }
     }
 }
@@ -684,10 +818,7 @@ fn guest_upload_path(name: &str) -> Result<String, String> {
     if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return Err("file name must be a single path component".to_owned());
     }
-    if name
-        .chars()
-        .any(|character| character == '\0' || character.is_control())
-    {
+    if name.chars().any(|c| c == '\0' || c.is_control()) {
         return Err("file name contains a control character".to_owned());
     }
     Ok(format!("/workspace/uploads/{name}"))
@@ -696,11 +827,10 @@ fn guest_upload_path(name: &str) -> Result<String, String> {
 fn create_model_working_directory() -> Result<PathBuf, String> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .map_err(|e| format!("system clock is before the Unix epoch: {e}"))?
         .as_nanos();
     let base = env::temp_dir();
     let process_id = std::process::id();
-
     for attempt in 0..16 {
         let path = base.join(format!(
             "a-rust-vm-model-{process_id}-{timestamp}-{attempt}"
@@ -711,9 +841,7 @@ fn create_model_working_directory() -> Result<PathBuf, String> {
                     .args(["init", "--quiet"])
                     .current_dir(&path)
                     .output()
-                    .map_err(|error| {
-                        format!("failed to initialize model runner project: {error}")
-                    })?;
+                    .map_err(|e| format!("failed to initialize model runner project: {e}"))?;
                 if !output.status.success() {
                     let detail = String::from_utf8_lossy(&output.stderr);
                     return Err(format!(
@@ -723,22 +851,23 @@ fn create_model_working_directory() -> Result<PathBuf, String> {
                 }
                 return Ok(path);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!("failed to create model runner directory: {error}"));
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to create model runner directory: {e}")),
         }
     }
-
     Err("could not allocate a unique model runner directory".to_owned())
 }
 
-fn handle_approval(stream: &mut TcpStream, body: &[u8], approvals: &ApprovalStore) {
+fn handle_approval(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session: &Arc<SessionData>,
+    set_cookie: Option<&str>,
+) {
     let request = match serde_json::from_slice::<ApprovalRequest>(body) {
-        Ok(request) => request,
-        Err(error) => {
-            let body = format!(r#"{{"error":"invalid approval request: {error}"}}"#);
-            write_response(stream, 400, "application/json", body.as_bytes());
+        Ok(r) => r,
+        Err(_) => {
+            write_error(stream, 400, "invalid approval request", set_cookie);
             return;
         }
     };
@@ -746,26 +875,36 @@ fn handle_approval(stream: &mut TcpStream, body: &[u8], approvals: &ApprovalStor
         "allow" => ApprovalReply::Allow,
         "deny" => ApprovalReply::Deny,
         _ => {
-            write_response(
+            write_error(
                 stream,
                 400,
-                "application/json",
-                br#"{"error":"decision must be 'allow' or 'deny'"}"#,
+                "decision must be 'allow' or 'deny'",
+                set_cookie,
             );
             return;
         }
     };
-    match approvals.resolve(request.id, reply) {
-        Ok(()) => write_response(stream, 200, "application/json", br#"{"ok":true}"#),
-        Err(error) => {
-            let body = format!(r#"{{"error":"{error}"}}"#);
-            write_response(stream, 409, "application/json", body.as_bytes());
-        }
+    match session.approvals.resolve(request.id, reply) {
+        Ok(()) => write_response(
+            stream,
+            200,
+            "application/json",
+            br#"{"ok":true}"#,
+            set_cookie,
+        ),
+        Err(e) => write_error_with_status(stream, 409, &e, set_cookie),
     }
 }
 
-fn write_stream_headers(stream: &mut TcpStream) {
-    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+fn write_stream_headers(stream: &mut TcpStream, set_cookie: Option<&str>) {
+    let mut header = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n",
+    );
+    append_security_headers(&mut header);
+    if let Some(c) = set_cookie {
+        header.push_str(&format!("Set-Cookie: {c}\r\n"));
+    }
+    header.push_str("\r\n");
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.flush();
 }
@@ -779,58 +918,133 @@ fn write_event(stream: &mut TcpStream, event: &AgentEvent) {
     let _ = stream.flush();
 }
 
-fn guest_system_prompt(guest_vm: &SharedGuestVm) -> String {
+fn guest_system_prompt(vm: &Arc<Mutex<VmInstance>>) -> String {
     let mut prompt = format!(
         "{}\n\nYou are operating inside an isolated guest VM. Use guest-prefixed tools for all files and processes. Guest files are not host files; do not claim host workspace changes.",
         crate::agent::DEFAULT_SYSTEM_PROMPT
     );
-    if let Ok(vm) = guest_vm.lock()
-        && let Ok(entries) = vm.list_dir("/workspace/uploads")
-        && !entries.is_empty()
-    {
-        prompt.push_str(
-            "\n\nUploaded guest files currently available (use guest_read_file with the exact path when asked about their contents):",
-        );
-        for entry in entries {
-            if matches!(entry.kind, crate::runtime::EntryKind::File) {
-                prompt.push_str(&format!(
-                    "\n- /workspace/uploads/{} ({} bytes)",
-                    entry.name, entry.size
-                ));
+    #[allow(clippy::collapsible_if)]
+    if let Ok(vm) = vm.lock() {
+        if let Ok(entries) = vm.list_dir("/workspace/uploads") {
+            if !entries.is_empty() {
+                prompt.push_str("\n\nUploaded guest files currently available (use guest_read_file with the exact path when asked about their contents):");
+                for entry in entries {
+                    if matches!(entry.kind, crate::runtime::EntryKind::File) {
+                        prompt.push_str(&format!(
+                            "\n- /workspace/uploads/{} ({} bytes)",
+                            entry.name, entry.size
+                        ));
+                    }
+                }
             }
         }
     }
     prompt
 }
 
-fn serve_file(stream: &mut TcpStream, root: &Path, relative_path: &str, content_type: &str) {
+fn serve_file(
+    stream: &mut TcpStream,
+    root: &Path,
+    relative_path: &str,
+    content_type: &str,
+    set_cookie: Option<&str>,
+) {
     let path = root.join(relative_path);
     match fs::read(path) {
-        Ok(body) => write_response(stream, 200, content_type, &body),
-        Err(_) => write_response(stream, 404, "text/plain; charset=utf-8", b"not found"),
+        Ok(body) => write_response(stream, 200, content_type, &body, set_cookie),
+        Err(_) => write_error(stream, 404, "not found", set_cookie),
     }
 }
 
-fn write_redirect(stream: &mut TcpStream, location: &str) {
-    let response = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+fn write_redirect(stream: &mut TcpStream, location: &str, set_cookie: Option<&str>) {
+    let mut response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n"
     );
+    append_security_headers(&mut response);
+    if let Some(c) = set_cookie {
+        response.push_str(&format!("Set-Cookie: {c}\r\n"));
+    }
+    response.push_str("\r\n");
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+fn append_security_headers(header: &mut String) {
+    header.push_str("X-Content-Type-Options: nosniff\r\n");
+    header.push_str("X-Frame-Options: DENY\r\n");
+    header.push_str("Referrer-Policy: no-referrer\r\n");
+    header.push_str("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n");
+    header.push_str("Cross-Origin-Opener-Policy: same-origin\r\n");
+    header.push_str("Cross-Origin-Resource-Policy: same-origin\r\n");
+    header.push_str("Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n");
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    set_cookie: Option<&str>,
+) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    let mut header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
         body.len()
     );
+    append_security_headers(&mut header);
+    if let Some(c) = set_cookie {
+        header.push_str(&format!("Set-Cookie: {c}\r\n"));
+    }
+    header.push_str("\r\n");
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
+}
+
+fn write_error(stream: &mut TcpStream, status: u16, message: &str, set_cookie: Option<&str>) {
+    write_error_with_status(stream, status, message, set_cookie)
+}
+
+fn write_error_with_status(
+    stream: &mut TcpStream,
+    status: u16,
+    message: &str,
+    set_cookie: Option<&str>,
+) {
+    let sanitized = sanitize_error(message);
+    let body = serde_json::json!({"error": sanitized}).to_string();
+    write_response(
+        stream,
+        status,
+        "application/json",
+        body.as_bytes(),
+        set_cookie,
+    );
+}
+
+fn sanitize_error(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("/home")
+        || lower.contains("/tmp")
+        || lower.contains("credential")
+        || lower.contains("stack trace")
+        || lower.contains("backtrace")
+    {
+        return "request failed".to_owned();
+    }
+    if message.len() > 500 {
+        message.chars().take(500).collect()
+    } else {
+        message.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -847,12 +1061,10 @@ mod tests {
         let store = Arc::new(ApprovalStore::default());
         let waiting = store.clone();
         let handle = thread::spawn(move || waiting.wait("permission-1"));
-
         thread::sleep(Duration::from_millis(10));
         store
             .resolve("permission-1".to_owned(), ApprovalReply::Allow)
             .unwrap();
-
         assert_eq!(handle.join().unwrap(), PermissionDecision::Allow);
     }
 
@@ -862,7 +1074,6 @@ mod tests {
         store
             .resolve("permission-2".to_owned(), ApprovalReply::Deny)
             .unwrap();
-
         assert_eq!(
             store.wait("permission-2"),
             PermissionDecision::Deny {
@@ -893,5 +1104,153 @@ mod tests {
         let prompt = guest_system_prompt(&vm);
         assert!(prompt.contains("/workspace/uploads/rag_review.md (3 bytes)"));
         assert!(!prompt.contains("/home/"));
+    }
+
+    #[test]
+    fn sanitize_error_hides_paths() {
+        assert_eq!(
+            super::sanitize_error("failed at /home/user/secret"),
+            "request failed"
+        );
+    }
+
+    #[test]
+    fn sid_format_validation() {
+        assert!(crate::anon_session::is_valid_sid_format(&"a".repeat(64)));
+        assert!(!crate::anon_session::is_valid_sid_format("short"));
+        assert_eq!(
+            crate::anon_session::extract_sid("arvm_anon=abc; other=1"),
+            Some("abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn origin_check_rejects_cross_origin() {
+        let mut headers = std::collections::BTreeMap::new();
+        assert!(!crate::anon_session::check_origin(
+            &headers,
+            "https://asiliano.online"
+        ));
+        headers.insert("origin".to_owned(), "https://evil.com".to_owned());
+        assert!(!crate::anon_session::check_origin(
+            &headers,
+            "https://asiliano.online"
+        ));
+        headers.insert("origin".to_owned(), "https://asiliano.online".to_owned());
+        assert!(crate::anon_session::check_origin(
+            &headers,
+            "https://asiliano.online"
+        ));
+    }
+
+    #[test]
+    fn production_cookie_can_be_marked_secure() {
+        let secure = crate::anon_session::cookie_header("a", true);
+        let local = crate::anon_session::cookie_header("a", false);
+        assert!(secure.contains("; Secure"));
+        assert!(!local.contains("; Secure"));
+        assert!(secure.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn anonymous_sessions_are_isolated() {
+        let store = super::AnonStore::new();
+        let (a, cookie_a) = store.resolve(None).unwrap();
+        let cookie_a = cookie_a.expect("first session should set cookie");
+        let sid_a = crate::anon_session::extract_sid(&cookie_a).unwrap();
+        {
+            let mut vm = a.vm.lock().unwrap();
+            vm.mkdir("/workspace/uploads", true).unwrap();
+            vm.write_file("/workspace/uploads/a.txt", b"secret-a")
+                .unwrap();
+        }
+        a.jobs
+            .lock()
+            .unwrap()
+            .start_tabulation(&a.id, "/workspace/uploads/a.txt");
+        a.approvals
+            .resolve("perm-a".to_owned(), ApprovalReply::Allow)
+            .unwrap();
+
+        let (b, cookie_b) = store.resolve(None).unwrap();
+        let cookie_b = cookie_b.expect("second session should set cookie");
+        let sid_b = crate::anon_session::extract_sid(&cookie_b).unwrap();
+        assert_ne!(sid_a, sid_b);
+        assert!(
+            b.vm.lock()
+                .unwrap()
+                .read_file("/workspace/uploads/a.txt")
+                .is_err()
+        );
+        assert!(b.jobs.lock().unwrap().list(&b.id).is_empty());
+        assert!(
+            b.approvals
+                .resolve("perm-a".to_owned(), ApprovalReply::Allow)
+                .is_ok()
+        );
+
+        let (a2, no_cookie) = store.resolve(Some(&cookie_a)).unwrap();
+        assert!(no_cookie.is_none());
+        assert_eq!(a2.id, a.id);
+        assert_eq!(
+            a2.vm
+                .lock()
+                .unwrap()
+                .read_text("/workspace/uploads/a.txt")
+                .unwrap(),
+            "secret-a"
+        );
+    }
+
+    #[test]
+    fn tampered_cookie_is_rotated() {
+        let store = super::AnonStore::new();
+        let (a, cookie_a) = store.resolve(None).unwrap();
+        let sid_a = crate::anon_session::extract_sid(&cookie_a.unwrap()).unwrap();
+        let tampered = format!("arvm_anon={}x; other=1", &sid_a[..63]);
+        let (b, cookie_b) = store.resolve(Some(&tampered)).unwrap();
+        assert!(cookie_b.is_some());
+        let sid_b = crate::anon_session::extract_sid(&cookie_b.unwrap()).unwrap();
+        assert_ne!(sid_a, sid_b);
+        assert_ne!(a.id, b.id);
+        let (c, none) = store.resolve(Some(&format!("arvm_anon={sid_a}"))).unwrap();
+        assert!(none.is_none());
+        assert_eq!(c.id, a.id);
+    }
+
+    #[test]
+    fn invalid_sid_formats_are_rotated() {
+        let store = super::AnonStore::new();
+        for bad in [
+            "short",
+            "",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "a/b..",
+        ] {
+            let (_s, cookie) = store.resolve(Some(&format!("arvm_anon={bad}"))).unwrap();
+            assert!(cookie.is_some(), "bad sid {bad} should rotate");
+            let sid = crate::anon_session::extract_sid(&cookie.unwrap()).unwrap();
+            assert!(crate::anon_session::is_valid_sid_format(&sid));
+        }
+    }
+
+    #[test]
+    fn limits_are_enforced() {
+        assert_eq!(super::MAX_PROMPT_CHARS, 8192);
+        assert_eq!(super::MAX_UPLOAD_BYTES, 1024 * 1024);
+        assert_eq!(super::MAX_FILES_PER_SESSION, 32);
+        assert_eq!(super::MAX_JOBS_PER_SESSION, 64);
+        assert_eq!(super::AGENT_TTL_STEP_LIMIT, 8);
+        assert_eq!(super::MAX_GLOBAL_SESSIONS, 128);
+    }
+
+    #[test]
+    fn security_headers_present() {
+        let mut header = String::new();
+        super::append_security_headers(&mut header);
+        assert!(header.contains("X-Content-Type-Options: nosniff"));
+        assert!(header.contains("X-Frame-Options: DENY"));
+        assert!(header.contains("Content-Security-Policy:"));
+        assert!(header.contains("Cross-Origin-Opener-Policy: same-origin"));
     }
 }

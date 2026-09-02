@@ -84,6 +84,33 @@ binds to loopback. Authenticated multi-user VM selection is not wired into the
 browser protocol yet. Host workspace tools remain available to native coding
 workflows, but are not registered with the browser guest agent.
 
+### Anonymous browser sessions
+
+The browser host assigns each visitor an opaque, in-memory session cookie. Each
+session owns its guest VM, uploads, jobs, artifacts, and pending approvals.
+Sessions expire after 30 minutes of inactivity and the process evicts old
+sessions after reaching its bounded session limit. Data is not durable and is
+lost when the server restarts or the session expires; do not upload sensitive
+information to a public deployment.
+
+State-changing browser requests require the configured same-origin `Origin`
+header and an existing anonymous session cookie (the browser obtains it from
+the initial page request). For local development the default origin is
+`http://127.0.0.1:<port>`. A
+deployment behind an HTTPS edge must set both of these variables explicitly:
+
+```bash
+A_RVM_ALLOWED_ORIGIN=https://asiliano.online
+A_RVM_SECURE_COOKIES=true
+```
+
+The anonymous cookie is a session capability, not an identity system. Public
+deployments still need an HTTPS edge, WAF or equivalent rate limiting, bounded
+container resources, and monitoring before they should be considered safe for
+untrusted internet traffic. The current host still binds its application
+listener to loopback and uses a process-local session store; multi-instance
+durability and managed session storage are future deployment work.
+
 ## Run the interactive terminal agent
 
 With the local model runner installed and authenticated, the interactive agent
@@ -96,6 +123,19 @@ cargo run -- agent
 The built-in bridge uses `openrouter/deepseek/deepseek-v4-flash` as its fixed
 model. It only forwards requests and structured responses; credentials remain
 in the runner's protected configuration.
+
+For a local OpenRouter-backed run, provide the key through the environment;
+never place it in browser code, Git, command arguments, or committed files:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-v1-...
+cargo run -- agent
+```
+
+The hosted browser service must load its OpenRouter key from an AWS-managed
+secret and must call the provider from the server side. OpenCode and Muse are
+development-time orchestration tools and are not required by the hosted
+runtime.
 
 ## Connect an external model process
 
