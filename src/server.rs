@@ -18,9 +18,10 @@ use crate::anon_session::{
 };
 use crate::apps::{
     AppDescriptor, AppId, DOCS_DOCUMENT_PATH, Document, SHEETS_INPUT_PATH, SheetFormat,
-    SheetSummary, app_descriptors, append_document, import_sheet, open_docs, open_sheets,
-    read_document, replace_document,
+    SheetSummary, app_descriptors, append_document, import_sheet, import_sheet_records, open_docs,
+    open_sheets, read_document, replace_document, replace_document_with_metadata,
 };
+use crate::format_readers::{read_document as read_document_upload, read_spreadsheet};
 use crate::guest_tools::guest_coding_tool_registry_shared;
 use crate::jobs::{
     JobRecord, JobStore, PdfSummary, TableSummary, inspect_uploaded_pdf, tabulate_uploaded_file,
@@ -84,6 +85,7 @@ struct AppOperationRequest {
     operation: String,
     text: Option<String>,
     format: Option<SheetFormat>,
+    file: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -775,34 +777,48 @@ fn handle_app_operation(
         }
     };
 
-    let result = match session.vm.lock() {
-        Ok(mut vm) => match (request.app, operation.as_str()) {
-            (AppId::Docs, "open") => open_docs(&mut vm).map(|document| (Some(document), None)),
-            (AppId::Docs, "read") => read_document(&vm).map(|document| (Some(document), None)),
-            (AppId::Docs, "replace") => request
-                .text
-                .as_deref()
-                .ok_or_else(|| "document text is required".to_owned())
-                .and_then(|text| replace_document(&mut vm, text))
-                .map(|document| (Some(document), None)),
-            (AppId::Docs, "append") => request
-                .text
-                .as_deref()
-                .ok_or_else(|| "document text is required".to_owned())
-                .and_then(|text| append_document(&mut vm, text))
-                .map(|document| (Some(document), None)),
-            (AppId::Sheets, "open") => open_sheets(&mut vm).map(|sheet| (None, Some(sheet))),
-            (AppId::Sheets, "import") => match (request.text.as_deref(), request.format) {
-                (Some(text), Some(format)) => {
-                    import_sheet(&mut vm, text, format).map(|sheet| (None, Some(sheet)))
-                }
-                (None, _) => Err("sheet text is required".to_owned()),
-                (_, None) => Err("sheet format must be 'csv' or 'tsv'".to_owned()),
+    let result = match (request.app, operation.as_str()) {
+        (AppId::Docs, "open_upload") => request
+            .file
+            .as_deref()
+            .ok_or_else(|| "uploaded document name is required".to_owned())
+            .and_then(|file| import_uploaded_document(session, file))
+            .map(|document| (Some(document), None)),
+        (AppId::Sheets, "open_upload") => request
+            .file
+            .as_deref()
+            .ok_or_else(|| "uploaded spreadsheet name is required".to_owned())
+            .and_then(|file| import_uploaded_sheet(session, file))
+            .map(|sheet| (None, Some(sheet))),
+        _ => match session.vm.lock() {
+            Ok(mut vm) => match (request.app, operation.as_str()) {
+                (AppId::Docs, "open") => open_docs(&mut vm).map(|document| (Some(document), None)),
+                (AppId::Docs, "read") => read_document(&vm).map(|document| (Some(document), None)),
+                (AppId::Docs, "replace") => request
+                    .text
+                    .as_deref()
+                    .ok_or_else(|| "document text is required".to_owned())
+                    .and_then(|text| replace_document(&mut vm, text))
+                    .map(|document| (Some(document), None)),
+                (AppId::Docs, "append") => request
+                    .text
+                    .as_deref()
+                    .ok_or_else(|| "document text is required".to_owned())
+                    .and_then(|text| append_document(&mut vm, text))
+                    .map(|document| (Some(document), None)),
+                (AppId::Sheets, "open") => open_sheets(&mut vm).map(|sheet| (None, Some(sheet))),
+                (AppId::Sheets, "import") => match (request.text.as_deref(), request.format) {
+                    (Some(text), Some(format)) => {
+                        import_sheet(&mut vm, text, format).map(|sheet| (None, Some(sheet)))
+                    }
+                    (None, _) => Err("sheet text is required".to_owned()),
+                    (_, None) => Err("sheet format must be 'csv' or 'tsv'".to_owned()),
+                },
+                (AppId::Docs, _) => Err("unsupported Docs operation".to_owned()),
+                (AppId::Sheets, _) => Err("unsupported Sheets operation".to_owned()),
             },
-            (AppId::Docs, _) => Err("unsupported Docs operation".to_owned()),
-            (AppId::Sheets, _) => Err("unsupported Sheets operation".to_owned()),
+            Err(_) => Err("internal error".to_owned()),
         },
-        Err(_) => Err("internal error".to_owned()),
     };
     match result {
         Ok((document, sheet)) => {
@@ -834,6 +850,44 @@ fn handle_app_operation(
             write_error(stream, 400, &error, set_cookie);
         }
     }
+}
+
+fn import_uploaded_document(session: &Arc<SessionData>, name: &str) -> Result<Document, String> {
+    let path = guest_upload_path(name)?;
+    let bytes = session
+        .vm
+        .lock()
+        .map_err(|_| "internal error".to_owned())?
+        .read_file(&path)
+        .map_err(|error| error.to_string())?;
+    let content = read_document_upload(name, &bytes)?;
+    let mut vm = session.vm.lock().map_err(|_| "internal error".to_owned())?;
+    replace_document_with_metadata(
+        &mut vm,
+        &content.text,
+        (content.format, Some(name.to_owned()), content.warnings),
+    )
+}
+
+fn import_uploaded_sheet(session: &Arc<SessionData>, name: &str) -> Result<SheetSummary, String> {
+    let path = guest_upload_path(name)?;
+    let bytes = session
+        .vm
+        .lock()
+        .map_err(|_| "internal error".to_owned())?
+        .read_file(&path)
+        .map_err(|error| error.to_string())?;
+    let content = read_spreadsheet(name, &bytes)?;
+    let mut vm = session.vm.lock().map_err(|_| "internal error".to_owned())?;
+    import_sheet_records(
+        &mut vm,
+        content.headers,
+        content.rows,
+        &content.format,
+        content.sheet_name,
+        content.warnings,
+        &path,
+    )
 }
 
 fn handle_tabulate(
@@ -1194,9 +1248,22 @@ mod tests {
     use super::{ApprovalReply, ApprovalStore, guest_system_prompt, guest_upload_path};
     use crate::agent::PermissionDecision;
     use crate::runtime::VmInstance;
+    use std::io::{Cursor, Write};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    fn archive(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, content) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
 
     #[test]
     fn approval_store_releases_a_waiting_agent() {
@@ -1246,6 +1313,30 @@ mod tests {
         let prompt = guest_system_prompt(&vm);
         assert!(prompt.contains("/workspace/uploads/rag_review.md (3 bytes)"));
         assert!(!prompt.contains("/home/"));
+    }
+
+    #[test]
+    fn uploaded_office_files_are_read_outside_the_guest_vm_as_bounded_artifacts() {
+        let store = super::AnonStore::new();
+        let (session, _) = store.resolve(None).unwrap();
+        let docx = archive(&[(
+            "word/document.xml",
+            "<w:document><w:body><w:p><w:r><w:t>Imported plan</w:t></w:r></w:p></w:body></w:document>",
+        )]);
+        {
+            let mut vm = session.vm.lock().unwrap();
+            vm.mkdir("/workspace/uploads", true).unwrap();
+            vm.write_file("/workspace/uploads/plan.docx", docx).unwrap();
+            vm.write_file("/workspace/uploads/sales.csv", "name,amount\nAda,12\n")
+                .unwrap();
+        }
+        let document = super::import_uploaded_document(&session, "plan.docx").unwrap();
+        assert_eq!(document.text, "Imported plan");
+        assert_eq!(document.source_name.as_deref(), Some("plan.docx"));
+        let sheet = super::import_uploaded_sheet(&session, "sales.csv").unwrap();
+        assert_eq!(sheet.format, "csv");
+        assert_eq!(sheet.columns[1].numeric, 1);
+        assert!(super::import_uploaded_document(&session, "../plan.docx").is_err());
     }
 
     #[test]

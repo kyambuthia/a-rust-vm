@@ -5,8 +5,8 @@ It makes two useful apps executable now while preserving the guest boundary:
 
 | App | Guest root | Input | Deterministic output |
 | --- | --- | --- | --- |
-| Docs | `/workspace/apps/docs` | UTF-8 document text | document metadata and text |
-| Sheets | `/workspace/apps/sheets` | CSV or TSV text | validated table summary and JSON artifact |
+| Docs | `/workspace/apps/docs` | bounded text, RTF, DOCX/DOCM, or ODT upload | normalized text and document metadata |
+| Sheets | `/workspace/apps/sheets` | CSV/TSV or supported Excel/OpenDocument upload | validated table summary and JSON artifact |
 
 The browser can select either app from the bottom navigation deck. Selection
 uses server endpoints that act only on the caller's anonymous session; no app
@@ -16,7 +16,13 @@ release so the `/try` layout stays unchanged.
 The public API must never accept a command line, executable path, module URL,
 or host path as an app operation. Each app operation resolves a fixed guest
 path, validates text and size limits, and writes only beneath its own guest
-root.
+root. Binary upload readers are host-only pure functions that receive copied
+guest bytes and return normalized text or cached cell values; they never accept
+a command line, host path, module URL, capability, or VM handle.
+
+Supported extensions and the explicit refusals (legacy DOC, encrypted files,
+macro/formula execution, and binary write-back) live in
+[`format-reader-roadmap.md`](format-reader-roadmap.md).
 
 Future execution tiers:
 

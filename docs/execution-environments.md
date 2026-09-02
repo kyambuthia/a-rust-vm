@@ -13,8 +13,10 @@ ambient network access.
 
 The Docs and Sheets apps use this boundary in their first version. They are
 built-in, deterministic application runtimes operating only on the guest
-filesystem. They do not evaluate user-provided JavaScript, Python, binaries,
-macros, formulas, or document parsers.
+filesystem. Their host-only format readers receive copied guest bytes and
+return bounded visible text or cached sheet values. They do not evaluate
+user-provided JavaScript, Python, binaries, macros, formulas, external links,
+or embedded document content.
 
 ## App-runtime contract
 

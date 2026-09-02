@@ -270,19 +270,22 @@ function setActiveApp(app) {
 }
 
 function printDocument(document, operation) {
-  writeLine(`[docs] ${operation} · ${document.bytes} bytes · ${document.lines} lines`, "result");
+  const source = document.source_name ? ` · ${document.source_name}` : "";
+  writeLine(`[docs] ${operation} · ${document.format} · ${document.bytes} bytes · ${document.lines} lines${source}`, "result");
   if (document.text) {
     writeLine(document.text, "muted");
   } else {
     writeLine("[docs] empty document · use /docs replace <text>", "muted");
   }
+  for (const warning of document.warnings ?? []) writeLine(`[docs] ${warning}`, "muted");
 }
 
 function printSheet(sheet, operation) {
   const columns = sheet.columns.map(column => column.name).join(" · ");
-  writeLine(`[sheets] ${operation} · ${sheet.rows} rows · ${sheet.columns.length} columns · ${sheet.delimiter.toUpperCase()}`, "result");
+  writeLine(`[sheets] ${operation} · ${sheet.format.toUpperCase()} · ${sheet.sheet_name} · ${sheet.rows} rows · ${sheet.columns.length} columns`, "result");
   writeLine(`[columns] ${columns}`, "muted");
   writeLine(`[output] ${sheet.output_path}`, "muted");
+  for (const warning of sheet.warnings ?? []) writeLine(`[sheets] ${warning}`, "muted");
 }
 
 async function operateApp(request) {
@@ -328,6 +331,10 @@ function executeDocsCommand(argumentsText) {
     writeLine(`[error] usage: /docs ${operation.toLowerCase()} <text>`, "error");
     return;
   }
+  if (operation.toLowerCase() === "open" && text) {
+    void operateApp({ app: "docs", operation: "open_upload", file: text });
+    return;
+  }
   void operateApp({
     app: "docs",
     operation: operation.toLowerCase(),
@@ -339,6 +346,11 @@ function executeSheetsCommand(argumentsText) {
   const value = argumentsText.trim();
   if (!value || value.toLowerCase() === "open") {
     openApp("sheets");
+    return;
+  }
+  const openMatch = value.match(/^open\s+(.+)$/i);
+  if (openMatch) {
+    void operateApp({ app: "sheets", operation: "open_upload", file: openMatch[1].trim() });
     return;
   }
   const match = value.match(/^import\s+(csv|tsv)\s+([\s\S]+)$/i);
@@ -667,8 +679,8 @@ function executeCommand(rawCommand, instance) {
     writeLine("  /files                list files in the guest VM");
     writeLine("  /tabulate <file>      summarize an uploaded CSV or TSV");
     writeLine("  /pdf <file>           validate an uploaded PDF safely");
-    writeLine("  /docs [operation]     open or edit the built-in document app");
-    writeLine("  /sheets [operation]   open or import a bounded data sheet");
+    writeLine("  /docs open <file>     read a guest DOCX, ODT, RTF, or text document");
+    writeLine("  /sheets open <file>   read a guest XLS/XLSX/XLSB/XLSM/ODS workbook");
     writeLine("  /jobs                 list data-processing jobs");
     writeLine("  /load <a> <op> <b>  load a program");
     writeLine("  /asm <instructions>  load ';'-separated assembly");

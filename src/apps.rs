@@ -11,6 +11,7 @@ use crate::runtime::{RuntimeError, VmInstance};
 
 pub const DOCS_ROOT: &str = "/workspace/apps/docs";
 pub const DOCS_DOCUMENT_PATH: &str = "/workspace/apps/docs/document.txt";
+pub const DOCS_METADATA_PATH: &str = "/workspace/apps/docs/document.json";
 pub const SHEETS_ROOT: &str = "/workspace/apps/sheets";
 pub const SHEETS_INPUT_PATH: &str = "/workspace/apps/sheets/sheet.txt";
 pub const SHEETS_SUMMARY_PATH: &str = "/workspace/apps/sheets/summary.json";
@@ -53,13 +54,13 @@ pub fn app_descriptors() -> [AppDescriptor; 2] {
             id: AppId::Docs,
             label: AppId::Docs.label(),
             root: DOCS_ROOT,
-            operations: &["open", "read", "replace", "append"],
+            operations: &["open", "open_upload", "read", "replace", "append"],
         },
         AppDescriptor {
             id: AppId::Sheets,
             label: AppId::Sheets.label(),
             root: SHEETS_ROOT,
-            operations: &["open", "import"],
+            operations: &["open", "open_upload", "import"],
         },
     ]
 }
@@ -70,6 +71,16 @@ pub struct Document {
     pub bytes: usize,
     pub lines: usize,
     pub text: String,
+    pub format: String,
+    pub source_name: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DocumentMetadata {
+    format: String,
+    source_name: Option<String>,
+    warnings: Vec<String>,
 }
 
 pub fn open_docs(vm: &mut VmInstance) -> Result<Document, String> {
@@ -86,18 +97,51 @@ pub fn read_document(vm: &VmInstance) -> Result<Document, String> {
     if text.len() > MAX_DOCUMENT_BYTES {
         return Err(format!("document exceeds {MAX_DOCUMENT_BYTES} bytes"));
     }
+    let metadata = vm
+        .read_text(DOCS_METADATA_PATH)
+        .ok()
+        .and_then(|encoded| serde_json::from_str::<DocumentMetadata>(&encoded).ok())
+        .unwrap_or_else(plain_document_metadata);
     Ok(Document {
         path: DOCS_DOCUMENT_PATH,
         bytes: text.len(),
         lines: line_count(&text),
         text,
+        format: metadata.format,
+        source_name: metadata.source_name,
+        warnings: metadata.warnings,
     })
 }
 
 pub fn replace_document(vm: &mut VmInstance, text: &str) -> Result<Document, String> {
+    let metadata = plain_document_metadata();
+    replace_document_with_metadata(
+        vm,
+        text,
+        (metadata.format, metadata.source_name, metadata.warnings),
+    )
+}
+
+/// Persist normalized text extracted by a format reader. The reader has already
+/// consumed copied guest bytes outside the VM lock; this function only writes
+/// bounded guest artifacts.
+pub fn replace_document_with_metadata(
+    vm: &mut VmInstance,
+    text: &str,
+    metadata: (String, Option<String>, Vec<String>),
+) -> Result<Document, String> {
     validate_document(text)?;
     vm.mkdir(DOCS_ROOT, true).map_err(runtime_error)?;
     vm.write_file(DOCS_DOCUMENT_PATH, text)
+        .map_err(runtime_error)?;
+    let metadata = DocumentMetadata {
+        format: metadata.0,
+        source_name: metadata.1,
+        warnings: metadata.2,
+    };
+    let encoded = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| format!("failed to encode document metadata: {error}"))?;
+    vm.write_file(DOCS_METADATA_PATH, encoded)
         .map_err(runtime_error)?;
     read_document(vm)
 }
@@ -144,12 +188,14 @@ pub struct SheetColumn {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SheetSummary {
-    pub input_path: &'static str,
+    pub input_path: String,
     pub output_path: &'static str,
-    pub delimiter: &'static str,
+    pub format: String,
+    pub sheet_name: String,
     pub rows: usize,
     pub columns: Vec<SheetColumn>,
     pub preview: Vec<Vec<String>>,
+    pub warnings: Vec<String>,
 }
 
 pub fn open_sheets(vm: &mut VmInstance) -> Result<SheetSummary, String> {
@@ -193,6 +239,25 @@ pub fn summarize_existing_sheet(vm: &mut VmInstance) -> Result<SheetSummary, Str
     Ok(summary)
 }
 
+/// Store an already parsed worksheet from a host-only format reader.
+pub fn import_sheet_records(
+    vm: &mut VmInstance,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    format: &str,
+    sheet_name: String,
+    warnings: Vec<String>,
+    source_path: &str,
+) -> Result<SheetSummary, String> {
+    let summary = summarize_records(headers, rows, format, sheet_name, warnings, source_path)?;
+    let encoded = serde_json::to_vec_pretty(&summary)
+        .map_err(|error| format!("failed to encode sheet summary: {error}"))?;
+    vm.mkdir(SHEETS_ROOT, true).map_err(runtime_error)?;
+    vm.write_file(SHEETS_SUMMARY_PATH, encoded)
+        .map_err(runtime_error)?;
+    Ok(summary)
+}
+
 fn validate_document(text: &str) -> Result<(), String> {
     if text.len() > MAX_DOCUMENT_BYTES {
         Err(format!("document exceeds {MAX_DOCUMENT_BYTES} bytes"))
@@ -230,16 +295,34 @@ fn summarize_sheet(source: &str, format: SheetFormat) -> Result<SheetSummary, St
     let (headers, rows) = records
         .split_first()
         .ok_or_else(|| "sheet is empty".to_owned())?;
-    validate_headers(headers)?;
+    summarize_records(
+        headers.clone(),
+        rows.to_vec(),
+        format.name(),
+        "Sheet1".to_owned(),
+        Vec::new(),
+        SHEETS_INPUT_PATH,
+    )
+}
+
+fn summarize_records(
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    format: &str,
+    sheet_name: String,
+    warnings: Vec<String>,
+    source_path: &str,
+) -> Result<SheetSummary, String> {
+    validate_headers(&headers)?;
     if headers.len() > MAX_SHEET_COLUMNS {
         return Err(format!("sheet has more than {MAX_SHEET_COLUMNS} columns"));
     }
     if rows.len() > MAX_SHEET_ROWS {
         return Err(format!("sheet has more than {MAX_SHEET_ROWS} data rows"));
     }
-    let cells = records
+    let cells = rows
         .iter()
-        .try_fold(0usize, |count, row| count.checked_add(row.len()))
+        .try_fold(headers.len(), |count, row| count.checked_add(row.len()))
         .ok_or_else(|| "sheet cell count overflowed".to_owned())?;
     if cells > MAX_SHEET_CELLS {
         return Err(format!("sheet has more than {MAX_SHEET_CELLS} cells"));
@@ -275,9 +358,10 @@ fn summarize_sheet(source: &str, format: SheetFormat) -> Result<SheetSummary, St
         })
         .collect();
     Ok(SheetSummary {
-        input_path: SHEETS_INPUT_PATH,
+        input_path: source_path.to_owned(),
         output_path: SHEETS_SUMMARY_PATH,
-        delimiter: format.name(),
+        format: format.to_owned(),
+        sheet_name,
         rows: rows.len(),
         columns,
         preview: rows
@@ -285,7 +369,16 @@ fn summarize_sheet(source: &str, format: SheetFormat) -> Result<SheetSummary, St
             .take(PREVIEW_ROWS)
             .map(|row| row.iter().map(|cell| truncate_cell(cell)).collect())
             .collect(),
+        warnings,
     })
+}
+
+fn plain_document_metadata() -> DocumentMetadata {
+    DocumentMetadata {
+        format: "plain_text".to_owned(),
+        source_name: None,
+        warnings: Vec::new(),
+    }
 }
 
 fn validate_headers(headers: &[String]) -> Result<(), String> {

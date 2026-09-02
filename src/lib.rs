@@ -8,6 +8,8 @@ pub mod apps;
 pub mod control_plane;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control_plane_store;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod format_readers;
 pub mod guest_tools;
 pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
