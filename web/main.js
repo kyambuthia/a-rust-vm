@@ -1,4 +1,4 @@
-const wasmPath = "../target/wasm32-unknown-unknown/debug/a_rust_vm.wasm";
+const wasmPath = "../api/wasm";
 const i32Min = -2147483648;
 const i32Max = 2147483647;
 

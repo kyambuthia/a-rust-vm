@@ -1,2 +1,10 @@
 /target/
 .DS_Store
+/infra/node_modules/
+/infra/cdk.out/
+/infra/*.js
+/infra/*.d.ts
+/infra/*.js.map
+/infra/**/*.js
+/infra/**/*.d.ts
+/infra/**/*.js.map

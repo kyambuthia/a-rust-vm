@@ -2,6 +2,8 @@
 
 A terminal-first Rust VM with a provider-neutral LLM agent boundary.
 
+> **Deployment:** see [`infra/README.md`](infra/README.md) for the ECS/Fargate + ALB + WAF packaging slice. The service intentionally runs a single Fargate task (`desiredCount=1`, min/max 1) because anonymous sessions and VM state are process-local; horizontal scaling waits for durable shared session state.
+
 ## Run the VM demo
 
 ```bash
@@ -99,10 +101,12 @@ parsing document streams. It does **not** extract text: PDF parsing and OCR
 remain future isolated job runners, rather than running untrusted document
 parsers in the browser host.
 
-The local browser server currently creates one guest VM per server process and
-binds to loopback. Authenticated multi-user VM selection is not wired into the
-browser protocol yet. Host workspace tools remain available to native coding
-workflows, but are not registered with the browser guest agent.
+The local browser server creates one guest VM per anonymous session and binds
+to loopback by default. Container deployments set `A_RVM_BIND_ADDRESS=0.0.0.0`
+behind the private task security group. Authenticated multi-user VM selection
+is not wired into the browser protocol yet. Host workspace tools remain
+available to native coding workflows, but are not registered with the browser
+guest agent.
 
 ### Anonymous browser sessions
 

@@ -1,0 +1,8 @@
+target/
+.git/
+.gitignore
+infra/node_modules/
+infra/cdk.out/
+infra/.cdk.staging/
+*.env
+.env

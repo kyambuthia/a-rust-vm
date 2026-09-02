@@ -274,7 +274,8 @@ pub fn run(root: PathBuf) {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or_else(|| allowed_origin.starts_with("https://"));
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+    let bind_address = env::var("A_RVM_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let listener = TcpListener::bind((bind_address.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("failed to bind browser host on port {port}: {e}");
         std::process::exit(2);
     });
@@ -326,6 +327,10 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         .is_some_and(|sid| is_valid_sid_format(&sid));
     if is_state_changing && !has_valid_session {
         write_error(&mut stream, 401, "anonymous session required", None);
+        return;
+    }
+    if request.method == "GET" && request.path == "/healthz" {
+        write_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", None);
         return;
     }
     let (session, set_cookie) = match state.anon.resolve(cookie_val) {
@@ -388,6 +393,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
             "application/wasm",
             set_cookie.as_deref(),
         ),
+        ("GET" | "HEAD", "/api/wasm") => serve_wasm(&mut stream, root, set_cookie.as_deref()),
         ("GET", "/api/v1/system") => handle_system_info(&mut stream, state, set_cookie.as_deref()),
         ("POST", "/api/agent") => handle_agent(
             &mut stream,
@@ -934,6 +940,24 @@ fn serve_file(
     }
 }
 
+fn wasm_candidates() -> [&'static str; 2] {
+    [
+        "target/wasm32-unknown-unknown/release/a_rust_vm.wasm",
+        "target/wasm32-unknown-unknown/debug/a_rust_vm.wasm",
+    ]
+}
+
+fn serve_wasm(stream: &mut TcpStream, root: &Path, set_cookie: Option<&str>) {
+    for candidate in wasm_candidates() {
+        let path = root.join(candidate);
+        if let Ok(body) = fs::read(path) {
+            write_response(stream, 200, "application/wasm", &body, set_cookie);
+            return;
+        }
+    }
+    write_error(stream, 404, "not found", set_cookie);
+}
+
 fn write_redirect(stream: &mut TcpStream, location: &str, set_cookie: Option<&str>) {
     let mut response = format!(
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n"
@@ -1239,5 +1263,16 @@ mod tests {
         assert!(configured.contains(r#""model_gateway":{"configured":true}"#));
         assert!(unavailable.contains(r#""model_gateway":{"configured":false}"#));
         assert!(!configured.contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn wasm_route_prefers_release_artifact() {
+        assert_eq!(
+            super::wasm_candidates(),
+            [
+                "target/wasm32-unknown-unknown/release/a_rust_vm.wasm",
+                "target/wasm32-unknown-unknown/debug/a_rust_vm.wasm"
+            ]
+        );
     }
 }
