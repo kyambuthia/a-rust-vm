@@ -40,14 +40,20 @@ summary:focus-visible {
   outline-offset: 4px;
 }
 
-.site-shell { min-height: 100vh; padding: 0 32px 32px; }
+.site-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: 0 32px;
+}
 
 .site-nav {
+  order: 2;
   display: flex;
   align-items: center;
   gap: 24px;
   min-height: 64px;
-  border-bottom: 1px solid var(--line);
+  border-top: 1px solid var(--line);
   color: var(--muted);
 }
 
@@ -89,7 +95,15 @@ summary:focus-visible {
 
 .nav-install:hover { color: var(--text); }
 
-.try-layout { width: 100%; margin: 0; }
+.try-layout {
+  order: 1;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+}
 
 .demo-note {
   display: flex;
@@ -131,7 +145,14 @@ summary:focus-visible {
   font-size: 12px;
 }
 
-.terminal-window { display: flex; flex-direction: column; min-height: calc(100vh - 162px); overflow: hidden; background: var(--background); }
+.terminal-window {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--background);
+}
 
 .terminal-window.expanded {
   position: fixed;
@@ -154,7 +175,7 @@ summary:focus-visible {
 
 .terminal-output {
   flex: 1;
-  min-height: 170px;
+  min-height: 0;
   overflow-y: auto;
   color: var(--muted);
   font-size: 13px;
@@ -222,7 +243,7 @@ summary:focus-visible {
 }
 
 @media (max-width: 720px) {
-  .site-shell { padding: 0 16px 24px; }
+  .site-shell { padding: 0 16px; }
   .site-nav { gap: 16px; }
   .site-links { gap: 16px; }
   .site-links a:nth-child(2), .site-links a:nth-child(3) { display: none; }
@@ -231,7 +252,7 @@ summary:focus-visible {
 }
 
 @media (max-width: 420px) {
-  .site-shell { padding: 0 12px 20px; }
+  .site-shell { padding: 0 12px; }
   .site-nav { min-height: 56px; }
   .site-links { margin-left: auto; }
   .site-links a:first-child { display: none; }
