@@ -21,7 +21,7 @@ const DEFAULT_MAX_STEPS: usize = 100_000;
 pub type Pid = u32;
 
 /// Limits applied independently to one guest VM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
     pub max_inodes: usize,
     pub max_bytes: usize,

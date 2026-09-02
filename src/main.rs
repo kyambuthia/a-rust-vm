@@ -27,6 +27,10 @@ fn main() {
         println!("arvm {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if command == Some("doctor") {
+        run_doctor(&arguments[1..]);
+        return;
+    }
     if matches!(command, Some("run" | "check" | "disassemble" | "trace")) {
         run_program_command(command.expect("matched above"), &arguments[1..]);
         return;
@@ -74,10 +78,36 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent                   Start the interactive coding agent\n  serve                   Host the browser and agent API\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent                   Start the interactive coding agent\n  serve                   Host the browser and agent API\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
+}
+
+fn run_doctor(arguments: &[String]) {
+    if arguments.iter().any(|argument| argument != "--json") || arguments.len() > 1 {
+        eprintln!("usage: arvm doctor [--json]");
+        std::process::exit(2);
+    }
+    let info = a_rust_vm::protocol::SystemInfo::current();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--json")
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&info).expect("system info is serializable")
+        );
+        return;
+    }
+    println!(
+        "{} {} · API {}",
+        info.product, info.version, info.api_version
+    );
+    println!("workspace control plane: available (in-memory)");
+    println!("bytecode executor: available");
+    println!("Wasm/WASI executor: not installed");
+    println!("native sandbox executor: not installed");
 }
 
 fn run_program_command(command: &str, arguments: &[String]) {

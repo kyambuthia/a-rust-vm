@@ -264,6 +264,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
             "target/wasm32-unknown-unknown/debug/a_rust_vm.wasm",
             "application/wasm",
         ),
+        ("GET", "/api/v1/system") => handle_system_info(&mut stream),
         ("POST", "/api/agent") => handle_agent(&mut stream, root, &request.body, state),
         ("POST", "/api/upload") => handle_upload(&mut stream, &request.body, state),
         ("GET", "/api/files") => handle_files(&mut stream, state),
@@ -272,6 +273,16 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         ("GET", "/api/jobs") => handle_jobs(&mut stream, state),
         ("POST", "/api/approval") => handle_approval(&mut stream, &request.body, &state.approvals),
         _ => write_response(&mut stream, 404, "text/plain; charset=utf-8", b"not found"),
+    }
+}
+
+fn handle_system_info(stream: &mut TcpStream) {
+    match serde_json::to_vec(&crate::protocol::SystemInfo::current()) {
+        Ok(body) => write_response(stream, 200, "application/json", &body),
+        Err(error) => {
+            let body = serde_json::json!({ "error": error.to_string() }).to_string();
+            write_response(stream, 500, "application/json", body.as_bytes());
+        }
     }
 }
 

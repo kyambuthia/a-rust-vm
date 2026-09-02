@@ -32,6 +32,18 @@ function printWelcome() {
   writeLine("[hint] ask anything · upload files · /load 2 + 3", "muted");
 }
 
+async function printSystemInfo() {
+  try {
+    const response = await fetch("../api/v1/system");
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    const info = await response.json();
+    const workspaceMode = info.features?.workspaces?.durable ? "durable" : "in-memory";
+    writeLine(`[platform] API ${info.api_version} · workspaces ${workspaceMode} · bytecode executor ready`, "muted");
+  } catch (error) {
+    writeLine(`[platform warning] system API unavailable: ${error.message}`, "error");
+  }
+}
+
 async function uploadFiles(files) {
   for (const file of files) {
     if (file.size > maxUploadBytes) {
@@ -630,6 +642,7 @@ try {
   runtimeLabel.textContent = "wasm online";
   terminalInput.disabled = false;
   printWelcome();
+  await printSystemInfo();
   terminalInput.focus();
 
   terminalForm.addEventListener("submit", event => {
