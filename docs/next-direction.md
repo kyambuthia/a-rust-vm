@@ -1,14 +1,14 @@
 # Next Direction Decision
 
-Decision: add `arvm session export <id> [--json]` as a small sessions/replay slice (next after dangerous-command policy).
+Decision: add project skill discovery plus explicit `arvm skill list|show|load` as a small P3 extensibility slice (next after session export).
 
-Rationale: sessions already persist and resume transcripts, and roadmap P2 explicitly lists transcript export ahead of tool-call and deterministic VM replay; `session show` is human-only text, so a small machine-readable JSON export plus stable text export is the smallest end-to-end slice that unblocks deterministic fixtures, replay work, and scripting without changing the session schema, permission policy, workspace roots, or agent loop.
+Rationale: roadmap P3 lists skills discovered from project and user roots with explicit loading and scoped instructions ahead of MCP and subagents; there is no `skills/` directory or discovery primitive yet, while project instructions (`AGENTS.md`) already compose into the system prompt. A pure discovery + explicit-load slice unblocks scoped skill instructions without changing the permission policy, workspace roots, session schema, agent loop, or model boundary.
 
 Plan (one small slice):
 
-1. Add pure `format_session_text` and `format_session_json` helpers for `Session` transcripts in `src/main.rs`.
-2. Add `arvm session export <id> [--json]` using those helpers, failing closed on unknown ids and invalid flags.
-3. Add unit tests for text export, JSON round-trip, empty-session export, and unknown-session failure path.
+1. Add pure `src/skills.rs` with `SKILL.md` frontmatter (`name`, `description`) parsing, name validation, and deterministic discovery across `<workspace>/skills/` and user config `skills/` roots.
+2. Add `arvm skill list|show <name>|load <name>` using those helpers, failing closed on unknown names, invalid frontmatter, and invalid flags.
+3. Add unit tests for discovery ordering, explicit load, unknown-skill failure, and malformed `SKILL.md` rejection.
 4. Verify with `cargo fmt -- --check`, `cargo test`, `cargo build --target wasm32-unknown-unknown --lib`, and `node --input-type=module --check < web/main.js`; commit as one conventional commit.
 
-Explicitly out of this slice: workspace-scoped additional directories, command allowlists, rule editing beyond add/clear, redacted diagnostics, skills/MCP/subagents, structured tool-call replay, deterministic VM replay, ACP, session listing changes, or small language/compiler work.
+Explicitly out of this slice: workspace-scoped additional directories, MCP client/tools, one-off or persistent subagents, ACP, skill auto-loading into the system prompt, permission-rule changes, session replay, deterministic VM replay, or small language/compiler work.
