@@ -59,8 +59,8 @@ fn main() {
         run_coding_demo();
         return;
     }
-    if command == Some("agent") {
-        run_live_agent();
+    if matches!(command, Some("agent" | "ask")) {
+        run_live_agent(&arguments[1..]);
         return;
     }
     if command == Some("model-bridge") {
@@ -82,7 +82,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent                   Start the interactive coding agent\n  serve                   Host the browser and agent API\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -630,7 +630,7 @@ fn run_guest_demo() {
     println!("Bob process:   {:?}", bob.process_info(bob_pid));
 }
 
-fn run_live_agent() {
+fn run_live_agent(user_arguments: &[String]) {
     let using_builtin_bridge = env::var_os("A_RVM_MODEL_PROGRAM").is_none();
     let program = env::var_os("A_RVM_MODEL_PROGRAM").unwrap_or_else(|| {
         env::current_exe()
@@ -681,6 +681,10 @@ fn run_live_agent() {
         ..RouteRequest::default()
     });
     let mut route = agent.route_request().clone();
+    if let Some((prompt, json)) = parse_one_shot_args(user_arguments) {
+        run_one_shot_agent(&mut agent, &prompt, json);
+        return;
+    }
     let stdin = io::stdin();
 
     println!("A/RVM agent. Type /exit to quit.");
@@ -780,6 +784,70 @@ fn run_live_agent() {
         ) {
             eprintln!("\n[agent error] {error}");
         }
+        println!();
+    }
+}
+
+fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
+    if arguments.is_empty() {
+        return None;
+    }
+    let json = arguments.iter().any(|argument| argument == "--json");
+    let prompt = arguments
+        .iter()
+        .filter(|argument| *argument != "--json")
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if prompt.trim().is_empty() {
+        None
+    } else {
+        Some((prompt, json))
+    }
+}
+
+fn run_one_shot_agent(agent: &mut Agent<ModelRouter>, prompt: &str, json: bool) {
+    let result = agent.run_streaming_with_approval(
+        prompt,
+        |request| a_rust_vm::agent::PermissionDecision::Deny {
+            reason: format!("one-shot mode denies guarded tool: {}", request.description),
+        },
+        |event| {
+            if json {
+                if let Ok(line) = serde_json::to_string(&event) {
+                    println!("{line}");
+                }
+                return;
+            }
+            match event {
+                AgentEvent::AssistantDelta { content } | AgentEvent::AssistantText { content } => {
+                    print!("{content}");
+                    io::stdout().flush().expect("stdout should be writable");
+                }
+                AgentEvent::ToolCall(call) => println!("\n[tool] {}\n", call.name),
+                AgentEvent::ToolResult(result) => println!("\n[tool result] {}\n", result.content),
+                AgentEvent::PermissionRequested(request) => {
+                    println!("\n[permission denied] {}\n", request.description)
+                }
+                AgentEvent::RepeatedToolCall { tool, count } => {
+                    println!("\n[agent] repeated tool call: {tool} (x{count})\n")
+                }
+                AgentEvent::Error { message } => println!("\n[error] {message}\n"),
+                AgentEvent::Cancelled => println!("\n[agent] cancelled\n"),
+                AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
+            }
+        },
+    );
+    if let Err(error) = result {
+        if json {
+            let event = serde_json::json!({"type": "error", "message": error.to_string()});
+            println!("{event}");
+        } else {
+            eprintln!("\n[agent error] {error}\n");
+        }
+        std::process::exit(1);
+    }
+    if !json {
         println!();
     }
 }
@@ -1066,6 +1134,20 @@ mod tests {
         BridgeResponse, check_artifact_byte_len, collect_runner_text,
         parse_artifact_import_arguments, parse_artifact_kind, parse_bridge_response,
     };
+
+    #[test]
+    fn one_shot_args_extract_prompt_and_json_flag() {
+        assert_eq!(
+            super::parse_one_shot_args(&["--json".to_owned(), "do".to_owned(), "x".to_owned()]),
+            Some(("do x".to_owned(), true))
+        );
+        assert_eq!(
+            super::parse_one_shot_args(&["do".to_owned(), "x".to_owned()]),
+            Some(("do x".to_owned(), false))
+        );
+        assert_eq!(super::parse_one_shot_args(&[]), None);
+        assert_eq!(super::parse_one_shot_args(&["--json".to_owned()]), None);
+    }
 
     #[test]
     fn parses_bridge_text_response() {
