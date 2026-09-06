@@ -1,6 +1,7 @@
 use std::env;
 use std::io::Read;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -10,6 +11,7 @@ use crate::agent::{Model, ModelError, ModelRequest, ModelResponse, ToolCall};
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_RETRIES: u32 = 2;
 const MAX_TOOL_ARGS_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_TOKENS: u32 = 2048;
 const MAX_MAX_TOKENS: u32 = 4096;
@@ -119,43 +121,65 @@ impl OpenRouterModel {
     }
 }
 
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429) || (500..=599).contains(&status)
+}
+
 impl Model for OpenRouterModel {
     fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = self.build_request_body(request);
-        let mut http_request = self
-            .inner
-            .client
-            .post(OPENROUTER_URL)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.inner.config.api_key),
-            )
-            .header("Content-Type", "application/json");
-        if let Some(url) = &self.inner.config.site_url {
-            http_request = http_request.header("HTTP-Referer", url.as_str());
+        let mut last_error: Option<ModelError> = None;
+        for attempt in 0..=MAX_RETRIES {
+            let mut http_request = self
+                .inner
+                .client
+                .post(OPENROUTER_URL)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", self.inner.config.api_key),
+                )
+                .header("Content-Type", "application/json");
+            if let Some(url) = &self.inner.config.site_url {
+                http_request = http_request.header("HTTP-Referer", url.as_str());
+            }
+            if let Some(title) = &self.inner.config.site_title {
+                http_request = http_request.header("X-OpenRouter-Title", title.as_str());
+            }
+            let response = match http_request.json(&body).send() {
+                Ok(response) => response,
+                Err(error) => {
+                    let err = ModelError::new(sanitize_error(&format!(
+                        "provider request failed: {error}"
+                    )));
+                    if attempt < MAX_RETRIES {
+                        last_error = Some(err);
+                        thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let status = response.status();
+            let bytes = read_response_body(response, self.inner.config.max_response_bytes)
+                .map_err(ModelError::new)?;
+            if bytes.len() > self.inner.config.max_response_bytes {
+                return Err(ModelError::new("provider response is too large".to_owned()));
+            }
+            let text = String::from_utf8(bytes)
+                .map_err(|_| ModelError::new("provider response was not UTF-8".to_owned()))?;
+            let text = redact_secret(&text, &self.inner.config.api_key);
+            if status.is_success() {
+                return parse_chat_response(&text).map_err(ModelError::new);
+            }
+            let error = ModelError::new(sanitize_provider_error(status.as_u16(), &text));
+            if is_transient_status(status.as_u16()) && attempt < MAX_RETRIES {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+                continue;
+            }
+            return Err(error);
         }
-        if let Some(title) = &self.inner.config.site_title {
-            http_request = http_request.header("X-OpenRouter-Title", title.as_str());
-        }
-        let response = http_request.json(&body).send().map_err(|error| {
-            ModelError::new(sanitize_error(&format!("provider request failed: {error}")))
-        })?;
-        let status = response.status();
-        let bytes = read_response_body(response, self.inner.config.max_response_bytes)
-            .map_err(ModelError::new)?;
-        if bytes.len() > self.inner.config.max_response_bytes {
-            return Err(ModelError::new("provider response is too large".to_owned()));
-        }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| ModelError::new("provider response was not UTF-8".to_owned()))?;
-        let text = redact_secret(&text, &self.inner.config.api_key);
-        if !status.is_success() {
-            return Err(ModelError::new(sanitize_provider_error(
-                status.as_u16(),
-                &text,
-            )));
-        }
-        parse_chat_response(&text).map_err(ModelError::new)
+        Err(last_error.unwrap_or_else(|| ModelError::new("provider request failed".to_owned())))
     }
 }
 
@@ -559,6 +583,18 @@ mod tests {
             redact_secret("provider echoed sk-or-test", "sk-or-test"),
             "provider echoed [redacted]"
         );
+    }
+
+    #[test]
+    fn transient_statuses_are_retryable() {
+        assert!(is_transient_status(408));
+        assert!(is_transient_status(429));
+        assert!(is_transient_status(500));
+        assert!(is_transient_status(503));
+        assert!(!is_transient_status(400));
+        assert!(!is_transient_status(401));
+        assert!(!is_transient_status(404));
+        assert!(!is_transient_status(422));
     }
 
     #[test]
