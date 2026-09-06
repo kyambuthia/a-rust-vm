@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -882,6 +883,9 @@ impl ToolRegistry {
 pub enum AgentError {
     Model(ModelError),
     StepLimitExceeded { limit: usize },
+    ToolCallLimitExceeded { limit: usize },
+    TurnTimeoutExceeded,
+    PatternLoopDetected { period: usize },
 }
 
 impl fmt::Display for AgentError {
@@ -890,6 +894,16 @@ impl fmt::Display for AgentError {
             Self::Model(error) => write!(formatter, "model error: {error}"),
             Self::StepLimitExceeded { limit } => {
                 write!(formatter, "agent step limit exceeded: {limit}")
+            }
+            Self::ToolCallLimitExceeded { limit } => {
+                write!(formatter, "agent tool call limit exceeded: {limit}")
+            }
+            Self::TurnTimeoutExceeded => write!(formatter, "agent turn timeout exceeded"),
+            Self::PatternLoopDetected { period } => {
+                write!(
+                    formatter,
+                    "agent tool pattern loop detected (period {period})"
+                )
             }
         }
     }
@@ -902,6 +916,8 @@ pub struct Agent<M> {
     model: M,
     tools: ToolRegistry,
     max_steps: usize,
+    max_tool_calls: usize,
+    turn_timeout: Duration,
     route_request: RouteRequest,
     system_prompt: String,
     conversation: Vec<ConversationMessage>,
@@ -918,6 +934,8 @@ where
             model,
             tools,
             max_steps: 8,
+            max_tool_calls: 24,
+            turn_timeout: Duration::from_secs(300),
             route_request: RouteRequest::default(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
             conversation: Vec::new(),
@@ -928,6 +946,16 @@ where
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+
+    pub fn with_max_tool_calls(mut self, max_tool_calls: usize) -> Self {
+        self.max_tool_calls = max_tool_calls;
+        self
+    }
+
+    pub fn with_turn_timeout(mut self, turn_timeout: Duration) -> Self {
+        self.turn_timeout = turn_timeout;
         self
     }
 
@@ -992,9 +1020,15 @@ where
         }];
         let mut tool_results = Vec::new();
         let mut last_call: Option<(String, String)> = None;
+        let mut executed: Vec<String> = Vec::new();
+        let mut tool_calls: usize = 0;
+        let deadline = Instant::now() + self.turn_timeout;
         let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
+            if Instant::now() >= deadline {
+                return Err(AgentError::TurnTimeoutExceeded);
+            }
             let response = self
                 .model
                 .respond(&ModelRequest {
@@ -1016,6 +1050,11 @@ where
                     return Ok(events);
                 }
                 ModelResponse::ToolCall(call) => {
+                    if tool_calls >= self.max_tool_calls {
+                        return Err(AgentError::ToolCallLimitExceeded {
+                            limit: self.max_tool_calls,
+                        });
+                    }
                     let canonical = canonical_arguments(&call.arguments);
                     if let Some((last_name, last_args)) = last_call.as_ref() {
                         if last_name == &call.name && last_args == &canonical {
@@ -1040,7 +1079,18 @@ where
                         format_tool_result(&result),
                     ));
                     events.push(AgentEvent::ToolResult(result));
+                    tool_calls += 1;
+                    let key = format!("{} {canonical}", call.name);
+                    executed.push(key);
                     last_call = Some((call.name.clone(), canonical));
+                    for period in 2..=3 {
+                        let len = executed.len();
+                        if len >= period * 2
+                            && executed[len - period..] == executed[len - period * 2..len - period]
+                        {
+                            return Err(AgentError::PatternLoopDetected { period });
+                        }
+                    }
                 }
             }
         }
@@ -1081,9 +1131,15 @@ where
         });
         let mut tool_results = Vec::new();
         let mut last_call: Option<(String, String)> = None;
+        let mut executed: Vec<String> = Vec::new();
+        let mut tool_calls: usize = 0;
+        let deadline = Instant::now() + self.turn_timeout;
         let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
+            if Instant::now() >= deadline {
+                return Err(AgentError::TurnTimeoutExceeded);
+            }
             let mut emitted_text = false;
             let response = self
                 .model
@@ -1116,6 +1172,11 @@ where
                     return Ok(());
                 }
                 ModelResponse::ToolCall(call) => {
+                    if tool_calls >= self.max_tool_calls {
+                        return Err(AgentError::ToolCallLimitExceeded {
+                            limit: self.max_tool_calls,
+                        });
+                    }
                     let canonical = canonical_arguments(&call.arguments);
                     if let Some((last_name, last_args)) = last_call.as_ref() {
                         if last_name == &call.name && last_args == &canonical {
@@ -1139,7 +1200,18 @@ where
                         format_tool_result(&result),
                     ));
                     emit(AgentEvent::ToolResult(result));
+                    tool_calls += 1;
+                    let key = format!("{} {canonical}", call.name);
+                    executed.push(key);
                     last_call = Some((call.name.clone(), canonical));
+                    for period in 2..=3 {
+                        let len = executed.len();
+                        if len >= period * 2
+                            && executed[len - period..] == executed[len - period * 2..len - period]
+                        {
+                            return Err(AgentError::PatternLoopDetected { period });
+                        }
+                    }
                 }
             }
         }
@@ -2020,6 +2092,81 @@ mod tests {
         assert_eq!(tool_calls, 1);
         assert_eq!(repeats, 1);
         assert!(events.iter().any(|event| matches!(event, AgentEvent::Done)));
+    }
+
+    #[test]
+    fn pattern_loop_of_two_tools_stops_with_pattern_error() {
+        let empty_a = ToolCall::new("a-1", "inspect_vm", ToolArguments::new());
+        let tagged_b = ToolCall::new(
+            "b-1",
+            "inspect_vm",
+            [("tag".to_owned(), ToolValue::Text("b".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+        let empty_a_again = ToolCall::new("a-2", "inspect_vm", ToolArguments::new());
+        let tagged_b_again = ToolCall::new(
+            "b-2",
+            "inspect_vm",
+            [("tag".to_owned(), ToolValue::Text("b".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(empty_a),
+            ModelResponse::ToolCall(tagged_b),
+            ModelResponse::ToolCall(empty_a_again),
+            ModelResponse::ToolCall(tagged_b_again),
+            ModelResponse::Text("unreachable".to_owned()),
+        ]);
+        let mut agent = Agent::new(model, vm_tool_registry().unwrap())
+            .with_max_steps(10)
+            .with_max_tool_calls(32);
+
+        let error = agent.run("probe").unwrap_err();
+
+        assert_eq!(error, super::AgentError::PatternLoopDetected { period: 2 });
+    }
+
+    #[test]
+    fn tool_call_cap_ends_turn_before_extra_execution() {
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new("a-1", "inspect_vm", ToolArguments::new())),
+            ModelResponse::ToolCall(ToolCall::new(
+                "b-1",
+                "inspect_vm",
+                [("tag".to_owned(), ToolValue::Text("b".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )),
+            ModelResponse::ToolCall(ToolCall::new(
+                "c-1",
+                "inspect_vm",
+                [("tag".to_owned(), ToolValue::Text("c".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )),
+            ModelResponse::Text("unreachable".to_owned()),
+        ]);
+        let mut agent = Agent::new(model, vm_tool_registry().unwrap())
+            .with_max_steps(10)
+            .with_max_tool_calls(2);
+
+        let error = agent.run("probe").unwrap_err();
+
+        assert_eq!(error, super::AgentError::ToolCallLimitExceeded { limit: 2 });
+    }
+
+    #[test]
+    fn expired_turn_timeout_stops_before_model_call() {
+        let model = ScriptedModel::new([ModelResponse::Text("hi".to_owned())]);
+        let mut agent = Agent::new(model, vm_tool_registry().unwrap())
+            .with_turn_timeout(std::time::Duration::ZERO);
+
+        assert_eq!(
+            agent.run("ping").unwrap_err(),
+            super::AgentError::TurnTimeoutExceeded
+        );
     }
 
     #[test]
