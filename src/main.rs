@@ -45,6 +45,10 @@ fn main() {
         run_permission_command(&arguments[1..]);
         return;
     }
+    if command == Some("skill") {
+        run_skill_command(&arguments[1..]);
+        return;
+    }
     if matches!(command, Some("run" | "check" | "disassemble" | "trace")) {
         run_program_command(command.expect("matched above"), &arguments[1..]);
         return;
@@ -92,7 +96,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  skill <command>         Discover and load project skills (list/show/load)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -578,6 +582,84 @@ fn run_permission_command(arguments: &[String]) {
         }
         _ => {
             permission_usage();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn skill_usage() {
+    eprintln!("usage: arvm skill list|show <name>|load <name>");
+}
+
+fn skill_roots_for(
+    project_root: &std::path::Path,
+    user_root: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    vec![project_root.join("skills"), user_root.join("skills")]
+}
+
+fn skill_roots() -> Vec<std::path::PathBuf> {
+    let user_root = env::var_os("A_RVM_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".config/a-rust-vm"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    skill_roots_for(&working_directory(), &user_root)
+}
+
+fn run_skill_command(arguments: &[String]) {
+    let roots = skill_roots();
+    let Some(command) = arguments.first().map(String::as_str) else {
+        skill_usage();
+        std::process::exit(2);
+    };
+    match command {
+        "list" => {
+            if arguments.len() != 1 {
+                skill_usage();
+                std::process::exit(2);
+            }
+            match a_rust_vm::skills::discover_skills(&roots) {
+                Ok(skills) => {
+                    if skills.is_empty() {
+                        println!("(no skills)");
+                    } else {
+                        for skill in skills {
+                            println!("{}\t{}", skill.name, skill.description);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[skill] {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "show" | "load" => {
+            if arguments.len() != 2 {
+                skill_usage();
+                std::process::exit(2);
+            }
+            match a_rust_vm::skills::load_skill(&roots, &arguments[1]) {
+                Ok(skill) => {
+                    if command == "show" {
+                        println!("{}\t{}", skill.name, skill.description);
+                    } else {
+                        println!("{}", skill.scoped_instructions());
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[skill] {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            skill_usage();
             std::process::exit(2);
         }
     }
@@ -1572,7 +1654,7 @@ mod tests {
     use super::{
         BridgeResponse, check_artifact_byte_len, collect_runner_text, export_session,
         format_session_json, format_session_text, parse_artifact_import_arguments,
-        parse_artifact_kind, parse_bridge_response, parse_session_export_args,
+        parse_artifact_kind, parse_bridge_response, parse_session_export_args, skill_roots_for,
     };
 
     #[test]
@@ -1746,6 +1828,32 @@ mod tests {
         assert!(parse_session_export_args(&[]).is_err());
         assert!(parse_session_export_args(&["a".to_owned(), "b".to_owned()]).is_err());
         assert!(parse_session_export_args(&["a".to_owned(), "--text".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn skill_roots_prefer_project_then_user_and_cli_loads() {
+        let project =
+            std::env::temp_dir().join(format!("a-rvm-skill-cli-project-{}", std::process::id()));
+        let user =
+            std::env::temp_dir().join(format!("a-rvm-skill-cli-user-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&user);
+        std::fs::create_dir_all(project.join("skills").join("review")).unwrap();
+        std::fs::write(
+            project.join("skills").join("review").join("SKILL.md"),
+            "---\nname: review\ndescription: Review changes\n---\nCheck diffs.\n",
+        )
+        .unwrap();
+
+        let roots = skill_roots_for(&project, &user);
+        assert_eq!(roots, vec![project.join("skills"), user.join("skills")]);
+        let discovered = a_rust_vm::skills::discover_skills(&roots).unwrap();
+        assert_eq!(discovered.len(), 1);
+        let loaded = a_rust_vm::skills::load_skill(&roots, "review").unwrap();
+        assert!(loaded.scoped_instructions().contains("Check diffs."));
+        assert!(a_rust_vm::skills::load_skill(&roots, "missing").is_err());
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&user);
     }
 
     #[test]

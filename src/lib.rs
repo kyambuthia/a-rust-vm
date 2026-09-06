@@ -24,6 +24,7 @@ pub mod program;
 pub mod protocol;
 pub mod runtime;
 pub mod session;
+pub mod skills;
 pub mod workspace;
 
 #[cfg(not(target_arch = "wasm32"))]
