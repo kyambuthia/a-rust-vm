@@ -392,6 +392,9 @@ function printAgentEvent(event) {
     case "repeated_tool_call":
       writeLine(`[agent] repeated tool call: ${event.tool} (x${event.count})`, "error");
       break;
+    case "cancelled":
+      writeLine("[agent] cancelled", "error");
+      break;
     case "error":
       writeLine(`[error] ${event.message}`, "error");
       break;

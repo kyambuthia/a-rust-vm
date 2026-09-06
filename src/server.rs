@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -147,6 +148,7 @@ struct SessionData {
     approvals: Arc<ApprovalStore>,
     last_seen: Mutex<Instant>,
     agent_active: Mutex<bool>,
+    agent_cancel: Arc<AtomicBool>,
     rate_window: Mutex<Instant>,
     rate_count: Mutex<usize>,
 }
@@ -282,6 +284,7 @@ impl AnonStore {
             approvals: Arc::new(ApprovalStore::default()),
             last_seen: Mutex::new(now),
             agent_active: Mutex::new(false),
+            agent_cancel: Arc::new(AtomicBool::new(false)),
             rate_window: Mutex::new(now),
             rate_count: Mutex::new(0),
         });
@@ -431,6 +434,9 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
             state,
             set_cookie.as_deref(),
         ),
+        ("POST", "/api/agent/cancel") => {
+            handle_agent_cancel(&mut stream, &session, set_cookie.as_deref())
+        }
         ("POST", "/api/upload") => {
             handle_upload(&mut stream, &request.body, &session, set_cookie.as_deref())
         }
@@ -578,6 +584,7 @@ fn handle_agent(
         }
         *active = true;
     }
+    session.agent_cancel.store(false, Ordering::SeqCst);
     {
         let mut global = state.global_agents.lock().unwrap();
         if *global >= MAX_GLOBAL_CONCURRENT_AGENTS {
@@ -622,13 +629,18 @@ fn handle_agent(
         requires_tools: true,
         ..RouteRequest::default()
     })
-    .with_max_steps(AGENT_TTL_STEP_LIMIT);
+    .with_max_steps(AGENT_TTL_STEP_LIMIT)
+    .with_cancel_token(session.agent_cancel.clone());
     write_stream_headers(stream, set_cookie);
     let approvals = session.approvals.clone();
     let result = agent.run_streaming_with_approval(
         request.prompt,
         |p| approvals.wait(&p.id),
-        |event| write_event(stream, &event),
+        |event| {
+            if !write_event(stream, &event) {
+                session.agent_cancel.store(true, Ordering::SeqCst);
+            }
+        },
     );
     if let Err(e) = result {
         write_event(
@@ -640,6 +652,26 @@ fn handle_agent(
     }
     *session.agent_active.lock().unwrap() = false;
     *state.global_agents.lock().unwrap() -= 1;
+}
+
+fn handle_agent_cancel(
+    stream: &mut TcpStream,
+    session: &Arc<SessionData>,
+    set_cookie: Option<&str>,
+) {
+    let active = session.agent_active.lock().unwrap();
+    if !*active {
+        write_error(stream, 409, "agent is not running", set_cookie);
+        return;
+    }
+    session.agent_cancel.store(true, Ordering::SeqCst);
+    write_response(
+        stream,
+        200,
+        "application/json",
+        br#"{"ok":true}"#,
+        set_cookie,
+    );
 }
 
 fn handle_upload(
@@ -1087,13 +1119,12 @@ fn write_stream_headers(stream: &mut TcpStream, set_cookie: Option<&str>) {
     let _ = stream.flush();
 }
 
-fn write_event(stream: &mut TcpStream, event: &AgentEvent) {
+fn write_event(stream: &mut TcpStream, event: &AgentEvent) -> bool {
     let Ok(mut body) = serde_json::to_vec(event) else {
-        return;
+        return false;
     };
     body.push(b'\n');
-    let _ = stream.write_all(&body);
-    let _ = stream.flush();
+    stream.write_all(&body).is_ok() && stream.flush().is_ok()
 }
 
 fn guest_system_prompt(vm: &Arc<Mutex<VmInstance>>) -> String {

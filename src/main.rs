@@ -528,6 +528,7 @@ fn run_agent_demo() {
                         println!("repeated tool call: {tool} (x{count})")
                     }
                     AgentEvent::Error { message } => println!("error: {message}"),
+                    AgentEvent::Cancelled => println!("cancelled"),
                     AgentEvent::Done => println!("done"),
                 }
             }
@@ -773,6 +774,7 @@ fn run_live_agent() {
                     println!("[agent] repeated tool call: {tool} (x{count})")
                 }
                 AgentEvent::Error { message } => println!("[error] {message}"),
+                AgentEvent::Cancelled => println!("\n[agent] cancelled"),
                 AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
             },
         ) {
@@ -1039,6 +1041,7 @@ fn run_coding_demo() {
                         println!("repeated tool call: {tool} (x{count})")
                     }
                     AgentEvent::Error { message } => println!("error: {message}"),
+                    AgentEvent::Cancelled => println!("cancelled"),
                     AgentEvent::Done => println!("done"),
                 }
             }

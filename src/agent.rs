@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +85,7 @@ pub enum AgentEvent {
     ToolResult(ToolResult),
     PermissionRequested(PermissionRequest),
     RepeatedToolCall { tool: String, count: usize },
+    Cancelled,
     Error { message: String },
     Done,
 }
@@ -918,6 +921,7 @@ pub struct Agent<M> {
     max_steps: usize,
     max_tool_calls: usize,
     turn_timeout: Duration,
+    cancel: Arc<AtomicBool>,
     route_request: RouteRequest,
     system_prompt: String,
     conversation: Vec<ConversationMessage>,
@@ -936,6 +940,7 @@ where
             max_steps: 8,
             max_tool_calls: 24,
             turn_timeout: Duration::from_secs(300),
+            cancel: Arc::new(AtomicBool::new(false)),
             route_request: RouteRequest::default(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
             conversation: Vec::new(),
@@ -956,6 +961,11 @@ where
 
     pub fn with_turn_timeout(mut self, turn_timeout: Duration) -> Self {
         self.turn_timeout = turn_timeout;
+        self
+    }
+
+    pub fn with_cancel_token(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -1026,6 +1036,11 @@ where
         let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
+            if self.cancel.load(Ordering::Relaxed) {
+                events.push(AgentEvent::Cancelled);
+                events.push(AgentEvent::Done);
+                return Ok(events);
+            }
             if Instant::now() >= deadline {
                 return Err(AgentError::TurnTimeoutExceeded);
             }
@@ -1137,6 +1152,11 @@ where
         let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
+            if self.cancel.load(Ordering::Relaxed) {
+                emit(AgentEvent::Cancelled);
+                emit(AgentEvent::Done);
+                return Ok(());
+            }
             if Instant::now() >= deadline {
                 return Err(AgentError::TurnTimeoutExceeded);
             }
@@ -2155,6 +2175,27 @@ mod tests {
         let error = agent.run("probe").unwrap_err();
 
         assert_eq!(error, super::AgentError::ToolCallLimitExceeded { limit: 2 });
+    }
+
+    #[test]
+    fn pre_cancelled_agent_finishes_without_calling_the_model() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let model = ScriptedModel::new([ModelResponse::Text("should not run".to_owned())]);
+        let mut agent = Agent::new(model, vm_tool_registry().unwrap()).with_cancel_token(cancel);
+
+        let events = agent.run("ping").unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled))
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Done)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::AssistantText { .. }))
+        );
     }
 
     #[test]
