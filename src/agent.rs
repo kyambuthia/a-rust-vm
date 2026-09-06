@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::permissions::{PermissionEffect, PermissionPolicy, SessionApprovals};
 use crate::{Instruction, StepResult, Vm, VmError};
 
 /// A value that can cross the model-to-tool boundary without requiring a JSON
@@ -927,6 +928,8 @@ pub struct Agent<M> {
     conversation: Vec<ConversationMessage>,
     max_context_messages: usize,
     max_context_chars: usize,
+    permission_policy: PermissionPolicy,
+    session_approvals: SessionApprovals,
 }
 
 impl<M> Agent<M>
@@ -946,6 +949,8 @@ where
             conversation: Vec::new(),
             max_context_messages: DEFAULT_CONTEXT_MESSAGES,
             max_context_chars: DEFAULT_CONTEXT_CHARS,
+            permission_policy: PermissionPolicy::new(),
+            session_approvals: SessionApprovals::new(),
         }
     }
 
@@ -1011,6 +1016,24 @@ where
 
     pub fn clear_conversation(&mut self) {
         self.conversation.clear();
+    }
+
+    pub fn with_permission_policy(mut self, policy: PermissionPolicy) -> Self {
+        self.permission_policy = policy;
+        self
+    }
+
+    pub fn set_permission_policy(&mut self, policy: PermissionPolicy) {
+        self.permission_policy = policy;
+        self.session_approvals.clear();
+    }
+
+    pub fn permission_policy(&self) -> &PermissionPolicy {
+        &self.permission_policy
+    }
+
+    pub fn clear_session_approvals(&mut self) {
+        self.session_approvals.clear();
     }
 
     pub fn run(&mut self, prompt: impl Into<String>) -> Result<Vec<AgentEvent>, AgentError> {
@@ -1259,9 +1282,27 @@ where
             return self.tools.execute(call);
         };
 
+        let target = rule_target(call);
+        if self.session_approvals.is_allowed(&call.name, &target)
+            || self.permission_policy.decide(&call.name, &target) == PermissionEffect::Allow
+        {
+            return self.tools.execute(call);
+        }
+        if self.permission_policy.decide(&call.name, &target) == PermissionEffect::Deny {
+            return ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                content: format!("permission rule denies {} '{target}'", call.name),
+                is_error: true,
+            };
+        }
+
         emit(AgentEvent::PermissionRequested(request.clone()));
         match approve(&request) {
-            PermissionDecision::Allow => self.tools.execute(call),
+            PermissionDecision::Allow => {
+                self.session_approvals.remember(&call.name, &target);
+                self.tools.execute(call)
+            }
             PermissionDecision::Deny { reason } => ToolResult {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -1300,6 +1341,15 @@ where
         let bounded = self.bounded_context();
         self.conversation = bounded;
     }
+}
+
+fn rule_target(call: &ToolCall) -> String {
+    for name in ["path", "command", "program"] {
+        if let Some(ToolValue::Text(value)) = call.arguments.get(name) {
+            return value.clone();
+        }
+    }
+    String::new()
 }
 
 fn canonical_arguments(arguments: &ToolArguments) -> String {
@@ -2294,6 +2344,188 @@ mod tests {
             matches!(event, AgentEvent::ToolResult(result) if result.is_error && result.content == "test denial")
         }));
         assert!(!root.join("blocked.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn allow_rule_executes_guarded_tool_without_prompting() {
+        let root =
+            std::env::temp_dir().join(format!("a-rust-vm-agent-allow-rule-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new(
+                "write-1",
+                "write_file",
+                [
+                    ("path".to_owned(), ToolValue::Text("notes.txt".to_owned())),
+                    ("content".to_owned(), ToolValue::Text("allowed".to_owned())),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            ModelResponse::Text("done".to_owned()),
+        ]);
+        let policy = crate::permissions::PermissionPolicy::with_rules(vec![
+            crate::permissions::parse_permission_rule("allow write_file:notes.txt").unwrap(),
+        ]);
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        )
+        .with_permission_policy(policy);
+        let mut prompts = 0;
+
+        let events = agent
+            .run_with_approval("write a file", |_| {
+                prompts += 1;
+                PermissionDecision::Allow
+            })
+            .unwrap();
+
+        assert_eq!(prompts, 0);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::PermissionRequested(_)))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "allowed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deny_rule_blocks_guarded_tool_without_prompting() {
+        let root =
+            std::env::temp_dir().join(format!("a-rust-vm-agent-deny-rule-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new(
+                "write-1",
+                "write_file",
+                [
+                    ("path".to_owned(), ToolValue::Text("secrets.txt".to_owned())),
+                    ("content".to_owned(), ToolValue::Text("blocked".to_owned())),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            ModelResponse::Text("done".to_owned()),
+        ]);
+        let policy = crate::permissions::PermissionPolicy::with_rules(vec![
+            crate::permissions::parse_permission_rule("deny write_file:secrets").unwrap(),
+        ]);
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        )
+        .with_permission_policy(policy);
+        let mut prompts = 0;
+
+        let events = agent
+            .run_with_approval("write a file", |_| {
+                prompts += 1;
+                PermissionDecision::Allow
+            })
+            .unwrap();
+
+        assert_eq!(prompts, 0);
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolResult(result) if result.is_error && result.content.contains("permission rule denies"))
+        }));
+        assert!(!root.join("secrets.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_allow_is_remembered_for_the_same_tool_and_target() {
+        let root =
+            std::env::temp_dir().join(format!("a-rust-vm-agent-remember-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let write = |id: &str| {
+            ModelResponse::ToolCall(ToolCall::new(
+                id,
+                "write_file",
+                [
+                    ("path".to_owned(), ToolValue::Text("notes.txt".to_owned())),
+                    ("content".to_owned(), ToolValue::Text("updated".to_owned())),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+        };
+        let model = ScriptedModel::new([
+            write("write-1"),
+            write("write-2"),
+            ModelResponse::Text("done".to_owned()),
+        ]);
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        )
+        .with_max_steps(6);
+        let mut prompts = 0;
+
+        let events = agent
+            .run_with_approval("write twice", |_| {
+                prompts += 1;
+                PermissionDecision::Allow
+            })
+            .unwrap();
+
+        assert_eq!(prompts, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::PermissionRequested(_)))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_deny_is_never_remembered() {
+        let root = std::env::temp_dir().join(format!(
+            "a-rust-vm-agent-no-remember-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let write = |id: &str, content: &str| {
+            ModelResponse::ToolCall(ToolCall::new(
+                id,
+                "write_file",
+                [
+                    ("path".to_owned(), ToolValue::Text("notes.txt".to_owned())),
+                    ("content".to_owned(), ToolValue::Text(content.to_owned())),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+        };
+        let model = ScriptedModel::new([
+            write("write-1", "first"),
+            write("write-2", "second"),
+            ModelResponse::Text("done".to_owned()),
+        ]);
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        )
+        .with_max_steps(6);
+        let mut prompts = 0;
+
+        agent
+            .run_with_approval("write twice", |_| {
+                prompts += 1;
+                PermissionDecision::Deny {
+                    reason: "test denial".to_owned(),
+                }
+            })
+            .unwrap();
+
+        assert_eq!(prompts, 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
