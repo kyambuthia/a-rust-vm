@@ -251,6 +251,20 @@ pub enum ModelStreamEvent {
     TextDelta { content: String },
 }
 
+impl Model for Box<dyn Model> {
+    fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.as_mut().respond(request)
+    }
+
+    fn respond_stream(
+        &mut self,
+        request: &ModelRequest,
+        emit: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelResponse, ModelError> {
+        self.as_mut().respond_stream(request, emit)
+    }
+}
+
 /// Errors produced by the model boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelError {
@@ -1488,6 +1502,59 @@ where
     })
 }
 
+/// A parent-visible tool that delegates one bounded subtask to an isolated child.
+pub struct SubagentTool {
+    make_model: Box<dyn FnMut() -> Box<dyn Model>>,
+    make_tools: Box<dyn FnMut() -> ToolRegistry>,
+    config: SubagentConfig,
+}
+
+impl SubagentTool {
+    /// Create a delegation tool with factories for fresh child models and tools.
+    pub fn new<M, MF, TF>(make_model: MF, make_tools: TF, config: SubagentConfig) -> Self
+    where
+        M: Model + 'static,
+        MF: FnMut() -> M + 'static,
+        TF: FnMut() -> ToolRegistry + 'static,
+    {
+        let mut make_model = make_model;
+        Self {
+            make_model: Box::new(move || Box::new(make_model()) as Box<dyn Model>),
+            make_tools: Box::new(make_tools),
+            config,
+        }
+    }
+}
+
+impl Tool for SubagentTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "delegate_subagent",
+            "Delegate one bounded subtask to an isolated child agent.",
+            r#"{"type":"object","properties":{"task":{"type":"string"}},"required":["task"]}"#,
+        )
+    }
+
+    fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
+        ensure_arguments(arguments, &["task"])?;
+        let task = required_text(arguments, "task")?;
+        let model = (self.make_model)();
+        let tools = (self.make_tools)();
+        run_subagent(model, tools, task, self.config.clone())
+            .map(|result| {
+                if result.assistant_text.is_empty() {
+                    format!("tool_calls={}", result.tool_calls)
+                } else {
+                    format!(
+                        "{}\ntool_calls={}",
+                        result.assistant_text, result.tool_calls
+                    )
+                }
+            })
+            .map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
 #[derive(Debug, Default)]
 struct VmToolState {
     program: Vec<Instruction>,
@@ -1793,8 +1860,8 @@ mod tests {
     use super::{
         Agent, AgentEvent, Model, ModelCapabilities, ModelError, ModelMode, ModelRequest,
         ModelResponse, ModelRouter, ModelStreamEvent, PermissionDecision, RouteRequest,
-        ScriptedModel, SubagentConfig, ToolArguments, ToolCall, ToolRegistry, ToolValue,
-        load_project_instructions, run_subagent, system_prompt_with_instructions,
+        ScriptedModel, SubagentConfig, SubagentTool, ToolArguments, ToolCall, ToolRegistry,
+        ToolValue, load_project_instructions, run_subagent, system_prompt_with_instructions,
         system_prompt_with_skills, vm_tool_registry,
     };
 
@@ -2798,5 +2865,97 @@ mod tests {
         assert_eq!(requests[0].prompt, "child task");
         assert_eq!(requests[0].system_prompt, "child contract");
         assert!(requests[0].conversation.is_empty());
+    }
+
+    #[test]
+    fn delegation_tool_runs_an_isolated_child_turn() {
+        let delegate = SubagentTool::new(
+            || ScriptedModel::new([ModelResponse::Text("child answer".to_owned())]),
+            || vm_tool_registry().unwrap(),
+            SubagentConfig::default(),
+        );
+        let mut registry = ToolRegistry::default();
+        registry.register(delegate).unwrap();
+        let parent = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new(
+                "delegate-1",
+                "delegate_subagent",
+                [("task".to_owned(), ToolValue::Text("child task".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )),
+            ModelResponse::Text("parent done".to_owned()),
+        ]);
+        let mut agent = Agent::new(parent, registry);
+
+        let events = agent.run("parent task").unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult(result)
+                if result.content.contains("child answer") && result.content.contains("tool_calls=0")
+        )));
+    }
+
+    #[test]
+    fn delegation_tool_fails_closed_on_empty_tasks() {
+        let delegate = SubagentTool::new(
+            ScriptedModel::default,
+            || vm_tool_registry().unwrap(),
+            SubagentConfig::default(),
+        );
+        let mut registry = ToolRegistry::default();
+        registry.register(delegate).unwrap();
+        let call = ToolCall::new(
+            "delegate-1",
+            "delegate_subagent",
+            [("task".to_owned(), ToolValue::Text("   ".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+
+        let result = registry.execute(&call);
+        assert!(result.is_error);
+        assert_eq!(result.content, "argument 'task' must be non-empty text");
+    }
+
+    #[test]
+    fn delegation_tool_propagates_child_tool_limits() {
+        let delegate = SubagentTool::new(
+            || {
+                ScriptedModel::new([
+                    ModelResponse::ToolCall(ToolCall::new(
+                        "probe-1",
+                        "inspect_vm",
+                        ToolArguments::new(),
+                    )),
+                    ModelResponse::ToolCall(ToolCall::new(
+                        "probe-2",
+                        "inspect_vm",
+                        ToolArguments::new(),
+                    )),
+                ])
+            },
+            || vm_tool_registry().unwrap(),
+            SubagentConfig {
+                max_tool_calls: 1,
+                ..SubagentConfig::default()
+            },
+        );
+        let mut registry = ToolRegistry::default();
+        registry.register(delegate).unwrap();
+        let call = ToolCall::new(
+            "delegate-1",
+            "delegate_subagent",
+            [("task".to_owned(), ToolValue::Text("probe".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+
+        let result = registry.execute(&call);
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            "subagent turn failed: agent tool call limit exceeded: 1"
+        );
     }
 }
