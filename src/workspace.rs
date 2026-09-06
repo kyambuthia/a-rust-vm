@@ -37,10 +37,12 @@ impl std::fmt::Display for WorkspaceError {
 
 impl std::error::Error for WorkspaceError {}
 
-/// An approved root directory for workspace operations.
+/// An approved root directory for workspace operations, plus explicit
+/// additional directories granted alongside it.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    additional: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -58,23 +60,84 @@ impl Workspace {
                 root.display()
             )));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            additional: Vec::new(),
+        })
+    }
+
+    pub fn with_additional_directories(
+        root: impl Into<PathBuf>,
+        additional: &[PathBuf],
+    ) -> Result<Self, WorkspaceError> {
+        let primary = Self::new(root)?;
+        let mut canonical = Vec::with_capacity(additional.len());
+        for directory in additional {
+            let resolved = fs::canonicalize(directory).map_err(|error| {
+                WorkspaceError::new(format!(
+                    "cannot resolve additional workspace directory '{}': {error}",
+                    directory.display()
+                ))
+            })?;
+            if !resolved.is_dir() {
+                return Err(WorkspaceError::new(format!(
+                    "additional workspace directory is not a directory: {}",
+                    resolved.display()
+                )));
+            }
+            if resolved == primary.root
+                || resolved.starts_with(&primary.root)
+                || primary.root.starts_with(&resolved)
+            {
+                return Err(WorkspaceError::new(format!(
+                    "additional workspace directory must not overlap the workspace root: {}",
+                    resolved.display()
+                )));
+            }
+            if canonical.iter().any(|existing: &PathBuf| {
+                *existing == resolved
+                    || existing.starts_with(&resolved)
+                    || resolved.starts_with(existing)
+            }) {
+                return Err(WorkspaceError::new(format!(
+                    "additional workspace directory is a duplicate or nested: {}",
+                    resolved.display()
+                )));
+            }
+            canonical.push(resolved);
+        }
+        Ok(Self {
+            root: primary.root,
+            additional: canonical,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    pub fn additional_directories(&self) -> &[PathBuf] {
+        &self.additional
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+            || self
+                .additional
+                .iter()
+                .any(|directory| path.starts_with(directory))
+    }
+
     fn resolve(&self, requested: &str, allow_missing: bool) -> Result<PathBuf, ToolError> {
         let requested_path = Path::new(requested);
-        if requested_path.is_absolute() {
-            return Err(ToolError::new("workspace paths must be relative"));
-        }
         if requested_path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
         {
             return Err(ToolError::new("workspace paths cannot contain '..'"));
+        }
+        if requested_path.is_absolute() {
+            return self.resolve_absolute(requested, allow_missing);
         }
 
         let candidate = self.root.join(requested_path);
@@ -97,7 +160,35 @@ impl Workspace {
             return Err(ToolError::new(format!("path does not exist: {requested}")));
         };
 
-        if !resolved.starts_with(&self.root) {
+        if !self.contains(&resolved) {
+            return Err(ToolError::new(format!(
+                "path escapes the workspace: {requested}"
+            )));
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_absolute(&self, requested: &str, allow_missing: bool) -> Result<PathBuf, ToolError> {
+        let candidate = PathBuf::from(requested);
+        let resolved = if candidate.exists() {
+            fs::canonicalize(&candidate)
+                .map_err(|error| ToolError::new(format!("cannot resolve '{requested}': {error}")))?
+        } else if allow_missing {
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| ToolError::new("workspace path has no parent"))?;
+            let parent = fs::canonicalize(parent).map_err(|error| {
+                ToolError::new(format!("cannot resolve parent of '{requested}': {error}"))
+            })?;
+            parent.join(
+                candidate.file_name().ok_or_else(|| {
+                    ToolError::new("workspace path must name a file or directory")
+                })?,
+            )
+        } else {
+            return Err(ToolError::new(format!("path does not exist: {requested}")));
+        };
+        if !self.contains(&resolved) {
             return Err(ToolError::new(format!(
                 "path escapes the workspace: {requested}"
             )));
@@ -117,7 +208,16 @@ type SharedWorkspace = Rc<RefCell<Workspace>>;
 
 /// Register the safe read, write, search, and command tools for a workspace.
 pub fn workspace_tool_registry(root: impl Into<PathBuf>) -> Result<ToolRegistry, ToolError> {
-    let workspace = Workspace::new(root).map_err(|error| ToolError::new(error.to_string()))?;
+    workspace_tool_registry_with_directories(root, &[])
+}
+
+/// Register workspace tools with explicit additional directories.
+pub fn workspace_tool_registry_with_directories(
+    root: impl Into<PathBuf>,
+    additional: &[PathBuf],
+) -> Result<ToolRegistry, ToolError> {
+    let workspace = Workspace::with_additional_directories(root, additional)
+        .map_err(|error| ToolError::new(error.to_string()))?;
     let workspace = Rc::new(RefCell::new(workspace));
     let mut registry = ToolRegistry::default();
 
@@ -133,6 +233,16 @@ pub fn workspace_tool_registry(root: impl Into<PathBuf>) -> Result<ToolRegistry,
 pub fn coding_tool_registry(root: impl Into<PathBuf>) -> Result<ToolRegistry, ToolError> {
     let mut registry = crate::agent::vm_tool_registry()?;
     registry.merge(workspace_tool_registry(root)?)?;
+    Ok(registry)
+}
+
+/// Register VM and workspace tools with explicit additional directories.
+pub fn coding_tool_registry_with_directories(
+    root: impl Into<PathBuf>,
+    additional: &[PathBuf],
+) -> Result<ToolRegistry, ToolError> {
+    let mut registry = crate::agent::vm_tool_registry()?;
+    registry.merge(workspace_tool_registry_with_directories(root, additional)?)?;
     Ok(registry)
 }
 
@@ -570,7 +680,10 @@ fn is_ignored_directory_name(name: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Workspace, coding_tool_registry, workspace_tool_registry};
+    use super::{
+        Workspace, coding_tool_registry, workspace_tool_registry,
+        workspace_tool_registry_with_directories,
+    };
     use crate::agent::{ToolArguments, ToolCall, ToolValue};
 
     fn test_root(label: &str) -> std::path::PathBuf {
@@ -681,6 +794,66 @@ mod tests {
         assert!(result.content.contains("stdout:\nhello"));
         assert!(result.content.contains("exit_code=0"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn additional_directories_allow_absolute_access_and_reject_outsiders() {
+        let root = test_root("extra-primary");
+        let extra = test_root("extra-secondary");
+        let outside = test_root("extra-outside");
+        std::fs::write(extra.join("shared.txt"), "shared\n").unwrap();
+        let mut registry =
+            workspace_tool_registry_with_directories(&root, &[extra.clone()]).unwrap();
+        let absolute = extra.join("shared.txt").display().to_string();
+
+        let read = registry.execute(&ToolCall::new(
+            "read-1",
+            "read_file",
+            [("path".to_owned(), ToolValue::Text(absolute.clone()))]
+                .into_iter()
+                .collect(),
+        ));
+        assert_eq!(read.content, "shared\n");
+        assert!(!read.is_error);
+
+        let write = registry.execute(&ToolCall::new(
+            "write-1",
+            "write_file",
+            [
+                (
+                    "path".to_owned(),
+                    ToolValue::Text(extra.join("created.txt").display().to_string()),
+                ),
+                ("content".to_owned(), ToolValue::Text("created".to_owned())),
+            ]
+            .into_iter()
+            .collect::<ToolArguments>(),
+        ));
+        assert!(!write.is_error);
+        assert_eq!(
+            std::fs::read_to_string(extra.join("created.txt")).unwrap(),
+            "created"
+        );
+
+        let outside_path = outside.join("other.txt").display().to_string();
+        std::fs::write(outside.join("other.txt"), "outside\n").unwrap();
+        let rejected = registry.execute(&ToolCall::new(
+            "read-2",
+            "read_file",
+            [("path".to_owned(), ToolValue::Text(outside_path))]
+                .into_iter()
+                .collect(),
+        ));
+        assert!(rejected.is_error);
+        assert!(rejected.content.contains("path escapes the workspace"));
+
+        assert!(Workspace::with_additional_directories(&root, &[root.clone()]).is_err());
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        assert!(Workspace::with_additional_directories(&root, &[root.join("nested")]).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(extra).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
