@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod apps;
+pub mod artifacts;
 pub mod control_plane;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control_plane_store;
