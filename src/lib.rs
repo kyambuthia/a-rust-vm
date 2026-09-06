@@ -16,6 +16,8 @@ pub mod format_readers;
 pub mod guest_tools;
 pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod mcp;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod openrouter;
 pub mod permissions;
 #[cfg(not(target_arch = "wasm32"))]
