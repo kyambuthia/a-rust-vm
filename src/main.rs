@@ -92,7 +92,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -385,7 +385,41 @@ fn session_directory() -> std::path::PathBuf {
 }
 
 fn session_usage() {
-    eprintln!("usage: arvm session list|show <id>|save <id> <role> <content>");
+    eprintln!("usage: arvm session list|show <id>|save <id> <role> <content>|export <id> [--json]");
+}
+
+fn format_session_text(session: &Session) -> String {
+    if session.messages.is_empty() {
+        return format!("(empty session {})", session.id);
+    }
+    session
+        .messages
+        .iter()
+        .map(|message| format!("[{}] {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_session_json(session: &Session) -> Result<String, String> {
+    serde_json::to_string_pretty(session)
+        .map_err(|error| format!("cannot encode session '{}': {error}", session.id))
+}
+
+fn export_session(store: &SessionStore, id: &str, json: bool) -> Result<String, String> {
+    let session = store.load(id).map_err(|error| error.to_string())?;
+    if json {
+        format_session_json(&session)
+    } else {
+        Ok(format_session_text(&session))
+    }
+}
+
+fn parse_session_export_args(arguments: &[String]) -> Result<(String, bool), String> {
+    match arguments {
+        [id] => Ok((id.clone(), false)),
+        [id, flag] if flag == "--json" => Ok((id.clone(), true)),
+        _ => Err("usage: arvm session export <id> [--json]".to_owned()),
+    }
 }
 
 fn permission_rules_path() -> std::path::PathBuf {
@@ -615,6 +649,22 @@ fn run_session_command(arguments: &[String]) {
                 std::process::exit(1);
             }
             println!("saved {id} ({} messages)", session.messages.len());
+        }
+        "export" => {
+            let (id, json) = match parse_session_export_args(&arguments[1..]) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    eprintln!("[session] {error}");
+                    std::process::exit(2);
+                }
+            };
+            match export_session(&store, &id, json) {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("[session] {error}");
+                    std::process::exit(1);
+                }
+            }
         }
         _ => {
             session_usage();
@@ -1520,8 +1570,9 @@ fn working_directory() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeResponse, check_artifact_byte_len, collect_runner_text,
-        parse_artifact_import_arguments, parse_artifact_kind, parse_bridge_response,
+        BridgeResponse, check_artifact_byte_len, collect_runner_text, export_session,
+        format_session_json, format_session_text, parse_artifact_import_arguments,
+        parse_artifact_kind, parse_bridge_response, parse_session_export_args,
     };
 
     #[test]
@@ -1645,6 +1696,56 @@ mod tests {
             a_rust_vm::permissions::PermissionEffect::Allow
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_export_formats_text_json_and_usage() {
+        let mut session = a_rust_vm::session::Session::new("export-1").unwrap();
+        session.push("user", "inspect this workspace");
+        session.push("assistant", "I will inspect it.");
+
+        assert_eq!(
+            format_session_text(&session),
+            "[user] inspect this workspace\n[assistant] I will inspect it."
+        );
+        let json = format_session_json(&session).unwrap();
+        let decoded: a_rust_vm::session::Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, session);
+
+        let empty = a_rust_vm::session::Session::new("empty-export").unwrap();
+        assert_eq!(format_session_text(&empty), "(empty session empty-export)");
+
+        let directory = std::env::temp_dir().join(format!(
+            "a-rvm-session-export-{}-{}.json",
+            std::process::id(),
+            "helpers"
+        ));
+        let directory = directory.with_extension("");
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = a_rust_vm::session::SessionStore::new(&directory);
+        store.save(&session).unwrap();
+        assert_eq!(
+            export_session(&store, "export-1", false).unwrap(),
+            format_session_text(&session)
+        );
+        assert_eq!(
+            export_session(&store, "export-1", true).unwrap(),
+            format_session_json(&session).unwrap()
+        );
+        assert!(export_session(&store, "missing", false).is_err());
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert_eq!(
+            parse_session_export_args(&["export-1".to_owned()]).unwrap(),
+            ("export-1".to_owned(), false)
+        );
+        assert_eq!(
+            parse_session_export_args(&["export-1".to_owned(), "--json".to_owned()]).unwrap(),
+            ("export-1".to_owned(), true)
+        );
+        assert!(parse_session_export_args(&[]).is_err());
+        assert!(parse_session_export_args(&["a".to_owned(), "b".to_owned()]).is_err());
+        assert!(parse_session_export_args(&["a".to_owned(), "--text".to_owned()]).is_err());
     }
 
     #[test]
