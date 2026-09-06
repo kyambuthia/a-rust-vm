@@ -836,6 +836,8 @@ pub trait Tool {
     fn permission(&self, _arguments: &ToolArguments) -> Option<PermissionRequest> {
         None
     }
+
+    fn set_cancel_token(&mut self, _cancel: Arc<AtomicBool>) {}
 }
 
 /// Mutable collection of named tools with deterministic dispatch.
@@ -877,6 +879,12 @@ impl ToolRegistry {
         }
         self.tools.extend(other.tools);
         Ok(())
+    }
+
+    pub fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
+        for tool in self.tools.values_mut() {
+            tool.set_cancel_token(cancel.clone());
+        }
     }
 
     pub fn execute(&mut self, call: &ToolCall) -> ToolResult {
@@ -1316,6 +1324,7 @@ where
         F: FnMut(&PermissionRequest) -> PermissionDecision,
         A: FnMut(AgentEvent),
     {
+        self.tools.set_cancel_token(self.cancel.clone());
         let Some(request) = self.tools.permission_request(call) else {
             return self.tools.execute(call);
         };
@@ -1485,6 +1494,30 @@ pub fn run_subagent<M>(
 where
     M: Model,
 {
+    run_subagent_with_cancel(
+        model,
+        tools,
+        prompt,
+        config,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+/// Run one bounded child turn sharing the caller's cancellation token.
+///
+/// A pre-cancelled token fails closed before the model is consulted, so a
+/// parent/host cancel stops delegated tool turns through the same primitive
+/// used by [`Agent`] and [`SubagentSession::send`].
+pub fn run_subagent_with_cancel<M>(
+    model: M,
+    tools: ToolRegistry,
+    prompt: impl Into<String>,
+    config: SubagentConfig,
+    cancel: Arc<AtomicBool>,
+) -> Result<SubagentResult, SubagentError>
+where
+    M: Model,
+{
     let prompt = prompt.into();
     if prompt.trim().is_empty() {
         return Err(SubagentError::EmptyPrompt);
@@ -1492,6 +1525,7 @@ where
     let mut agent = Agent::new(model, tools)
         .with_max_steps(config.max_steps)
         .with_max_tool_calls(config.max_tool_calls)
+        .with_cancel_token(cancel)
         .with_context_limits(config.max_context_messages, config.max_context_chars);
     if let Some(system_prompt) = config.system_prompt.clone() {
         agent.set_system_prompt(system_prompt);
@@ -1701,6 +1735,7 @@ pub struct SubagentTool {
     make_model: Box<dyn FnMut() -> Box<dyn Model>>,
     make_tools: Box<dyn FnMut() -> ToolRegistry>,
     config: SubagentConfig,
+    cancel: Arc<AtomicBool>,
 }
 
 impl SubagentTool {
@@ -1716,7 +1751,17 @@ impl SubagentTool {
             make_model: Box::new(move || Box::new(make_model()) as Box<dyn Model>),
             make_tools: Box::new(make_tools),
             config,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_cancel_token(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
     }
 }
 
@@ -1752,7 +1797,8 @@ impl Tool for SubagentTool {
         };
         let model = (self.make_model)();
         let tools = (self.make_tools)();
-        run_subagent(model, tools, task, self.config.clone())
+        let cancel = self.cancel.clone();
+        run_subagent_with_cancel(model, tools, task, self.config.clone(), cancel)
             .map(|result| {
                 let mut output = if result.assistant_text.is_empty() {
                     format!("tool_calls={}", result.tool_calls)
@@ -1776,9 +1822,20 @@ impl Tool for SubagentTool {
                 if !errors.is_empty() {
                     output.push_str(&format!("\ntool_errors:\n{errors}"));
                 }
+                if result
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Cancelled))
+                {
+                    output.push_str("\ncancelled");
+                }
                 output
             })
             .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = cancel;
     }
 }
 
@@ -2087,7 +2144,7 @@ mod tests {
     use super::{
         Agent, AgentEvent, Model, ModelCapabilities, ModelError, ModelMode, ModelRequest,
         ModelResponse, ModelRouter, ModelStreamEvent, PermissionDecision, RouteRequest,
-        ScriptedModel, SubagentConfig, SubagentTool, ToolArguments, ToolCall, ToolRegistry,
+        ScriptedModel, SubagentConfig, SubagentTool, Tool, ToolArguments, ToolCall, ToolRegistry,
         ToolValue, load_project_instructions, run_subagent, system_prompt_with_instructions,
         system_prompt_with_skills, vm_tool_registry,
     };
@@ -3334,6 +3391,154 @@ mod tests {
             assert_eq!(result.content, "argument 'task' must be non-empty text");
         }
         assert_eq!(super::subagent_depth(), 0);
+    }
+
+    #[test]
+    fn subagent_with_cancel_fails_closed_before_consulting_the_model() {
+        use super::run_subagent_with_cancel;
+        struct CallCountingModel {
+            calls: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl Model for CallCountingModel {
+            fn respond(&mut self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(ModelResponse::Text("should not run".to_owned()))
+            }
+        }
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let result = run_subagent_with_cancel(
+            CallCountingModel {
+                calls: calls.clone(),
+            },
+            vm_tool_registry().unwrap(),
+            "child task",
+            SubagentConfig::default(),
+            cancel,
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 0);
+        assert!(result.assistant_text.is_empty());
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled))
+        );
+    }
+
+    #[test]
+    fn delegation_tool_shares_registry_cancel_tokens() {
+        struct ProbeTool {
+            seen: Rc<RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+        }
+
+        impl super::Tool for ProbeTool {
+            fn spec(&self) -> super::ToolSpec {
+                super::ToolSpec::new("probe", "probe", r#"{"type":"object"}"#)
+            }
+
+            fn execute(&mut self, _arguments: &ToolArguments) -> Result<String, super::ToolError> {
+                Ok("ok".to_owned())
+            }
+
+            fn set_cancel_token(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+                self.seen.borrow_mut().replace(cancel);
+            }
+        }
+
+        let seen = Rc::new(RefCell::new(None));
+        let mut registry = ToolRegistry::default();
+        registry.register(ProbeTool { seen: seen.clone() }).unwrap();
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry.set_cancel_token(token.clone());
+        assert!(std::sync::Arc::ptr_eq(
+            seen.borrow().as_ref().unwrap(),
+            &token
+        ));
+    }
+
+    #[test]
+    fn delegation_tool_propagates_parent_cancellation_to_child() {
+        struct NeverModel;
+
+        impl Model for NeverModel {
+            fn respond(&mut self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                panic!("cancelled child must not consult the model");
+            }
+        }
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut delegate = SubagentTool::new(
+            || NeverModel,
+            || vm_tool_registry().unwrap(),
+            SubagentConfig::default(),
+        )
+        .with_cancel_token(cancel.clone());
+        assert!(std::sync::Arc::ptr_eq(&delegate.cancel_token(), &cancel));
+        let call = ToolCall::new(
+            "delegate-1",
+            "delegate_subagent",
+            [("task".to_owned(), ToolValue::Text("child task".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+
+        let result = delegate.execute(&call.arguments);
+        let content = result.unwrap();
+        assert!(content.contains("cancelled"));
+        assert_eq!(super::subagent_depth(), 0);
+    }
+
+    #[test]
+    fn agent_turn_shares_parent_cancel_token_with_delegate_tool() {
+        struct CancelOnDispatch {
+            cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            call: ToolCall,
+        }
+
+        impl Model for CancelOnDispatch {
+            fn respond(&mut self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(ModelResponse::ToolCall(self.call.clone()))
+            }
+        }
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delegate = SubagentTool::new(
+            || NeverRespondModel,
+            || vm_tool_registry().unwrap(),
+            SubagentConfig::default(),
+        );
+        let mut registry = ToolRegistry::default();
+        registry.register(delegate).unwrap();
+        struct NeverRespondModel;
+
+        impl Model for NeverRespondModel {
+            fn respond(&mut self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                panic!("cancelled child must not consult the model");
+            }
+        }
+        let parent = CancelOnDispatch {
+            cancel: cancel.clone(),
+            call: ToolCall::new(
+                "delegate-1",
+                "delegate_subagent",
+                [("task".to_owned(), ToolValue::Text("child task".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let mut agent = Agent::new(parent, registry).with_cancel_token(cancel);
+
+        let events = agent.run("parent task").unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult(result) if result.content.contains("cancelled")
+        )));
     }
 
     #[test]
