@@ -1414,6 +1414,7 @@ pub struct SubagentConfig {
     pub max_context_chars: usize,
     pub system_prompt: Option<String>,
     pub max_transcript_chars: usize,
+    pub max_depth: usize,
 }
 
 impl Default for SubagentConfig {
@@ -1425,6 +1426,7 @@ impl Default for SubagentConfig {
             max_context_chars: DEFAULT_CONTEXT_CHARS,
             system_prompt: None,
             max_transcript_chars: 4 * 1024,
+            max_depth: 1,
         }
     }
 }
@@ -1441,6 +1443,7 @@ pub struct SubagentResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubagentError {
     EmptyPrompt,
+    DepthLimitExceeded { limit: usize },
     Agent(AgentError),
 }
 
@@ -1448,6 +1451,9 @@ impl fmt::Display for SubagentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPrompt => formatter.write_str("subagent prompt must not be empty"),
+            Self::DepthLimitExceeded { limit } => {
+                write!(formatter, "subagent delegation depth exceeded: {limit}")
+            }
             Self::Agent(error) => write!(formatter, "subagent turn failed: {error}"),
         }
     }
@@ -1503,6 +1509,26 @@ where
 }
 
 /// A parent-visible tool that delegates one bounded subtask to an isolated child.
+std::thread_local! {
+    static SUBAGENT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct DepthGuard {
+    previous: usize,
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        SUBAGENT_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn subagent_depth() -> usize {
+    SUBAGENT_DEPTH.with(|depth| depth.get())
+}
+
+/// A parent-visible tool that delegates one bounded subtask to an isolated child.
 pub struct SubagentTool {
     make_model: Box<dyn FnMut() -> Box<dyn Model>>,
     make_tools: Box<dyn FnMut() -> ToolRegistry>,
@@ -1538,18 +1564,51 @@ impl Tool for SubagentTool {
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &["task"])?;
         let task = required_text(arguments, "task")?;
+        let entered = SUBAGENT_DEPTH.with(|depth| {
+            if depth.get() >= self.config.max_depth {
+                return None;
+            }
+            let guard = DepthGuard {
+                previous: depth.get(),
+            };
+            depth.set(guard.previous + 1);
+            Some(guard)
+        });
+        let Some(_guard) = entered else {
+            return Err(ToolError::new(
+                SubagentError::DepthLimitExceeded {
+                    limit: self.config.max_depth,
+                }
+                .to_string(),
+            ));
+        };
         let model = (self.make_model)();
         let tools = (self.make_tools)();
         run_subagent(model, tools, task, self.config.clone())
             .map(|result| {
-                if result.assistant_text.is_empty() {
+                let mut output = if result.assistant_text.is_empty() {
                     format!("tool_calls={}", result.tool_calls)
                 } else {
                     format!(
                         "{}\ntool_calls={}",
                         result.assistant_text, result.tool_calls
                     )
+                };
+                let errors = result
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AgentEvent::ToolResult(tool_result) if tool_result.is_error => {
+                            Some(tool_result.content.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !errors.is_empty() {
+                    output.push_str(&format!("\ntool_errors:\n{errors}"));
                 }
+                output
             })
             .map_err(|error| ToolError::new(error.to_string()))
     }
@@ -1924,6 +1983,71 @@ mod tests {
         [("program".to_owned(), ToolValue::Text(source.to_owned()))]
             .into_iter()
             .collect()
+    }
+
+    struct EchoAfterOneToolCall {
+        call: ToolCall,
+        used: bool,
+    }
+
+    impl EchoAfterOneToolCall {
+        fn new(call: ToolCall) -> Self {
+            Self { call, used: false }
+        }
+    }
+
+    impl Default for EchoAfterOneToolCall {
+        fn default() -> Self {
+            Self::new(nested_call())
+        }
+    }
+
+    impl Model for EchoAfterOneToolCall {
+        fn respond(&mut self, request: &super::ModelRequest) -> Result<ModelResponse, ModelError> {
+            if self.used {
+                let echoed = request
+                    .tool_results
+                    .last()
+                    .map(|result| result.content.clone())
+                    .filter(|content| !content.is_empty())
+                    .unwrap_or_else(|| "child finished".to_owned());
+                return Ok(ModelResponse::Text(echoed));
+            }
+            self.used = true;
+            Ok(ModelResponse::ToolCall(self.call.clone()))
+        }
+    }
+
+    fn parent_call() -> ToolCall {
+        ToolCall::new(
+            "delegate-1",
+            "delegate_subagent",
+            [("task".to_owned(), ToolValue::Text("outer".to_owned()))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn nested_call() -> ToolCall {
+        ToolCall::new(
+            "nested-2",
+            "delegate_subagent",
+            [("task".to_owned(), ToolValue::Text("nested".to_owned()))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn nested_child_tools() -> ToolRegistry {
+        let mut tools = vm_tool_registry().unwrap();
+        tools
+            .register(SubagentTool::new(
+                ScriptedModel::default,
+                || vm_tool_registry().unwrap(),
+                SubagentConfig::default(),
+            ))
+            .unwrap();
+        tools
     }
 
     #[test]
@@ -2957,5 +3081,90 @@ mod tests {
             result.content,
             "subagent turn failed: agent tool call limit exceeded: 1"
         );
+    }
+
+    #[test]
+    fn delegation_tool_blocks_nested_delegation_at_default_depth() {
+        let outer = SubagentTool::new(
+            || EchoAfterOneToolCall::default(),
+            nested_child_tools,
+            SubagentConfig::default(),
+        );
+        let parent = EchoAfterOneToolCall::new(parent_call());
+        let mut tools = ToolRegistry::default();
+        tools.register(outer).unwrap();
+        let mut agent = Agent::new(parent, tools);
+
+        let events = agent.run("parent task").unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult(result)
+                if result.content.contains("subagent delegation depth exceeded: 1")
+        )));
+        assert_eq!(super::subagent_depth(), 0);
+    }
+
+    #[test]
+    fn delegation_tool_allows_one_nested_level_when_configured() {
+        let delegate = SubagentTool::new(
+            || EchoAfterOneToolCall::new(nested_call()),
+            || {
+                let mut tools = ToolRegistry::default();
+                tools
+                    .register(SubagentTool::new(
+                        || ScriptedModel::new([ModelResponse::Text("leaf".to_owned())]),
+                        || vm_tool_registry().unwrap(),
+                        SubagentConfig {
+                            max_depth: 2,
+                            ..SubagentConfig::default()
+                        },
+                    ))
+                    .unwrap();
+                tools
+            },
+            SubagentConfig {
+                max_depth: 2,
+                ..SubagentConfig::default()
+            },
+        );
+        let parent = EchoAfterOneToolCall::new(parent_call());
+        let mut tools = ToolRegistry::default();
+        tools.register(delegate).unwrap();
+        let mut agent = Agent::new(parent, tools);
+
+        let events = agent.run("parent task").unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult(result) if result.content.contains("leaf")
+        )));
+        assert_eq!(super::subagent_depth(), 0);
+    }
+
+    #[test]
+    fn delegation_depth_resets_between_sequential_calls() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(SubagentTool::new(
+                ScriptedModel::default,
+                || vm_tool_registry().unwrap(),
+                SubagentConfig::default(),
+            ))
+            .unwrap();
+        let call = || {
+            ToolCall::new(
+                "delegate-1",
+                "delegate_subagent",
+                [("task".to_owned(), ToolValue::Text("   ".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )
+        };
+
+        for _ in 0..2 {
+            let result = registry.execute(&call());
+            assert!(result.is_error);
+            assert_eq!(result.content, "argument 'task' must be non-empty text");
+        }
+        assert_eq!(super::subagent_depth(), 0);
     }
 }
