@@ -191,6 +191,126 @@ impl McpClient {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct McpToolAdapter {
+    client: McpClient,
+    remote_name: String,
+    registry_name: String,
+    description: String,
+    input_schema: String,
+}
+
+impl McpToolAdapter {
+    pub fn new(client: McpClient, tool: &McpTool) -> Result<Self, McpError> {
+        if tool.name.trim().is_empty() {
+            return Err(McpError::new("mcp tool entry must have a non-empty name"));
+        }
+        let registry_name = mcp_registry_name(&tool.name)?;
+        let description = if tool.description.trim().is_empty() {
+            format!("Call MCP tool '{}'.", tool.name)
+        } else {
+            format!("Call MCP tool '{}': {}", tool.name, tool.description)
+        };
+        let input_schema = match &tool.input_schema {
+            serde_json::Value::Null => r#"{"type":"object"}"#.to_owned(),
+            schema => compact_json(schema),
+        };
+        Ok(Self {
+            client,
+            remote_name: tool.name.clone(),
+            registry_name,
+            description,
+            input_schema,
+        })
+    }
+
+    pub fn remote_name(&self) -> &str {
+        &self.remote_name
+    }
+
+    pub fn registry_name(&self) -> &str {
+        &self.registry_name
+    }
+}
+
+impl crate::agent::Tool for McpToolAdapter {
+    fn spec(&self) -> crate::agent::ToolSpec {
+        crate::agent::ToolSpec::new(&self.registry_name, &self.description, &self.input_schema)
+    }
+
+    fn permission(
+        &self,
+        _arguments: &crate::agent::ToolArguments,
+    ) -> Option<crate::agent::PermissionRequest> {
+        Some(crate::agent::PermissionRequest {
+            id: format!("mcp:{}", self.remote_name),
+            tool: self.registry_name.clone(),
+            description: format!("call MCP tool '{}'", self.remote_name),
+        })
+    }
+
+    fn execute(
+        &mut self,
+        arguments: &crate::agent::ToolArguments,
+    ) -> Result<String, crate::agent::ToolError> {
+        let mut object = serde_json::Map::with_capacity(arguments.len());
+        for (name, value) in arguments {
+            object.insert(name.clone(), tool_value_to_json(value));
+        }
+        let payload = serde_json::Value::Object(object);
+        self.client
+            .call_tool(&self.remote_name, payload)
+            .map_err(|error| crate::agent::ToolError::new(error.to_string()))
+    }
+}
+
+pub fn mcp_registry_name(remote: &str) -> Result<String, McpError> {
+    let mut sanitized = String::with_capacity(remote.len());
+    let mut previous_underscore = false;
+    for part in remote.trim().to_lowercase().chars() {
+        if part.is_ascii_alphanumeric() {
+            sanitized.push(part);
+            previous_underscore = false;
+        } else if !previous_underscore {
+            sanitized.push('_');
+            previous_underscore = true;
+        }
+    }
+    let sanitized = sanitized.trim_matches('_').to_owned();
+    if sanitized.is_empty() {
+        return Err(McpError::new(format!(
+            "mcp tool name '{remote}' has no usable characters"
+        )));
+    }
+    Ok(format!("mcp_{sanitized}"))
+}
+
+fn tool_value_to_json(value: &crate::agent::ToolValue) -> serde_json::Value {
+    match value {
+        crate::agent::ToolValue::Text(text) => serde_json::Value::String(text.clone()),
+        crate::agent::ToolValue::Integer(number) => serde_json::json!(*number),
+        crate::agent::ToolValue::Boolean(flag) => serde_json::Value::Bool(*flag),
+        crate::agent::ToolValue::List(items) => {
+            serde_json::Value::Array(items.iter().map(tool_value_to_json).collect())
+        }
+    }
+}
+
+pub fn mcp_tool_registry(config: &McpConfig) -> Result<crate::agent::ToolRegistry, McpError> {
+    let client = McpClient::new(config.clone())?;
+    let mut registry = crate::agent::ToolRegistry::default();
+    for tool in client.list_tools()? {
+        let adapter = McpToolAdapter::new(client.clone(), &tool)?;
+        registry.register(adapter).map_err(|error| {
+            McpError::new(format!(
+                "mcp tool '{}' conflicts with an existing tool: {error}",
+                tool.name
+            ))
+        })?;
+    }
+    Ok(registry)
+}
+
 struct McpPage {
     tools: Vec<McpTool>,
     next_cursor: Option<String>,
@@ -360,7 +480,10 @@ fn compact_json(value: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{McpClient, McpConfig};
+    use super::{
+        McpClient, McpConfig, McpTool, McpToolAdapter, mcp_registry_name, mcp_tool_registry,
+    };
+    use crate::agent::{Tool, ToolArguments, ToolCall, ToolValue};
 
     fn shell_config(script: &str) -> McpConfig {
         McpConfig {
@@ -465,5 +588,94 @@ mod tests {
                 .to_string()
                 .contains("64 KiB")
         );
+    }
+
+    fn adapter(script: &str, tool: &McpTool) -> McpToolAdapter {
+        McpToolAdapter::new(client(script), tool).expect("adapter should build")
+    }
+
+    fn echo_tool() -> McpTool {
+        McpTool {
+            name: "echo".to_owned(),
+            description: "Echo input".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn namespaces_registry_names_with_sanitization() {
+        assert_eq!(mcp_registry_name("echo").unwrap(), "mcp_echo");
+        assert_eq!(mcp_registry_name("Read File!").unwrap(), "mcp_read_file");
+        assert_eq!(mcp_registry_name("a---b").unwrap(), "mcp_a_b");
+        assert!(mcp_registry_name("   ").is_err());
+        assert!(mcp_registry_name("!!!").is_err());
+        assert!(
+            McpToolAdapter::new(
+                client("true"),
+                &McpTool {
+                    name: "  ".to_owned(),
+                    description: String::new(),
+                    input_schema: serde_json::Value::Null,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adapter_spec_requires_approval_for_the_remote_tool() {
+        let adapter = adapter("true", &echo_tool());
+        assert_eq!(adapter.spec().name, "mcp_echo");
+        assert!(adapter.spec().description.contains("echo"));
+        let call = ToolCall::new("call-1", "mcp_echo", ToolArguments::new());
+        let request = adapter
+            .permission(&call.arguments)
+            .expect("mcp tools must require approval");
+        assert_eq!(request.tool, "mcp_echo");
+        assert!(request.id.contains("echo"));
+        assert!(request.description.contains("echo"));
+    }
+
+    #[test]
+    fn adapter_converts_arguments_and_returns_remote_text() {
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; case "$l2" in *'"count":3'*'"flag":true'*'"items":[1,"two"]'*'"text":"hi"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}';; *) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad args"}],"isError":true}}';; esac"#;
+        let mut adapter = adapter(script, &echo_tool());
+        let mut arguments = ToolArguments::new();
+        arguments.insert("text".to_owned(), ToolValue::Text("hi".to_owned()));
+        arguments.insert("count".to_owned(), ToolValue::Integer(3));
+        arguments.insert("flag".to_owned(), ToolValue::Boolean(true));
+        arguments.insert(
+            "items".to_owned(),
+            ToolValue::List(vec![
+                ToolValue::Integer(1),
+                ToolValue::Text("two".to_owned()),
+            ]),
+        );
+        let output = adapter.execute(&arguments).unwrap();
+        assert_eq!(output, "done");
+    }
+
+    #[test]
+    fn adapter_surfaces_remote_errors_fail_closed() {
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad input"}],"isError":true}}'"#;
+        let mut adapter = adapter(script, &echo_tool());
+        let error = adapter.execute(&ToolArguments::new()).unwrap_err();
+        assert!(error.to_string().contains("failed"));
+    }
+
+    #[test]
+    fn registry_lists_and_registers_discovered_tools() {
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}'"#;
+        let registry = mcp_tool_registry(&shell_config(script)).unwrap();
+        assert_eq!(registry.specs().len(), 1);
+        assert_eq!(registry.specs()[0].name, "mcp_echo");
+        let call = ToolCall::new("call-1", "mcp_echo", ToolArguments::new());
+        assert!(registry.permission_request(&call).is_some());
+    }
+
+    #[test]
+    fn registry_rejects_conflicting_discovered_names() {
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"Echo"},{"name":"echo "}]}}'"#;
+        assert!(mcp_tool_registry(&shell_config(script)).is_err());
     }
 }
