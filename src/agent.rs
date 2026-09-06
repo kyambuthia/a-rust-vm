@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::permissions::{PermissionEffect, PermissionPolicy, SessionApprovals};
+use crate::session::{Session, SessionStore};
 use crate::{Instruction, StepResult, Vm, VmError};
 
 /// A value that can cross the model-to-tool boundary without requiring a JSON
@@ -1410,7 +1411,7 @@ fn format_tool_result(result: &ToolResult) -> String {
 }
 
 /// Bounds for one delegated child turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentConfig {
     pub max_steps: usize,
     pub max_tool_calls: usize,
@@ -1449,6 +1450,7 @@ pub enum SubagentError {
     EmptyPrompt,
     InvalidId,
     DepthLimitExceeded { limit: usize },
+    Storage(String),
     Agent(AgentError),
 }
 
@@ -1459,6 +1461,9 @@ impl fmt::Display for SubagentError {
             Self::InvalidId => formatter.write_str("subagent id must not be empty"),
             Self::DepthLimitExceeded { limit } => {
                 write!(formatter, "subagent delegation depth exceeded: {limit}")
+            }
+            Self::Storage(message) => {
+                write!(formatter, "subagent transcript store failed: {message}")
             }
             Self::Agent(error) => write!(formatter, "subagent turn failed: {error}"),
         }
@@ -1519,6 +1524,7 @@ where
 /// Each `send` rehydrates a fresh [`Agent`] from the stored history, so a
 /// multi-step delegated task accumulates context while the parent-visible
 /// one-off `run_subagent` entry point keeps its stateless fail-closed shape.
+/// `save`/`load` persist the config plus history through [`SessionStore`].
 #[derive(Debug, Clone)]
 pub struct SubagentSession {
     id: String,
@@ -1534,6 +1540,8 @@ impl PartialEq for SubagentSession {
 }
 
 impl Eq for SubagentSession {}
+
+const SUBAGENT_CONFIG_ROLE: &str = "subagent-config";
 
 impl SubagentSession {
     pub fn new(id: impl Into<String>, config: SubagentConfig) -> Result<Self, SubagentError> {
@@ -1568,6 +1576,54 @@ impl SubagentSession {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    pub fn save(&self, store: &SessionStore) -> Result<(), SubagentError> {
+        let mut session = Session::new(self.id.clone())
+            .map_err(|error| SubagentError::Storage(error.to_string()))?;
+        let config = serde_json::to_string(&self.config)
+            .map_err(|error| SubagentError::Storage(error.to_string()))?;
+        session.push(SUBAGENT_CONFIG_ROLE, config);
+        for message in &self.history {
+            session.push(message.role.clone(), message.content.clone());
+        }
+        store
+            .save(&session)
+            .map_err(|error| SubagentError::Storage(error.to_string()))
+    }
+
+    pub fn load(store: &SessionStore, id: &str) -> Result<Self, SubagentError> {
+        if id.trim().is_empty() {
+            return Err(SubagentError::InvalidId);
+        }
+        let session = store
+            .load(id)
+            .map_err(|error| SubagentError::Storage(error.to_string()))?;
+        let (first, rest) = session.messages.split_first().ok_or_else(|| {
+            SubagentError::Storage(format!(
+                "subagent transcript '{}' has no config",
+                session.id
+            ))
+        })?;
+        if first.role != SUBAGENT_CONFIG_ROLE {
+            return Err(SubagentError::Storage(format!(
+                "subagent transcript '{}' has invalid config entry",
+                session.id
+            )));
+        }
+        let config: SubagentConfig = serde_json::from_str(&first.content)
+            .map_err(|error| SubagentError::Storage(error.to_string()))?;
+        Ok(Self {
+            id: session.id,
+            config,
+            history: rest
+                .iter()
+                .map(|message| {
+                    ConversationMessage::new(message.role.clone(), message.content.clone())
+                })
+                .collect(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn send<M>(
@@ -3452,5 +3508,81 @@ mod tests {
                 .any(|event| matches!(event, AgentEvent::Cancelled))
         );
         assert!(session.history().is_empty());
+    }
+
+    #[test]
+    fn persistent_session_transcript_round_trips_through_store() {
+        use super::{SubagentConfig, SubagentSession};
+        use crate::session::SessionStore;
+        let directory =
+            std::env::temp_dir().join(format!("a-rvm-subagent-{}-round-trip", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = SessionStore::new(&directory);
+        let mut session = SubagentSession::new(
+            "child-1",
+            SubagentConfig {
+                max_transcript_chars: 16,
+                ..SubagentConfig::default()
+            },
+        )
+        .unwrap();
+        session
+            .send(
+                ScriptedModel::new([ModelResponse::Text("first reply".to_owned())]),
+                vm_tool_registry().unwrap(),
+                "first task",
+            )
+            .unwrap();
+        session.save(&store).unwrap();
+
+        let reloaded = SubagentSession::load(&store, "child-1").unwrap();
+        assert_eq!(reloaded, session);
+        assert_eq!(reloaded.history(), session.history());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn persistent_session_continues_history_after_reload() {
+        use super::SubagentSession;
+        use crate::session::SessionStore;
+        let directory =
+            std::env::temp_dir().join(format!("a-rvm-subagent-{}-continue", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = SessionStore::new(&directory);
+        let mut session = SubagentSession::new("child-1", SubagentConfig::default()).unwrap();
+        session
+            .send(
+                ScriptedModel::new([ModelResponse::Text("first reply".to_owned())]),
+                vm_tool_registry().unwrap(),
+                "first task",
+            )
+            .unwrap();
+        session.save(&store).unwrap();
+
+        let mut reloaded = SubagentSession::load(&store, "child-1").unwrap();
+        let second = reloaded
+            .send(
+                ScriptedModel::new([ModelResponse::Text("second reply".to_owned())]),
+                vm_tool_registry().unwrap(),
+                "second task",
+            )
+            .unwrap();
+        assert_eq!(second.assistant_text, "second reply");
+        assert!(reloaded.history().len() > session.history().len());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn persistent_session_load_rejects_unknown_and_blank_ids() {
+        use super::SubagentSession;
+        use crate::session::SessionStore;
+        let directory =
+            std::env::temp_dir().join(format!("a-rvm-subagent-{}-reject", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = SessionStore::new(&directory);
+        assert!(SubagentSession::load(&store, "   ").is_err());
+        assert!(SubagentSession::load(&store, "missing-child").is_err());
+        let session = SubagentSession::new("with space", SubagentConfig::default()).unwrap();
+        assert!(session.save(&store).is_err());
     }
 }
