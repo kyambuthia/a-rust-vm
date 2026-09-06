@@ -88,7 +88,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -780,7 +780,8 @@ fn run_live_agent(user_arguments: &[String]) {
     let mut route = agent.route_request().clone();
     let session_id = extract_session_id(user_arguments);
     if let Some((prompt, json)) = parse_one_shot_args(user_arguments) {
-        run_one_shot_agent(&mut agent, &prompt, json);
+        let permission = extract_one_shot_permission(user_arguments);
+        run_one_shot_agent(&mut agent, &prompt, json, permission);
         return;
     }
     let store = SessionStore::new(session_directory());
@@ -960,7 +961,7 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
             skip_next = false;
             continue;
         }
-        if argument != "--json" {
+        if !matches!(argument.as_str(), "--json" | "--auto" | "--deny") {
             prompt_parts.push(argument.clone());
         }
     }
@@ -979,11 +980,33 @@ fn extract_session_id(arguments: &[String]) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
-fn run_one_shot_agent(agent: &mut Agent<ModelRouter>, prompt: &str, json: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneShotPermission {
+    Auto,
+    Deny,
+}
+
+fn extract_one_shot_permission(arguments: &[String]) -> OneShotPermission {
+    if arguments.iter().any(|argument| argument == "--auto") {
+        OneShotPermission::Auto
+    } else {
+        OneShotPermission::Deny
+    }
+}
+
+fn run_one_shot_agent(
+    agent: &mut Agent<ModelRouter>,
+    prompt: &str,
+    json: bool,
+    permission: OneShotPermission,
+) {
     let result = agent.run_streaming_with_approval(
         prompt,
-        |request| a_rust_vm::agent::PermissionDecision::Deny {
-            reason: format!("one-shot mode denies guarded tool: {}", request.description),
+        |request| match permission {
+            OneShotPermission::Auto => a_rust_vm::agent::PermissionDecision::Allow,
+            OneShotPermission::Deny => a_rust_vm::agent::PermissionDecision::Deny {
+                reason: format!("one-shot mode denies guarded tool: {}", request.description),
+            },
         },
         |event| {
             if json {
@@ -1334,6 +1357,18 @@ mod tests {
             Some("s-1".to_owned())
         );
         assert_eq!(super::extract_session_id(&["hi".to_owned()]), None);
+        assert_eq!(
+            super::parse_one_shot_args(&["--auto".to_owned(), "write".to_owned(), "x".to_owned()]),
+            Some(("write x".to_owned(), false))
+        );
+        assert_eq!(
+            super::extract_one_shot_permission(&["--auto".to_owned(), "hi".to_owned()]),
+            super::OneShotPermission::Auto
+        );
+        assert_eq!(
+            super::extract_one_shot_permission(&["hi".to_owned()]),
+            super::OneShotPermission::Deny
+        );
     }
 
     #[test]
