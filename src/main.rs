@@ -12,7 +12,7 @@ use a_rust_vm::agent::{
 };
 use a_rust_vm::program::Program;
 use a_rust_vm::session::{Session, SessionStore};
-use a_rust_vm::workspace::coding_tool_registry;
+use a_rust_vm::workspace::{coding_tool_registry, coding_tool_registry_with_directories};
 use a_rust_vm::{Instruction, Vm};
 
 const MODEL_ATTEMPTS: usize = 2;
@@ -96,7 +96,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... [--skill <name>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  skill <command>         Discover and load project skills (list/show/load)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... [--skill <name>]... [--workspace-dir <path>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  skill <command>         Discover and load project skills (list/show/load)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -1038,6 +1038,7 @@ fn run_live_agent(user_arguments: &[String]) {
             .unwrap_or_default()
     };
     let working_directory = working_directory();
+    let additional_directories = extract_workspace_directories(user_arguments);
     let model = ProcessModel::new(program)
         .with_arguments(arguments)
         .with_working_directory(&working_directory);
@@ -1055,19 +1056,22 @@ fn run_live_agent(user_arguments: &[String]) {
     router
         .set_strong(&model_name)
         .expect("strong model route should exist");
-    let mut agent = Agent::new(
-        router,
-        coding_tool_registry(&working_directory).expect("agent tools should register"),
-    )
-    .with_system_prompt(workspace_system_prompt_with_skills(
-        &working_directory,
-        &load_requested_skills(&working_directory, user_arguments),
-    ))
-    .with_route_request(RouteRequest {
-        requires_tools: true,
-        requires_streaming: true,
-        ..RouteRequest::default()
-    });
+    let registry =
+        coding_tool_registry_with_directories(&working_directory, &additional_directories)
+            .unwrap_or_else(|error| {
+                eprintln!("[workspace] {error}");
+                std::process::exit(2);
+            });
+    let mut agent = Agent::new(router, registry)
+        .with_system_prompt(workspace_system_prompt_with_skills(
+            &working_directory,
+            &load_requested_skills(&working_directory, user_arguments),
+        ))
+        .with_route_request(RouteRequest {
+            requires_tools: true,
+            requires_streaming: true,
+            ..RouteRequest::default()
+        });
     let policy = match merged_permission_policy(user_arguments) {
         Ok(policy) => policy,
         Err(error) => {
@@ -1252,7 +1256,11 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
     let mut prompt_parts = Vec::new();
     let mut skip_next = false;
     for argument in arguments {
-        if argument == "--session" || argument == "--rule" || argument == "--skill" {
+        if argument == "--session"
+            || argument == "--rule"
+            || argument == "--skill"
+            || argument == "--workspace-dir"
+        {
             skip_next = true;
             continue;
         }
@@ -1270,6 +1278,14 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
     } else {
         Some((prompt, json))
     }
+}
+
+fn extract_workspace_directories(arguments: &[String]) -> Vec<std::path::PathBuf> {
+    arguments
+        .windows(2)
+        .filter(|window| window[0] == "--workspace-dir")
+        .map(|window| std::path::PathBuf::from(&window[1]))
+        .collect()
 }
 
 fn extract_session_id(arguments: &[String]) -> Option<String> {
@@ -1686,9 +1702,10 @@ fn working_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         BridgeResponse, check_artifact_byte_len, collect_runner_text, export_session,
-        extract_skill_names, format_session_json, format_session_text,
-        parse_artifact_import_arguments, parse_artifact_kind, parse_bridge_response,
-        parse_session_export_args, skill_roots_for, workspace_system_prompt_with_skills,
+        extract_skill_names, extract_workspace_directories, format_session_json,
+        format_session_text, parse_artifact_import_arguments, parse_artifact_kind,
+        parse_bridge_response, parse_session_export_args, skill_roots_for,
+        workspace_system_prompt_with_skills,
     };
 
     #[test]
@@ -1738,6 +1755,34 @@ mod tests {
             ]),
             Some(("do x".to_owned(), false))
         );
+        assert_eq!(
+            super::parse_one_shot_args(&[
+                "--workspace-dir".to_owned(),
+                "/tmp/extra".to_owned(),
+                "do".to_owned(),
+                "x".to_owned()
+            ]),
+            Some(("do x".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn workspace_dir_flags_are_extracted_repeatably() {
+        let arguments = [
+            "--workspace-dir".to_owned(),
+            "/tmp/first".to_owned(),
+            "hi".to_owned(),
+            "--workspace-dir".to_owned(),
+            "/tmp/second".to_owned(),
+        ];
+        assert_eq!(
+            extract_workspace_directories(&arguments),
+            vec![
+                std::path::PathBuf::from("/tmp/first"),
+                std::path::PathBuf::from("/tmp/second")
+            ]
+        );
+        assert!(extract_workspace_directories(&["hi".to_owned()]).is_empty());
     }
 
     #[test]
