@@ -1,15 +1,17 @@
 use std::env;
 use std::io::{self, BufRead, Read, Write};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
 use a_rust_vm::agent::{
-    Agent, AgentEvent, ModelCapabilities, ModelMode, ModelResponse, ModelRouter, ProcessModel,
-    RouteRequest, ScriptedModel, ToolArguments, ToolCall, ToolValue, load_project_instructions,
-    system_prompt_with_instructions,
+    Agent, AgentEvent, ConversationMessage, ModelCapabilities, ModelMode, ModelResponse,
+    ModelRouter, ProcessModel, RouteRequest, ScriptedModel, ToolArguments, ToolCall, ToolValue,
+    load_project_instructions, system_prompt_with_instructions,
 };
 use a_rust_vm::program::Program;
+use a_rust_vm::session::{Session, SessionStore};
 use a_rust_vm::workspace::coding_tool_registry;
 use a_rust_vm::{Instruction, Vm};
 
@@ -33,6 +35,10 @@ fn main() {
     }
     if command == Some("workspace") {
         run_workspace_command(&arguments[1..]);
+        return;
+    }
+    if command == Some("session") {
+        run_session_command(&arguments[1..]);
         return;
     }
     if matches!(command, Some("run" | "check" | "disassemble" | "trace")) {
@@ -82,7 +88,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -359,6 +365,97 @@ fn control_plane_path() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join(".local/state/a-rust-vm/control-plane.json")
+}
+
+fn session_directory() -> std::path::PathBuf {
+    if let Some(directory) = env::var_os("A_RVM_STATE_DIR") {
+        return std::path::PathBuf::from(directory).join("sessions");
+    }
+    if let Some(directory) = env::var_os("XDG_STATE_HOME") {
+        return std::path::PathBuf::from(directory).join("a-rust-vm/sessions");
+    }
+    env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".local/state/a-rust-vm/sessions")
+}
+
+fn session_usage() {
+    eprintln!("usage: arvm session list|show <id>|save <id> <role> <content>");
+}
+
+fn run_session_command(arguments: &[String]) {
+    let store = SessionStore::new(session_directory());
+    let Some(command) = arguments.first().map(String::as_str) else {
+        session_usage();
+        std::process::exit(2);
+    };
+    match command {
+        "list" => match store.list() {
+            Ok(ids) => {
+                if ids.is_empty() {
+                    println!("(no sessions)");
+                } else {
+                    for id in ids {
+                        println!("{id}");
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("[session] cannot list: {error}");
+                std::process::exit(1);
+            }
+        },
+        "show" => {
+            let Some(id) = arguments.get(1) else {
+                session_usage();
+                std::process::exit(2);
+            };
+            match store.load(id) {
+                Ok(session) => {
+                    if session.messages.is_empty() {
+                        println!("(empty session {id})");
+                    }
+                    for message in &session.messages {
+                        println!("[{}] {}", message.role, message.content);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[session] {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "save" => {
+            if arguments.len() < 4 {
+                session_usage();
+                std::process::exit(2);
+            }
+            let id = &arguments[1];
+            let role = &arguments[2];
+            let content = &arguments[3];
+            let mut session = match store.load(id) {
+                Ok(existing) => existing,
+                Err(_) => match Session::new(id.clone()) {
+                    Ok(created) => created,
+                    Err(error) => {
+                        eprintln!("[session] {error}");
+                        std::process::exit(1);
+                    }
+                },
+            };
+            session.push(role.clone(), content.clone());
+            if let Err(error) = store.save(&session) {
+                eprintln!("[session] cannot save: {error}");
+                std::process::exit(1);
+            }
+            println!("saved {id} ({} messages)", session.messages.len());
+        }
+        _ => {
+            session_usage();
+            std::process::exit(2);
+        }
+    }
 }
 
 fn run_doctor(arguments: &[String]) {
@@ -681,10 +778,49 @@ fn run_live_agent(user_arguments: &[String]) {
         ..RouteRequest::default()
     });
     let mut route = agent.route_request().clone();
+    let session_id = extract_session_id(user_arguments);
     if let Some((prompt, json)) = parse_one_shot_args(user_arguments) {
         run_one_shot_agent(&mut agent, &prompt, json);
         return;
     }
+    let store = SessionStore::new(session_directory());
+    let mut session = match &session_id {
+        Some(id) => match store.load(id) {
+            Ok(existing) => {
+                println!(
+                    "[session] resumed {id} ({} messages)",
+                    existing.messages.len()
+                );
+                let conversation = existing
+                    .messages
+                    .iter()
+                    .map(|message| ConversationMessage {
+                        role: message.role.clone(),
+                        content: message.content.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                agent.set_conversation(conversation);
+                existing
+            }
+            Err(error) => {
+                eprintln!("[session] cannot resume {id}: {error}");
+                std::process::exit(2);
+            }
+        },
+        None => {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            match Session::new(format!("ask-{timestamp}")) {
+                Ok(created) => created,
+                Err(error) => {
+                    eprintln!("[session] {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
     let stdin = io::stdin();
 
     println!("A/RVM agent. Type /exit to quit.");
@@ -747,6 +883,8 @@ fn run_live_agent(user_arguments: &[String]) {
             continue;
         }
 
+        session.push("user", prompt);
+        let mut reply = String::new();
         if let Err(error) = agent.run_streaming_with_approval(
             prompt,
             |request| {
@@ -765,12 +903,19 @@ fn run_live_agent(user_arguments: &[String]) {
             },
             |event| match event {
                 AgentEvent::AssistantDelta { content } => {
+                    reply.push_str(&content);
                     print!("{content}");
                     io::stdout().flush().expect("stdout should be writable");
                 }
-                AgentEvent::AssistantText { content } => print!("{content}"),
+                AgentEvent::AssistantText { content } => {
+                    reply.push_str(&content);
+                    print!("{content}");
+                }
                 AgentEvent::ToolCall(call) => print!("\n[tool] {}\n", call.name),
-                AgentEvent::ToolResult(result) => println!("[tool result] {}", result.content),
+                AgentEvent::ToolResult(result) => {
+                    session.push("tool", format!("{}: {}", result.name, result.content));
+                    println!("[tool result] {}", result.content);
+                }
                 AgentEvent::PermissionRequested(request) => {
                     println!("[permission] {}", request.description)
                 }
@@ -779,12 +924,23 @@ fn run_live_agent(user_arguments: &[String]) {
                 }
                 AgentEvent::Error { message } => println!("[error] {message}"),
                 AgentEvent::Cancelled => println!("\n[agent] cancelled"),
-                AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
+                AgentEvent::Done => {
+                    if !reply.is_empty() {
+                        session.push("assistant", std::mem::take(&mut reply));
+                    }
+                }
+                AgentEvent::UserMessage { .. } => {}
             },
         ) {
             eprintln!("\n[agent error] {error}");
         }
+        if let Err(error) = store.save(&session) {
+            eprintln!("\n[session] cannot save: {error}");
+        }
         println!();
+    }
+    if !session.messages.is_empty() {
+        println!("\n[session] saved {}", session.id);
     }
 }
 
@@ -793,17 +949,34 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
         return None;
     }
     let json = arguments.iter().any(|argument| argument == "--json");
-    let prompt = arguments
-        .iter()
-        .filter(|argument| *argument != "--json")
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut prompt_parts = Vec::new();
+    let mut skip_next = false;
+    for argument in arguments {
+        if argument == "--session" {
+            skip_next = true;
+            continue;
+        }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if argument != "--json" {
+            prompt_parts.push(argument.clone());
+        }
+    }
+    let prompt = prompt_parts.join(" ");
     if prompt.trim().is_empty() {
         None
     } else {
         Some((prompt, json))
     }
+}
+
+fn extract_session_id(arguments: &[String]) -> Option<String> {
+    arguments
+        .windows(2)
+        .find(|window| window[0] == "--session")
+        .map(|window| window[1].clone())
 }
 
 fn run_one_shot_agent(agent: &mut Agent<ModelRouter>, prompt: &str, json: bool) {
@@ -1147,6 +1320,20 @@ mod tests {
         );
         assert_eq!(super::parse_one_shot_args(&[]), None);
         assert_eq!(super::parse_one_shot_args(&["--json".to_owned()]), None);
+        assert_eq!(
+            super::parse_one_shot_args(&[
+                "--session".to_owned(),
+                "s-1".to_owned(),
+                "--json".to_owned(),
+                "hi".to_owned()
+            ]),
+            Some(("hi".to_owned(), true))
+        );
+        assert_eq!(
+            super::extract_session_id(&["--session".to_owned(), "s-1".to_owned(), "hi".to_owned()]),
+            Some("s-1".to_owned())
+        );
+        assert_eq!(super::extract_session_id(&["hi".to_owned()]), None);
     }
 
     #[test]

@@ -969,6 +969,10 @@ where
         self
     }
 
+    pub fn set_conversation(&mut self, conversation: Vec<ConversationMessage>) {
+        self.conversation = conversation;
+    }
+
     pub fn with_route_request(mut self, route_request: RouteRequest) -> Self {
         self.route_request = route_request;
         self
