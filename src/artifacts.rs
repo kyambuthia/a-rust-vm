@@ -223,6 +223,10 @@ impl ArtifactStore {
         self.artifacts.get(id)
     }
 
+    pub fn artifacts(&self) -> Vec<&Artifact> {
+        self.artifacts.values().collect()
+    }
+
     pub fn version(&self, id: &str) -> Option<&ArtifactVersion> {
         self.versions.get(id)
     }

@@ -9,6 +9,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifacts::{
+    Artifact, ArtifactError, ArtifactStore, ArtifactVersion, NewArtifact, NewArtifactVersion,
+};
 use crate::runtime::{ResourceLimits, VmManager, VmManagerError, VmSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +70,8 @@ pub struct Observation {
 #[serde(rename_all = "snake_case")]
 pub enum AuditKind {
     WorkspaceCreated,
+    ArtifactCreated,
+    ArtifactVersionCreated,
     WorkspaceSuspended,
     WorkspaceResumed,
     CapabilityGranted,
@@ -91,6 +96,7 @@ pub struct WorkspaceView {
     pub state: WorkspaceState,
     pub runtime: VmSummary,
     pub capabilities: Vec<CapabilityGrant>,
+    pub artifacts: Vec<Artifact>,
     pub observations: Vec<Observation>,
     pub audit: Vec<AuditEvent>,
 }
@@ -100,6 +106,8 @@ struct WorkspaceRecord {
     id: String,
     owner: String,
     state: WorkspaceState,
+    #[serde(default)]
+    artifacts: ArtifactStore,
     capabilities: BTreeMap<String, CapabilityGrant>,
     observations: Vec<Observation>,
     audit: Vec<AuditEvent>,
@@ -180,6 +188,7 @@ impl ControlPlane {
             id: id.to_owned(),
             owner: owner.to_owned(),
             state: WorkspaceState::Active,
+            artifacts: ArtifactStore::default(),
             capabilities: BTreeMap::new(),
             observations: Vec::new(),
             audit: Vec::new(),
@@ -188,6 +197,91 @@ impl ControlPlane {
         record.audit.push(event);
         self.workspaces.insert(key, record);
         Ok(())
+    }
+
+    pub fn create_artifact(
+        &mut self,
+        owner: &str,
+        workspace_id: &str,
+        request: NewArtifact,
+    ) -> Result<Artifact, ControlPlaneError> {
+        if request.workspace_id != workspace_id {
+            return Err(ControlPlaneError::InvalidInput {
+                field: "artifact workspace id",
+            });
+        }
+        let sequence = self.next_sequence();
+        let record = self.record_mut(owner, workspace_id)?;
+        if record.state != WorkspaceState::Active {
+            return Err(ControlPlaneError::WorkspaceSuspended);
+        }
+        let artifact = record.artifacts.create_artifact(request)?;
+        record.audit.push(AuditEvent {
+            sequence,
+            workspace_id: workspace_id.to_owned(),
+            actor: owner.to_owned(),
+            kind: AuditKind::ArtifactCreated,
+            detail: format!("artifact created {}", artifact.id),
+        });
+        Ok(artifact)
+    }
+
+    pub fn append_artifact_version(
+        &mut self,
+        owner: &str,
+        workspace_id: &str,
+        request: NewArtifactVersion,
+    ) -> Result<ArtifactVersion, ControlPlaneError> {
+        let sequence = self.next_sequence();
+        let record = self.record_mut(owner, workspace_id)?;
+        if record.state != WorkspaceState::Active {
+            return Err(ControlPlaneError::WorkspaceSuspended);
+        }
+        let version = record.artifacts.create_version(request)?;
+        record.audit.push(AuditEvent {
+            sequence,
+            workspace_id: workspace_id.to_owned(),
+            actor: owner.to_owned(),
+            kind: AuditKind::ArtifactVersionCreated,
+            detail: format!(
+                "artifact version created {} for {}",
+                version.id, version.artifact_id
+            ),
+        });
+        Ok(version)
+    }
+
+    pub fn list_artifacts(
+        &self,
+        owner: &str,
+        workspace_id: &str,
+    ) -> Result<Vec<Artifact>, ControlPlaneError> {
+        Ok(self
+            .record(owner, workspace_id)?
+            .artifacts
+            .artifacts()
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    pub fn artifact_version_history(
+        &self,
+        owner: &str,
+        workspace_id: &str,
+        artifact_id: &str,
+    ) -> Result<Vec<ArtifactVersion>, ControlPlaneError> {
+        let artifacts = &self.record(owner, workspace_id)?.artifacts;
+        if artifacts.artifact(artifact_id).is_none() {
+            return Err(ControlPlaneError::Artifact(
+                ArtifactError::ArtifactNotFound(artifact_id.to_owned()),
+            ));
+        }
+        Ok(artifacts
+            .version_history(artifact_id)
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     pub fn grant_capability(
@@ -315,6 +409,7 @@ impl ControlPlane {
             state: record.state,
             runtime,
             capabilities: record.capabilities.values().cloned().collect(),
+            artifacts: record.artifacts.artifacts().into_iter().cloned().collect(),
             observations: record.observations.clone(),
             audit: record.audit.clone(),
         })
@@ -429,6 +524,7 @@ pub enum ControlPlaneError {
         action: String,
     },
     WorkspaceSuspended,
+    Artifact(ArtifactError),
     Runtime(String),
     UnsupportedSchema {
         expected: u32,
@@ -459,6 +555,7 @@ impl fmt::Display for ControlPlaneError {
                 "capability {capability_id} does not allow {action} on {resource}"
             ),
             Self::WorkspaceSuspended => f.write_str("workspace is suspended"),
+            Self::Artifact(error) => error.fmt(f),
             Self::Runtime(message) => f.write_str(message),
             Self::UnsupportedSchema { expected, actual } => write!(
                 f,
@@ -476,9 +573,16 @@ impl From<VmManagerError> for ControlPlaneError {
     }
 }
 
+impl From<ArtifactError> for ControlPlaneError {
+    fn from(error: ArtifactError) -> Self {
+        Self::Artifact(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityGrant, ControlPlane};
+    use super::{CapabilityGrant, ControlPlane, ControlPlaneSnapshot};
+    use crate::artifacts::{ArtifactKind, NewArtifact, NewArtifactVersion};
     use crate::runtime::ResourceLimits;
 
     #[test]
@@ -537,5 +641,68 @@ mod tests {
         let workspace = restored.inspect("alice", "research").unwrap();
         assert_eq!(workspace.capabilities.len(), 1);
         assert_eq!(workspace.runtime.process_count, 0);
+    }
+
+    #[test]
+    fn snapshots_restore_artifact_versions_and_legacy_snapshots_default_them() {
+        let limits = ResourceLimits::default();
+        let mut plane = ControlPlane::new(4, limits);
+        plane.create_workspace("alice", "research").unwrap();
+        plane
+            .create_artifact(
+                "alice",
+                "research",
+                NewArtifact::new(
+                    "budget",
+                    "research",
+                    "budget.xlsx",
+                    ArtifactKind::Source,
+                    "alice",
+                ),
+            )
+            .unwrap();
+        plane
+            .append_artifact_version(
+                "alice",
+                "research",
+                NewArtifactVersion::new(
+                    "budget-v1",
+                    "budget",
+                    "blob:budget-v1",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    120,
+                    "alice",
+                ),
+            )
+            .unwrap();
+
+        let restored = ControlPlane::restore(plane.snapshot(), 4, limits).unwrap();
+        let artifacts = restored.list_artifacts("alice", "research").unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].current_version_id.as_deref(),
+            Some("budget-v1")
+        );
+        assert_eq!(
+            restored
+                .artifact_version_history("alice", "research", "budget")
+                .unwrap()[0]
+                .content_reference,
+            "blob:budget-v1"
+        );
+
+        let mut legacy = serde_json::to_value(plane.snapshot()).unwrap();
+        legacy["workspaces"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifacts");
+        let legacy: ControlPlaneSnapshot = serde_json::from_value(legacy).unwrap();
+        let restored = ControlPlane::restore(legacy, 4, limits).unwrap();
+        assert!(
+            restored
+                .list_artifacts("alice", "research")
+                .unwrap()
+                .is_empty()
+        );
     }
 }
