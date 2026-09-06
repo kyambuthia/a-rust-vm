@@ -88,7 +88,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -777,6 +777,14 @@ fn run_live_agent(user_arguments: &[String]) {
         requires_streaming: true,
         ..RouteRequest::default()
     });
+    let policy = match build_permission_policy(user_arguments) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("[permission] {error}");
+            std::process::exit(2);
+        }
+    };
+    agent.set_permission_policy(policy);
     let mut route = agent.route_request().clone();
     let session_id = extract_session_id(user_arguments);
     if let Some((prompt, json)) = parse_one_shot_args(user_arguments) {
@@ -953,7 +961,7 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
     let mut prompt_parts = Vec::new();
     let mut skip_next = false;
     for argument in arguments {
-        if argument == "--session" {
+        if argument == "--session" || argument == "--rule" {
             skip_next = true;
             continue;
         }
@@ -978,6 +986,26 @@ fn extract_session_id(arguments: &[String]) -> Option<String> {
         .windows(2)
         .find(|window| window[0] == "--session")
         .map(|window| window[1].clone())
+}
+
+fn extract_permission_rule_texts(arguments: &[String]) -> Vec<String> {
+    arguments
+        .windows(2)
+        .filter(|window| window[0] == "--rule")
+        .map(|window| window[1].clone())
+        .collect()
+}
+
+fn build_permission_policy(
+    arguments: &[String],
+) -> Result<a_rust_vm::permissions::PermissionPolicy, String> {
+    let mut policy = a_rust_vm::permissions::PermissionPolicy::new();
+    for text in extract_permission_rule_texts(arguments) {
+        let rule = a_rust_vm::permissions::parse_permission_rule(&text)
+            .map_err(|error| format!("invalid --rule '{text}': {error}"))?;
+        policy.add_rule(rule);
+    }
+    Ok(policy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1368,6 +1396,47 @@ mod tests {
         assert_eq!(
             super::extract_one_shot_permission(&["hi".to_owned()]),
             super::OneShotPermission::Deny
+        );
+    }
+
+    #[test]
+    fn permission_rule_flags_are_extracted_and_excluded_from_prompt() {
+        let arguments = [
+            "--rule".to_owned(),
+            "allow write_file:notes.txt".to_owned(),
+            "--rule".to_owned(),
+            "deny run_command:rm".to_owned(),
+            "write".to_owned(),
+            "notes".to_owned(),
+        ];
+        assert_eq!(
+            super::extract_permission_rule_texts(&arguments),
+            vec![
+                "allow write_file:notes.txt".to_owned(),
+                "deny run_command:rm".to_owned(),
+            ]
+        );
+        assert_eq!(
+            super::parse_one_shot_args(&arguments),
+            Some(("write notes".to_owned(), false))
+        );
+        assert!(super::extract_permission_rule_texts(&["hi".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn permission_rule_flags_build_a_policy_or_fail_closed() {
+        let arguments = [
+            "--rule".to_owned(),
+            "deny run_command:rm".to_owned(),
+            "hi".to_owned(),
+        ];
+        let policy = super::build_permission_policy(&arguments).unwrap();
+        assert_eq!(
+            policy.decide("run_command", "rm -rf /tmp"),
+            a_rust_vm::permissions::PermissionEffect::Deny
+        );
+        assert!(
+            super::build_permission_policy(&["--rule".to_owned(), "permit x".to_owned()]).is_err()
         );
     }
 
