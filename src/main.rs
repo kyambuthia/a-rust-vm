@@ -41,6 +41,10 @@ fn main() {
         run_session_command(&arguments[1..]);
         return;
     }
+    if command == Some("permission") {
+        run_permission_command(&arguments[1..]);
+        return;
+    }
     if matches!(command, Some("run" | "check" | "disassemble" | "trace")) {
         run_program_command(command.expect("matched above"), &arguments[1..]);
         return;
@@ -88,7 +92,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -382,6 +386,167 @@ fn session_directory() -> std::path::PathBuf {
 
 fn session_usage() {
     eprintln!("usage: arvm session list|show <id>|save <id> <role> <content>");
+}
+
+fn permission_rules_path() -> std::path::PathBuf {
+    if let Some(directory) = env::var_os("A_RVM_STATE_DIR") {
+        return std::path::PathBuf::from(directory).join("rules.json");
+    }
+    if let Some(directory) = env::var_os("XDG_STATE_HOME") {
+        return std::path::PathBuf::from(directory).join("a-rust-vm/rules.json");
+    }
+    env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".local/state/a-rust-vm/rules.json")
+}
+
+fn load_stored_permission_policy(
+    path: &std::path::Path,
+) -> Result<a_rust_vm::permissions::PermissionPolicy, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(a_rust_vm::permissions::PermissionPolicy::new());
+        }
+        Err(error) => return Err(format!("cannot read permission rules: {error}")),
+    };
+    if bytes.is_empty() {
+        return Ok(a_rust_vm::permissions::PermissionPolicy::new());
+    }
+    let stored: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot decode permission rules: {error}"))?;
+    let mut policy = a_rust_vm::permissions::PermissionPolicy::new();
+    for text in stored {
+        let rule = a_rust_vm::permissions::parse_permission_rule(&text)
+            .map_err(|error| format!("invalid stored rule '{text}': {error}"))?;
+        policy.add_rule(rule);
+    }
+    Ok(policy)
+}
+
+fn save_stored_permission_rule_at(path: &std::path::Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create permission directory: {error}"))?;
+    }
+    let trimmed = text.trim().to_owned();
+    a_rust_vm::permissions::parse_permission_rule(&trimmed)
+        .map_err(|error| format!("invalid rule '{trimmed}': {error}"))?;
+    let mut stored: Vec<String> = match std::fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => Vec::new(),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("cannot decode permission rules: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("cannot read permission rules: {error}")),
+    };
+    for existing in &stored {
+        a_rust_vm::permissions::parse_permission_rule(existing)
+            .map_err(|error| format!("invalid stored rule '{existing}': {error}"))?;
+    }
+    stored.push(trimmed);
+    let content = serde_json::to_vec_pretty(&stored)
+        .map_err(|error| format!("cannot encode permission rules: {error}"))?;
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, content)
+        .map_err(|error| format!("cannot write permission rules: {error}"))?;
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("cannot save permission rules: {error}")
+    })
+}
+
+fn save_stored_permission_rule(text: &str) -> Result<(), String> {
+    let path = permission_rules_path();
+    save_stored_permission_rule_at(&path, text)
+}
+
+fn merged_permission_policy_at(
+    path: &std::path::Path,
+    arguments: &[String],
+) -> Result<a_rust_vm::permissions::PermissionPolicy, String> {
+    let mut policy = build_permission_policy(arguments)?;
+    for rule in load_stored_permission_policy(path)?.rules().to_vec() {
+        policy.add_rule(rule);
+    }
+    Ok(policy)
+}
+
+fn merged_permission_policy(
+    arguments: &[String],
+) -> Result<a_rust_vm::permissions::PermissionPolicy, String> {
+    merged_permission_policy_at(&permission_rules_path(), arguments)
+}
+
+fn permission_usage() {
+    eprintln!("usage: arvm permission list|add <rule>|clear");
+}
+
+fn run_permission_command(arguments: &[String]) {
+    let path = permission_rules_path();
+    let Some(command) = arguments.first().map(String::as_str) else {
+        permission_usage();
+        std::process::exit(2);
+    };
+    match command {
+        "list" => match load_stored_permission_policy(&path) {
+            Ok(policy) => {
+                if policy.rules().is_empty() {
+                    println!("(no rules)");
+                } else {
+                    for rule in policy.rules() {
+                        let effect = match rule.effect {
+                            a_rust_vm::permissions::PermissionEffect::Allow => "allow",
+                            a_rust_vm::permissions::PermissionEffect::Ask => "ask",
+                            a_rust_vm::permissions::PermissionEffect::Deny => "deny",
+                        };
+                        if rule.target_prefix.is_empty() {
+                            println!("{effect} {}", rule.tool);
+                        } else {
+                            println!("{effect} {}:{}", rule.tool, rule.target_prefix);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("[permission] {error}");
+                std::process::exit(1);
+            }
+        },
+        "add" => {
+            if arguments.len() != 2 {
+                permission_usage();
+                std::process::exit(2);
+            }
+            if let Err(error) = save_stored_permission_rule(&arguments[1]) {
+                eprintln!("[permission] {error}");
+                std::process::exit(1);
+            }
+            println!("saved rule");
+        }
+        "clear" => {
+            if arguments.len() != 1 {
+                permission_usage();
+                std::process::exit(2);
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => println!("cleared rules"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("(no rules)")
+                }
+                Err(error) => {
+                    eprintln!("[permission] cannot clear rules: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            permission_usage();
+            std::process::exit(2);
+        }
+    }
 }
 
 fn run_session_command(arguments: &[String]) {
@@ -777,7 +942,7 @@ fn run_live_agent(user_arguments: &[String]) {
         requires_streaming: true,
         ..RouteRequest::default()
     });
-    let policy = match build_permission_policy(user_arguments) {
+    let policy = match merged_permission_policy(user_arguments) {
         Ok(policy) => policy,
         Err(error) => {
             eprintln!("[permission] {error}");
@@ -1438,6 +1603,48 @@ mod tests {
         assert!(
             super::build_permission_policy(&["--rule".to_owned(), "permit x".to_owned()]).is_err()
         );
+    }
+
+    #[test]
+    fn durable_permission_rules_round_trip_missing_and_invalid() {
+        let path = std::env::temp_dir().join(format!(
+            "a-rvm-rules-{}-{}.json",
+            std::process::id(),
+            "round-trip"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let empty = super::load_stored_permission_policy(&path).unwrap();
+        assert!(empty.rules().is_empty());
+        super::save_stored_permission_rule_at(&path, "deny run_command:rm").unwrap();
+        let stored = super::load_stored_permission_policy(&path).unwrap();
+        assert_eq!(
+            stored.decide("run_command", "rm -rf /tmp"),
+            a_rust_vm::permissions::PermissionEffect::Deny
+        );
+        assert!(super::save_stored_permission_rule_at(&path, "permit write_file").is_err());
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(super::load_stored_permission_policy(&path).is_err());
+        std::fs::write(&path, b"[\"permit x\"]").unwrap();
+        assert!(super::load_stored_permission_policy(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cli_rules_take_precedence_over_stored_rules() {
+        let path = std::env::temp_dir().join(format!(
+            "a-rvm-rules-{}-{}.json",
+            std::process::id(),
+            "precedence"
+        ));
+        let _ = std::fs::remove_file(&path);
+        super::save_stored_permission_rule_at(&path, "deny write_file:notes.txt").unwrap();
+        let arguments = ["--rule".to_owned(), "allow write_file:notes.txt".to_owned()];
+        let policy = super::merged_permission_policy_at(&path, &arguments).unwrap();
+        assert_eq!(
+            policy.decide("write_file", "notes.txt"),
+            a_rust_vm::permissions::PermissionEffect::Allow
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

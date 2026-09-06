@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionEffect {
     Allow,
     Ask,
@@ -28,7 +31,7 @@ impl std::fmt::Display for PermissionError {
 
 impl std::error::Error for PermissionError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionRule {
     pub effect: PermissionEffect,
     pub tool: String,
@@ -91,7 +94,7 @@ pub fn parse_permission_rule(text: &str) -> Result<PermissionRule, PermissionErr
     })
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionPolicy {
     rules: Vec<PermissionRule>,
 }
@@ -107,6 +110,10 @@ impl PermissionPolicy {
 
     pub fn add_rule(&mut self, rule: PermissionRule) {
         self.rules.push(rule);
+    }
+
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
     }
 
     pub fn decide(&self, tool: &str, target: &str) -> PermissionEffect {
