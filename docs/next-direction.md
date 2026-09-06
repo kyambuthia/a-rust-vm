@@ -1,14 +1,15 @@
 # Next Direction Decision
 
-Decision: add a delegation depth guard to the `delegate_subagent` tool as a small P3 safety slice (next after the delegation tool in commit `61fd723`).
+Decision: add workspace-scoped additional directories to `workspace::Workspace` as a small P1 safety slice (next after the delegation depth guard in commit `64b4998`).
 
-Rationale: `SubagentTool` builds fresh child models/tools per call, so nothing stops a child registry from containing another `delegate_subagent` and recursing without bound on one thread. A thread-local depth counter checked against `SubagentConfig::max_depth` (default 1) fails closed on nested delegation without changing the model boundary, permission policy, workspace roots, session schema, CLI, or protocol.
+Rationale: `Workspace` currently allows exactly one canonicalized root, so child agents and jobs cannot be granted a bounded second directory without widening the primary root. Accepting an explicit list of additional canonicalized roots — with absolute paths permitted only when contained in an allowed root and relative paths still resolved under the primary root — extends the containment boundary without changing tool schemas, the model boundary, permission policy, session schema, CLI flags, or protocol.
 
 Plan (one small slice):
 
-1. Add `max_depth` to `agent::SubagentConfig` plus a depth-exceeded error surfaced as a tool error.
-2. Guard `SubagentTool::execute` with a thread-local counter that resets after each child turn.
-3. Add unit tests for blocked nesting, one allowed level with `max_depth: 2`, and counter reset across sequential calls.
-4. Verify with `cargo fmt -- --check`, `cargo test`, `cargo build --target wasm32-unknown-unknown --lib`, and `node --input-type=module --check < web/main.js`; commit as one conventional commit.
+1. Add `Workspace::with_additional_directories` plus `workspace_tool_registry_with_directories` and `coding_tool_registry_with_directories`, keeping `Workspace::new` behavior unchanged.
+2. Resolve relative paths under the primary root; accept absolute paths only when canonicalized inside an allowed root, failing closed otherwise.
+3. Reject duplicate or nested additional roots at construction so containment stays unambiguous.
+4. Add unit tests for reads/writes via an additional directory, rejection of paths outside all roots, and construction-time rejection of nested roots.
+5. Verify with `cargo fmt -- --check`, `cargo test`, `cargo build --target wasm32-unknown-unknown --lib`, and `node --input-type=module --check < web/main.js`; commit as one conventional commit.
 
-Explicitly out of this slice: persistent subagents with independent sessions, parent-child cancellation/message routing, MCP client/tools, workspace-scoped additional directories, skill auto-loading, ACP, permission-rule changes, session replay, deterministic VM replay, or small language/compiler work.
+Explicitly out of this slice: persistent subagents with independent sessions, parent-child cancellation/message routing, MCP client/tools, CLI flags for extra directories, skill auto-loading, ACP, permission-rule changes, session replay, deterministic VM replay, or small language/compiler work.
