@@ -1443,6 +1443,7 @@ pub struct SubagentResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubagentError {
     EmptyPrompt,
+    InvalidId,
     DepthLimitExceeded { limit: usize },
     Agent(AgentError),
 }
@@ -1451,6 +1452,7 @@ impl fmt::Display for SubagentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPrompt => formatter.write_str("subagent prompt must not be empty"),
+            Self::InvalidId => formatter.write_str("subagent id must not be empty"),
             Self::DepthLimitExceeded { limit } => {
                 write!(formatter, "subagent delegation depth exceeded: {limit}")
             }
@@ -1506,6 +1508,88 @@ where
         assistant_text,
         tool_calls,
     })
+}
+
+/// A persistent child session with its own independent conversation history.
+///
+/// Each `send` rehydrates a fresh [`Agent`] from the stored history, so a
+/// multi-step delegated task accumulates context while the parent-visible
+/// one-off `run_subagent` entry point keeps its stateless fail-closed shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSession {
+    id: String,
+    config: SubagentConfig,
+    history: Vec<ConversationMessage>,
+}
+
+impl SubagentSession {
+    pub fn new(id: impl Into<String>, config: SubagentConfig) -> Result<Self, SubagentError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(SubagentError::InvalidId);
+        }
+        Ok(Self {
+            id,
+            config,
+            history: Vec::new(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn history(&self) -> &[ConversationMessage] {
+        &self.history
+    }
+
+    pub fn send<M>(
+        &mut self,
+        model: M,
+        tools: ToolRegistry,
+        prompt: impl Into<String>,
+    ) -> Result<SubagentResult, SubagentError>
+    where
+        M: Model,
+    {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return Err(SubagentError::EmptyPrompt);
+        }
+        let mut agent = Agent::new(model, tools)
+            .with_max_steps(self.config.max_steps)
+            .with_max_tool_calls(self.config.max_tool_calls)
+            .with_context_limits(
+                self.config.max_context_messages,
+                self.config.max_context_chars,
+            );
+        if let Some(system_prompt) = self.config.system_prompt.clone() {
+            agent.set_system_prompt(system_prompt);
+        }
+        agent.set_conversation(self.history.clone());
+        let events = agent.run(prompt).map_err(SubagentError::Agent)?;
+        self.history = agent.conversation().to_vec();
+        let tool_calls = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCall(_)))
+            .count();
+        let mut assistant_text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::AssistantText { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if assistant_text.len() > self.config.max_transcript_chars {
+            assistant_text.truncate(self.config.max_transcript_chars);
+        }
+        Ok(SubagentResult {
+            events,
+            assistant_text,
+            tool_calls,
+        })
+    }
 }
 
 /// A parent-visible tool that delegates one bounded subtask to an isolated child.
@@ -3166,5 +3250,81 @@ mod tests {
             assert_eq!(result.content, "argument 'task' must be non-empty text");
         }
         assert_eq!(super::subagent_depth(), 0);
+    }
+
+    #[test]
+    fn persistent_session_rejects_blank_ids_and_prompts() {
+        use super::SubagentSession;
+        assert_eq!(
+            SubagentSession::new("   ", SubagentConfig::default()).unwrap_err(),
+            super::SubagentError::InvalidId
+        );
+        let mut session = SubagentSession::new("child-1", SubagentConfig::default()).unwrap();
+        assert_eq!(session.id(), "child-1");
+        assert!(session.history().is_empty());
+        let rejected = session.send(ScriptedModel::default(), vm_tool_registry().unwrap(), "   ");
+        assert_eq!(rejected.unwrap_err(), super::SubagentError::EmptyPrompt);
+        assert!(session.history().is_empty());
+    }
+
+    #[test]
+    fn persistent_session_accumulates_history_across_turns() {
+        use super::SubagentSession;
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut session = SubagentSession::new("child-1", SubagentConfig::default()).unwrap();
+        let first = session
+            .send(
+                RecordingModel {
+                    requests: requests.clone(),
+                    responses: [ModelResponse::Text("first reply".to_owned())]
+                        .into_iter()
+                        .collect(),
+                },
+                vm_tool_registry().unwrap(),
+                "first task",
+            )
+            .unwrap();
+        assert_eq!(first.assistant_text, "first reply");
+        assert_eq!(session.history().len(), 2);
+        let second = session
+            .send(
+                RecordingModel {
+                    requests: requests.clone(),
+                    responses: [ModelResponse::Text("second reply".to_owned())]
+                        .into_iter()
+                        .collect(),
+                },
+                vm_tool_registry().unwrap(),
+                "second task",
+            )
+            .unwrap();
+        assert_eq!(second.assistant_text, "second reply");
+        assert!(session.history().len() > 2);
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].conversation.iter().any(|message| {
+            message.content == "first task" || message.content == "first reply"
+        }));
+    }
+
+    #[test]
+    fn persistent_session_truncates_long_transcripts() {
+        use super::SubagentSession;
+        let mut session = SubagentSession::new(
+            "child-1",
+            SubagentConfig {
+                max_transcript_chars: 5,
+                ..SubagentConfig::default()
+            },
+        )
+        .unwrap();
+        let result = session
+            .send(
+                ScriptedModel::new([ModelResponse::Text("long reply".to_owned())]),
+                vm_tool_registry().unwrap(),
+                "task",
+            )
+            .unwrap();
+        assert_eq!(result.assistant_text, "long ");
     }
 }
