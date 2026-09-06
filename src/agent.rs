@@ -1007,6 +1007,10 @@ where
         self
     }
 
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
     pub fn set_conversation(&mut self, conversation: Vec<ConversationMessage>) {
         self.conversation = conversation;
     }
@@ -1515,12 +1519,21 @@ where
 /// Each `send` rehydrates a fresh [`Agent`] from the stored history, so a
 /// multi-step delegated task accumulates context while the parent-visible
 /// one-off `run_subagent` entry point keeps its stateless fail-closed shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SubagentSession {
     id: String,
     config: SubagentConfig,
     history: Vec<ConversationMessage>,
+    cancel: Arc<AtomicBool>,
 }
+
+impl PartialEq for SubagentSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.config == other.config && self.history == other.history
+    }
+}
+
+impl Eq for SubagentSession {}
 
 impl SubagentSession {
     pub fn new(id: impl Into<String>, config: SubagentConfig) -> Result<Self, SubagentError> {
@@ -1532,7 +1545,21 @@ impl SubagentSession {
             id,
             config,
             history: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn with_cancel_token(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
     }
 
     pub fn id(&self) -> &str {
@@ -1559,6 +1586,7 @@ impl SubagentSession {
         let mut agent = Agent::new(model, tools)
             .with_max_steps(self.config.max_steps)
             .with_max_tool_calls(self.config.max_tool_calls)
+            .with_cancel_token(self.cancel.clone())
             .with_context_limits(
                 self.config.max_context_messages,
                 self.config.max_context_chars,
@@ -3326,5 +3354,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.assistant_text, "long ");
+    }
+
+    #[test]
+    fn persistent_session_propagates_cancellation() {
+        use super::SubagentSession;
+        struct CallCountingModel {
+            calls: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl Model for CallCountingModel {
+            fn respond(&mut self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(ModelResponse::Text("should not run".to_owned()))
+            }
+        }
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let mut session = SubagentSession::new("child-1", SubagentConfig::default())
+            .unwrap()
+            .with_cancel_token(cancel);
+        let result = session
+            .send(
+                CallCountingModel {
+                    calls: calls.clone(),
+                },
+                vm_tool_registry().unwrap(),
+                "task",
+            )
+            .unwrap();
+
+        assert_eq!(calls.get(), 0);
+        assert!(result.assistant_text.is_empty());
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled))
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Done))
+        );
+        assert!(session.history().is_empty());
+    }
+
+    #[test]
+    fn persistent_session_shares_parent_cancel_token() {
+        use super::{Agent, SubagentSession};
+        let parent = Agent::new(
+            ScriptedModel::new([ModelResponse::Text("parent".to_owned())]),
+            vm_tool_registry().unwrap(),
+        );
+        let parent_token = parent.cancel_token();
+        let mut session = SubagentSession::new("child-1", SubagentConfig::default()).unwrap();
+        session = session.with_cancel_token(parent_token.clone());
+        assert!(std::sync::Arc::ptr_eq(
+            &session.cancel_token(),
+            &parent_token
+        ));
+
+        parent_token.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = session
+            .send(
+                ScriptedModel::new([ModelResponse::Text("child".to_owned())]),
+                vm_tool_registry().unwrap(),
+                "task",
+            )
+            .unwrap();
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled))
+        );
+    }
+
+    #[test]
+    fn persistent_session_cancel_stops_next_send() {
+        use super::SubagentSession;
+        let mut session = SubagentSession::new("child-1", SubagentConfig::default()).unwrap();
+        session.cancel();
+        let result = session
+            .send(
+                ScriptedModel::new([ModelResponse::Text("child".to_owned())]),
+                vm_tool_registry().unwrap(),
+                "task",
+            )
+            .unwrap();
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled))
+        );
+        assert!(session.history().is_empty());
     }
 }
