@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::content_store::ContentStore;
 use crate::control_plane::{ControlPlane, ControlPlaneError, ControlPlaneSnapshot};
 use crate::runtime::ResourceLimits;
 
@@ -28,6 +29,14 @@ impl ControlPlaneStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return the content-addressed blob store paired with this metadata store.
+    ///
+    /// Artifact versions retain only references into this store, which keeps the
+    /// durable control-plane snapshot small and makes byte retention explicit.
+    pub fn content_store(&self) -> ContentStore {
+        ContentStore::new(self.path.with_extension("blobs"))
     }
 
     pub fn load(&self) -> Result<ControlPlane, StoreError> {
@@ -122,6 +131,14 @@ mod tests {
             )
             .unwrap();
         store.save(&plane).unwrap();
+        let blob = store
+            .content_store()
+            .put(b"durable artifact bytes")
+            .unwrap();
+        assert_eq!(
+            store.content_store().get(&blob.reference).unwrap(),
+            b"durable artifact bytes"
+        );
         let restored = store.load().unwrap();
         assert_eq!(
             restored
