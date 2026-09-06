@@ -135,6 +135,25 @@ pub fn load_project_instructions(root: &Path) -> Result<Option<String>, std::io:
     }
 }
 
+/// Combine a base system prompt with explicitly loaded skill instructions.
+///
+/// Skill blocks are appended in caller order; empty blocks are ignored so a
+/// call with no skills returns the base prompt unchanged.
+pub fn system_prompt_with_skills(base: &str, skills: &[String]) -> String {
+    let blocks = skills
+        .iter()
+        .map(|skill| skill.trim())
+        .filter(|skill| !skill.is_empty())
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        return base.to_owned();
+    }
+    format!(
+        "{base}\n\nLoaded skills (follow this scoped guidance):\n{}",
+        blocks.join("\n\n")
+    )
+}
+
 /// Combine the baseline agent contract with project-local instructions.
 pub fn system_prompt_with_instructions(instructions: Option<&str>) -> String {
     match instructions.map(str::trim).filter(|text| !text.is_empty()) {
@@ -1678,7 +1697,7 @@ mod tests {
         Agent, AgentEvent, Model, ModelCapabilities, ModelError, ModelMode, ModelRequest,
         ModelResponse, ModelRouter, ModelStreamEvent, PermissionDecision, RouteRequest,
         ScriptedModel, ToolArguments, ToolCall, ToolRegistry, ToolValue, load_project_instructions,
-        system_prompt_with_instructions, vm_tool_registry,
+        system_prompt_with_instructions, system_prompt_with_skills, vm_tool_registry,
     };
 
     use std::cell::RefCell;
@@ -1946,6 +1965,25 @@ mod tests {
         assert!(prompt.contains("You are the A/RVM coding agent."));
         assert!(prompt.contains("Keep changes focused."));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loaded_skills_are_appended_in_order_or_ignored_when_empty() {
+        let base = "base prompt".to_owned();
+        assert_eq!(system_prompt_with_skills(&base, &[]), base);
+        assert_eq!(system_prompt_with_skills(&base, &["  ".to_owned()]), base);
+        let composed = system_prompt_with_skills(
+            &base,
+            &[
+                "# Skill: a\nfirst".to_owned(),
+                "# Skill: b\nsecond".to_owned(),
+            ],
+        );
+        assert!(composed.starts_with("base prompt"));
+        assert!(composed.contains("Loaded skills"));
+        assert!(composed.contains("first"));
+        assert!(composed.contains("second"));
+        assert!(composed.find("first").unwrap() < composed.find("second").unwrap());
     }
 
     #[test]

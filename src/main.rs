@@ -8,7 +8,7 @@ use serde::Deserialize;
 use a_rust_vm::agent::{
     Agent, AgentEvent, ConversationMessage, ModelCapabilities, ModelMode, ModelResponse,
     ModelRouter, ProcessModel, RouteRequest, ScriptedModel, ToolArguments, ToolCall, ToolValue,
-    load_project_instructions, system_prompt_with_instructions,
+    load_project_instructions, system_prompt_with_instructions, system_prompt_with_skills,
 };
 use a_rust_vm::program::Program;
 use a_rust_vm::session::{Session, SessionStore};
@@ -96,7 +96,7 @@ fn print_help() {
         "A/RVM - a deterministic stack VM and agent runtime\n\n\
 Usage: arvm <command> [options]\n\n\
 Core commands:\n  run <file|-> [--json]  Validate and execute assembly\n  check <file|->          Validate without executing\n  disassemble <file|->    Print stable instruction offsets\n  trace <file|->          Execute and print deterministic stack trace\n  demo                    Run the built-in VM example\n\n\
-Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  skill <command>         Discover and load project skills (list/show/load)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
+Product commands:\n  agent | ask              Interactive coding agent REPL\n  ask [--json] [--auto] [--rule <rule>]... [--skill <name>]... <prompt..>  One-shot prompt (exit after one turn)\n  serve                   Host the browser and agent API\n  session <command>       Manage local agent sessions (list/show/save/export)\n  skill <command>         Discover and load project skills (list/show/load)\n  permission <command>    Manage durable permission rules (list/add/clear)\n  workspace <command>     Manage durable owned workspaces\n  doctor [--json]         Report platform capabilities and readiness\n  version                 Print version information\n  help                    Show this help\n\n\
 Assembly is line-oriented. Instructions: PUSH <i32>, ADD, SUB, MUL, DIV, HALT.\n\
 Use '-' to read a program from standard input; '#' starts a comment."
     );
@@ -599,16 +599,7 @@ fn skill_roots_for(
 }
 
 fn skill_roots() -> Vec<std::path::PathBuf> {
-    let user_root = env::var_os("A_RVM_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|home| home.join(".config/a-rust-vm"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    skill_roots_for(&working_directory(), &user_root)
+    skill_roots_for(&working_directory(), &user_config_root())
 }
 
 fn run_skill_command(arguments: &[String]) {
@@ -1068,7 +1059,10 @@ fn run_live_agent(user_arguments: &[String]) {
         router,
         coding_tool_registry(&working_directory).expect("agent tools should register"),
     )
-    .with_system_prompt(workspace_system_prompt(&working_directory))
+    .with_system_prompt(workspace_system_prompt_with_skills(
+        &working_directory,
+        &load_requested_skills(&working_directory, user_arguments),
+    ))
     .with_route_request(RouteRequest {
         requires_tools: true,
         requires_streaming: true,
@@ -1258,7 +1252,7 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
     let mut prompt_parts = Vec::new();
     let mut skip_next = false;
     for argument in arguments {
-        if argument == "--session" || argument == "--rule" {
+        if argument == "--session" || argument == "--rule" || argument == "--skill" {
             skip_next = true;
             continue;
         }
@@ -1373,12 +1367,51 @@ fn run_one_shot_agent(
     }
 }
 
-fn workspace_system_prompt(root: &std::path::Path) -> String {
+fn extract_skill_names(arguments: &[String]) -> Vec<String> {
+    arguments
+        .windows(2)
+        .filter(|window| window[0] == "--skill")
+        .map(|window| window[1].clone())
+        .collect()
+}
+
+fn load_requested_skills(root: &std::path::Path, arguments: &[String]) -> Vec<String> {
+    let roots = skill_roots_for(root, &user_config_root());
+    extract_skill_names(arguments)
+        .iter()
+        .map(|name| {
+            a_rust_vm::skills::load_skill(&roots, name)
+                .map(|skill| skill.scoped_instructions())
+                .map_err(|error| format!("invalid --skill '{name}': {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| {
+            eprintln!("[skill] {error}");
+            std::process::exit(2);
+        })
+}
+
+fn user_config_root() -> std::path::PathBuf {
+    env::var_os("A_RVM_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".config/a-rust-vm"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn workspace_system_prompt_with_skills(root: &std::path::Path, skills: &[String]) -> String {
     let instructions = load_project_instructions(root).unwrap_or_else(|error| {
         eprintln!("[warning] project instructions unavailable: {error}");
         None
     });
-    system_prompt_with_instructions(instructions.as_deref())
+    system_prompt_with_skills(
+        &system_prompt_with_instructions(instructions.as_deref()),
+        skills,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1653,8 +1686,9 @@ fn working_directory() -> std::path::PathBuf {
 mod tests {
     use super::{
         BridgeResponse, check_artifact_byte_len, collect_runner_text, export_session,
-        format_session_json, format_session_text, parse_artifact_import_arguments,
-        parse_artifact_kind, parse_bridge_response, parse_session_export_args, skill_roots_for,
+        extract_skill_names, format_session_json, format_session_text,
+        parse_artifact_import_arguments, parse_artifact_kind, parse_bridge_response,
+        parse_session_export_args, skill_roots_for, workspace_system_prompt_with_skills,
     };
 
     #[test]
@@ -1695,6 +1729,47 @@ mod tests {
             super::extract_one_shot_permission(&["hi".to_owned()]),
             super::OneShotPermission::Deny
         );
+        assert_eq!(
+            super::parse_one_shot_args(&[
+                "--skill".to_owned(),
+                "review".to_owned(),
+                "do".to_owned(),
+                "x".to_owned()
+            ]),
+            Some(("do x".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn skill_flags_are_extracted_and_composed_into_prompt() {
+        let arguments = [
+            "--skill".to_owned(),
+            "review".to_owned(),
+            "do".to_owned(),
+            "x".to_owned(),
+        ];
+        assert_eq!(extract_skill_names(&arguments), vec!["review".to_owned()]);
+        assert!(extract_skill_names(&["hi".to_owned()]).is_empty());
+
+        let project =
+            std::env::temp_dir().join(format!("a-rvm-skill-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(project.join("skills").join("review")).unwrap();
+        std::fs::write(
+            project.join("skills").join("review").join("SKILL.md"),
+            "---\nname: review\ndescription: Review changes\n---\nCheck diffs.\n",
+        )
+        .unwrap();
+        let roots = skill_roots_for(
+            &project,
+            &std::env::temp_dir().join("a-rvm-skill-prompt-missing-user"),
+        );
+        let skill = a_rust_vm::skills::load_skill(&roots, "review").unwrap();
+        assert!(a_rust_vm::skills::load_skill(&roots, "missing").is_err());
+        let prompt = workspace_system_prompt_with_skills(&project, &[skill.scoped_instructions()]);
+        assert!(prompt.contains("Check diffs."));
+        assert!(prompt.contains("Loaded skills"));
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
