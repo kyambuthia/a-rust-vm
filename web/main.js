@@ -389,6 +389,9 @@ function printAgentEvent(event) {
     case "permission_requested":
       writeLine(`[permission] ${event.description}`, "error");
       break;
+    case "repeated_tool_call":
+      writeLine(`[agent] repeated tool call: ${event.tool} (x${event.count})`, "error");
+      break;
     case "error":
       writeLine(`[error] ${event.message}`, "error");
       break;

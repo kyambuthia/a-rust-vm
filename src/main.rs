@@ -524,6 +524,9 @@ fn run_agent_demo() {
                     AgentEvent::PermissionRequested(request) => {
                         println!("permission: {}", request.description)
                     }
+                    AgentEvent::RepeatedToolCall { tool, count } => {
+                        println!("repeated tool call: {tool} (x{count})")
+                    }
                     AgentEvent::Error { message } => println!("error: {message}"),
                     AgentEvent::Done => println!("done"),
                 }
@@ -765,6 +768,9 @@ fn run_live_agent() {
                 AgentEvent::ToolResult(result) => println!("[tool result] {}", result.content),
                 AgentEvent::PermissionRequested(request) => {
                     println!("[permission] {}", request.description)
+                }
+                AgentEvent::RepeatedToolCall { tool, count } => {
+                    println!("[agent] repeated tool call: {tool} (x{count})")
                 }
                 AgentEvent::Error { message } => println!("[error] {message}"),
                 AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
@@ -1028,6 +1034,9 @@ fn run_coding_demo() {
                     }
                     AgentEvent::PermissionRequested(request) => {
                         println!("permission: {}", request.description)
+                    }
+                    AgentEvent::RepeatedToolCall { tool, count } => {
+                        println!("repeated tool call: {tool} (x{count})")
                     }
                     AgentEvent::Error { message } => println!("error: {message}"),
                     AgentEvent::Done => println!("done"),
