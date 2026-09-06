@@ -1391,6 +1391,103 @@ fn format_tool_result(result: &ToolResult) -> String {
     )
 }
 
+/// Bounds for one delegated child turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentConfig {
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub max_context_messages: usize,
+    pub max_context_chars: usize,
+    pub system_prompt: Option<String>,
+    pub max_transcript_chars: usize,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: 4,
+            max_tool_calls: 8,
+            max_context_messages: DEFAULT_CONTEXT_MESSAGES,
+            max_context_chars: DEFAULT_CONTEXT_CHARS,
+            system_prompt: None,
+            max_transcript_chars: 4 * 1024,
+        }
+    }
+}
+
+/// Bounded transcript returned by one delegated child turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentResult {
+    pub events: Vec<AgentEvent>,
+    pub assistant_text: String,
+    pub tool_calls: usize,
+}
+
+/// Errors from one-off subagent delegation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentError {
+    EmptyPrompt,
+    Agent(AgentError),
+}
+
+impl fmt::Display for SubagentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPrompt => formatter.write_str("subagent prompt must not be empty"),
+            Self::Agent(error) => write!(formatter, "subagent turn failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SubagentError {}
+
+/// Run one bounded child turn with its own session and default-deny approvals.
+///
+/// The child starts with an empty conversation, so parent context never leaks
+/// in. The returned transcript is truncated to the configured character bound.
+pub fn run_subagent<M>(
+    model: M,
+    tools: ToolRegistry,
+    prompt: impl Into<String>,
+    config: SubagentConfig,
+) -> Result<SubagentResult, SubagentError>
+where
+    M: Model,
+{
+    let prompt = prompt.into();
+    if prompt.trim().is_empty() {
+        return Err(SubagentError::EmptyPrompt);
+    }
+    let mut agent = Agent::new(model, tools)
+        .with_max_steps(config.max_steps)
+        .with_max_tool_calls(config.max_tool_calls)
+        .with_context_limits(config.max_context_messages, config.max_context_chars);
+    if let Some(system_prompt) = config.system_prompt.clone() {
+        agent.set_system_prompt(system_prompt);
+    }
+    let events = agent.run(prompt).map_err(SubagentError::Agent)?;
+    let tool_calls = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCall(_)))
+        .count();
+    let mut assistant_text = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantText { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if assistant_text.len() > config.max_transcript_chars {
+        assistant_text.truncate(config.max_transcript_chars);
+    }
+    Ok(SubagentResult {
+        events,
+        assistant_text,
+        tool_calls,
+    })
+}
+
 #[derive(Debug, Default)]
 struct VmToolState {
     program: Vec<Instruction>,
@@ -1696,8 +1793,9 @@ mod tests {
     use super::{
         Agent, AgentEvent, Model, ModelCapabilities, ModelError, ModelMode, ModelRequest,
         ModelResponse, ModelRouter, ModelStreamEvent, PermissionDecision, RouteRequest,
-        ScriptedModel, ToolArguments, ToolCall, ToolRegistry, ToolValue, load_project_instructions,
-        system_prompt_with_instructions, system_prompt_with_skills, vm_tool_registry,
+        ScriptedModel, SubagentConfig, ToolArguments, ToolCall, ToolRegistry, ToolValue,
+        load_project_instructions, run_subagent, system_prompt_with_instructions,
+        system_prompt_with_skills, vm_tool_registry,
     };
 
     use std::cell::RefCell;
@@ -2606,5 +2704,99 @@ mod tests {
 
         assert_eq!(prompts, 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subagent_delegates_a_bounded_tool_turn() {
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new(
+                "run-1",
+                "run_program",
+                program_arguments("PUSH 2\nPUSH 3\nADD\nHALT"),
+            )),
+            ModelResponse::Text("The VM result is 5.".to_owned()),
+        ]);
+        let result = run_subagent(
+            model,
+            vm_tool_registry().unwrap(),
+            "add two and three",
+            SubagentConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_calls, 1);
+        assert_eq!(result.assistant_text, "The VM result is 5.");
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult(result) if result.content.contains("result=5")
+        )));
+    }
+
+    #[test]
+    fn subagent_rejects_empty_prompts_and_enforces_tool_limits() {
+        let empty = run_subagent(
+            ScriptedModel::default(),
+            vm_tool_registry().unwrap(),
+            "   ",
+            SubagentConfig::default(),
+        );
+        assert_eq!(empty.unwrap_err(), super::SubagentError::EmptyPrompt);
+
+        let limited = run_subagent(
+            ScriptedModel::new([
+                ModelResponse::ToolCall(ToolCall::new(
+                    "probe-1",
+                    "inspect_vm",
+                    ToolArguments::new(),
+                )),
+                ModelResponse::ToolCall(ToolCall::new(
+                    "probe-2",
+                    "inspect_vm",
+                    [("tag".to_owned(), ToolValue::Text("b".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                )),
+                ModelResponse::Text("unreachable".to_owned()),
+            ]),
+            vm_tool_registry().unwrap(),
+            "probe the VM",
+            SubagentConfig {
+                max_tool_calls: 1,
+                ..SubagentConfig::default()
+            },
+        );
+        assert_eq!(
+            limited.unwrap_err(),
+            super::SubagentError::Agent(super::AgentError::ToolCallLimitExceeded { limit: 1 })
+        );
+    }
+
+    #[test]
+    fn subagent_uses_an_isolated_session_and_prompt() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let model = RecordingModel {
+            requests: requests.clone(),
+            responses: [ModelResponse::Text("child reply".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let result = run_subagent(
+            model,
+            vm_tool_registry().unwrap(),
+            "child task",
+            SubagentConfig {
+                system_prompt: Some("child contract".to_owned()),
+                max_transcript_chars: 5,
+                ..SubagentConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.assistant_text, "child");
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].prompt, "child task");
+        assert_eq!(requests[0].system_prompt, "child contract");
+        assert!(requests[0].conversation.is_empty());
     }
 }
