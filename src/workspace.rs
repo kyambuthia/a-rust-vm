@@ -353,6 +353,7 @@ impl Tool for RunCommandTool {
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &["command"])?;
         let command = required_text(arguments, "command")?;
+        reject_dangerous_command(command)?;
         let workspace = self.workspace.borrow();
         let output = shell_command(command, workspace.root())?;
         Ok(format_command_output(&output))
@@ -381,6 +382,55 @@ fn shell_command(_command: &str, _directory: &Path) -> Result<std::process::Outp
     Err(ToolError::new(
         "command execution is unavailable on this target",
     ))
+}
+
+fn reject_dangerous_command(command: &str) -> Result<(), ToolError> {
+    if command
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<String>()
+        .contains(":(){:|:&};:")
+    {
+        return Err(ToolError::new(format!(
+            "refusing dangerous command '{command}'"
+        )));
+    }
+    let normalized = command.to_ascii_lowercase().replace([';', '&', '|'], " ");
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let joined = format!(" {} ", tokens.join(" "));
+    for binary in ["shutdown", "reboot", "halt", "poweroff", "mkfs"] {
+        if tokens.iter().any(|token| {
+            token == &binary || token.rsplit('/').next().is_some_and(|name| name == binary)
+        }) {
+            return Err(ToolError::new(format!(
+                "refusing dangerous command '{command}'"
+            )));
+        }
+    }
+    if tokens.iter().any(|token| *token == "dd") && joined.contains(" of=/dev/") {
+        return Err(ToolError::new(format!(
+            "refusing dangerous command '{command}'"
+        )));
+    }
+    let recursive = tokens.iter().any(|token| {
+        token.starts_with("-")
+            && token.contains('r')
+            && token.chars().skip(1).all(|flag| "rfRxivfp".contains(flag))
+    });
+    let removes_root = tokens.iter().any(|token| *token == "rm")
+        && recursive
+        && ["/", "/*", "/.", "~", "~/*", "$home", "$home/*"]
+            .iter()
+            .any(|target| joined.contains(&format!(" {target} ")));
+    if removes_root {
+        return Err(ToolError::new(format!(
+            "refusing dangerous command '{command}'"
+        )));
+    }
+    Ok(())
 }
 
 fn format_command_output(output: &std::process::Output) -> String {
@@ -630,6 +680,35 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("stdout:\nhello"));
         assert!(result.content.contains("exit_code=0"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dangerous_commands_fail_closed_before_execution() {
+        let root = test_root("dangerous");
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        for command in [
+            "rm -rf /",
+            "sudo rm -Rf /*",
+            "mkfs -t ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "shutdown now",
+            ":(){ :|:& };:",
+        ] {
+            let result = registry.execute(&ToolCall::new(
+                "blocked",
+                "run_command",
+                [("command".to_owned(), ToolValue::Text(command.to_owned()))]
+                    .into_iter()
+                    .collect(),
+            ));
+            assert!(result.is_error, "command should be refused: {command}");
+            assert!(
+                result.content.contains("refusing dangerous command"),
+                "unexpected content: {}",
+                result.content
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

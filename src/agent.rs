@@ -2439,6 +2439,47 @@ mod tests {
     }
 
     #[test]
+    fn allow_rule_does_not_override_dangerous_command_refusal() {
+        let root = std::env::temp_dir().join(format!(
+            "a-rust-vm-agent-dangerous-command-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let model = ScriptedModel::new([
+            ModelResponse::ToolCall(ToolCall::new(
+                "command-1",
+                "run_command",
+                [("command".to_owned(), ToolValue::Text("rm -rf /".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )),
+            ModelResponse::Text("done".to_owned()),
+        ]);
+        let policy = crate::permissions::PermissionPolicy::with_rules(vec![
+            crate::permissions::parse_permission_rule("allow run_command").unwrap(),
+        ]);
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        )
+        .with_permission_policy(policy);
+        let mut prompts = 0;
+
+        let events = agent
+            .run_with_approval("run a command", |_| {
+                prompts += 1;
+                PermissionDecision::Allow
+            })
+            .unwrap();
+
+        assert_eq!(prompts, 0);
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolResult(result) if result.is_error && result.content.contains("refusing dangerous command"))
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn host_allow_is_remembered_for_the_same_tool_and_target() {
         let root =
             std::env::temp_dir().join(format!("a-rust-vm-agent-remember-{}", std::process::id()));
