@@ -16,6 +16,13 @@ const DEFAULT_MAX_INODES: usize = 4_096;
 const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_PROCESSES: usize = 128;
 const DEFAULT_MAX_STEPS: usize = 100_000;
+const MAX_SNAPSHOT_ENTRIES: usize = 4_096;
+const MAX_SNAPSHOT_ENTRY_PATH_BYTES: usize = 4_096;
+const MAX_SNAPSHOT_PATH_COMPONENTS: usize = 128;
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SNAPSHOT_INODES: usize = 32_768;
+const MAX_SNAPSHOT_PROCESSES: usize = 512;
+const MAX_SNAPSHOT_STEPS: usize = 10_000_000;
 
 /// A guest process identifier. PIDs are scoped to one [`VmInstance`].
 pub type Pid = u32;
@@ -693,6 +700,7 @@ impl VmInstance {
                 ),
             });
         }
+        validate_snapshot_bounds(&snapshot)?;
         let mut vm = Self::with_limits(snapshot.id, snapshot.limits)?;
         let mut paths = BTreeSet::new();
         for entry in snapshot.entries {
@@ -925,6 +933,74 @@ impl VmInstance {
             }
         }
     }
+}
+
+fn validate_snapshot_bounds(snapshot: &VmSnapshot) -> Result<(), RuntimeError> {
+    if snapshot.id.is_empty()
+        || snapshot.id.len() > 128
+        || !snapshot.id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
+        })
+    {
+        return Err(RuntimeError::InvalidSnapshot {
+            reason: "VM id is invalid".to_owned(),
+        });
+    }
+    if snapshot.entries.len() > MAX_SNAPSHOT_ENTRIES {
+        return Err(RuntimeError::InvalidSnapshot {
+            reason: format!("too many filesystem entries: maximum is {MAX_SNAPSHOT_ENTRIES}"),
+        });
+    }
+    if snapshot.limits.max_inodes > MAX_SNAPSHOT_INODES {
+        return Err(RuntimeError::InvalidSnapshot {
+            reason: format!(
+                "inode limit exceeds snapshot maximum: maximum is {MAX_SNAPSHOT_INODES}"
+            ),
+        });
+    }
+    if snapshot.limits.max_bytes > MAX_SNAPSHOT_BYTES {
+        return Err(RuntimeError::InvalidSnapshot {
+            reason: format!("byte limit exceeds snapshot maximum: maximum is {MAX_SNAPSHOT_BYTES}"),
+        });
+    }
+    if snapshot.limits.max_processes > MAX_SNAPSHOT_PROCESSES {
+        return Err(RuntimeError::InvalidSnapshot {
+            reason: format!(
+                "process limit exceeds snapshot maximum: maximum is {MAX_SNAPSHOT_PROCESSES}"
+            ),
+        });
+    }
+    if snapshot.limits.max_steps > MAX_SNAPSHOT_STEPS {
+        return Err(RuntimeError::InvalidSnapshot {
+            reason: format!("step limit exceeds snapshot maximum: maximum is {MAX_SNAPSHOT_STEPS}"),
+        });
+    }
+
+    let mut total_bytes = 0usize;
+    for entry in &snapshot.entries {
+        if entry.path.len() > MAX_SNAPSHOT_ENTRY_PATH_BYTES {
+            return Err(RuntimeError::InvalidSnapshot {
+                reason: format!("snapshot path exceeds {MAX_SNAPSHOT_ENTRY_PATH_BYTES} bytes"),
+            });
+        }
+        let components = normalize_path(&entry.path, "/")?;
+        if components.len() > MAX_SNAPSHOT_PATH_COMPONENTS {
+            return Err(RuntimeError::InvalidSnapshot {
+                reason: format!("snapshot path exceeds {MAX_SNAPSHOT_PATH_COMPONENTS} components"),
+            });
+        }
+        total_bytes = total_bytes.checked_add(entry.bytes.len()).ok_or_else(|| {
+            RuntimeError::InvalidSnapshot {
+                reason: "snapshot byte count overflowed".to_owned(),
+            }
+        })?;
+        if total_bytes > MAX_SNAPSHOT_BYTES || total_bytes > snapshot.limits.max_bytes {
+            return Err(RuntimeError::InvalidSnapshot {
+                reason: "snapshot file bytes exceed the configured quota".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Errors from the ownership-aware VM manager.
@@ -1195,6 +1271,29 @@ mod tests {
         let mut snapshot = VmInstance::new("snapshot").snapshot();
         snapshot.schema_version += 1;
 
+        assert!(matches!(
+            VmInstance::from_snapshot(snapshot),
+            Err(RuntimeError::InvalidSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn vm_snapshot_rejects_untrusted_bounds() {
+        let mut snapshot = VmInstance::new("snapshot").snapshot();
+        snapshot.limits.max_bytes = super::MAX_SNAPSHOT_BYTES + 1;
+        assert!(matches!(
+            VmInstance::from_snapshot(snapshot),
+            Err(RuntimeError::InvalidSnapshot { .. })
+        ));
+
+        let mut snapshot = VmInstance::new("snapshot").snapshot();
+        snapshot.entries = (0..=super::MAX_SNAPSHOT_ENTRIES)
+            .map(|index| super::SnapshotEntry {
+                path: format!("/workspace/file-{index}"),
+                kind: super::SnapshotEntryKind::File,
+                bytes: Vec::new(),
+            })
+            .collect();
         assert!(matches!(
             VmInstance::from_snapshot(snapshot),
             Err(RuntimeError::InvalidSnapshot { .. })
