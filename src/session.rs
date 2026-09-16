@@ -2,7 +2,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 use serde::{Deserialize, Serialize};
 
@@ -48,13 +51,32 @@ impl Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionError {
     pub message: String,
+    kind: SessionErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionErrorKind {
+    Generic,
+    NotFound,
 }
 
 impl SessionError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: SessionErrorKind::Generic,
         }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: SessionErrorKind::NotFound,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.kind == SessionErrorKind::NotFound
     }
 }
 
@@ -94,9 +116,12 @@ impl SessionStore {
         let content = serde_json::to_vec_pretty(session)
             .map_err(|error| SessionError::new(format!("cannot encode session: {error}")))?;
         let target = self.path_for(&session.id);
-        let temporary = self
-            .directory
-            .join(format!(".{}.{}.tmp", session.id, std::process::id()));
+        let temporary = self.directory.join(format!(
+            ".{}.{}.{}.tmp",
+            session.id,
+            std::process::id(),
+            NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::write(&temporary, content).map_err(|error| {
             SessionError::new(format!("cannot write temporary session: {error}"))
         })?;
@@ -109,8 +134,13 @@ impl SessionStore {
     pub fn load(&self, id: &str) -> Result<Session, SessionError> {
         validate_id(id)?;
         let path = self.path_for(id);
-        let bytes = fs::read(&path)
-            .map_err(|error| SessionError::new(format!("cannot read session '{id}': {error}")))?;
+        let bytes = fs::read(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SessionError::not_found(format!("session '{id}' does not exist"))
+            } else {
+                SessionError::new(format!("cannot read session '{id}': {error}"))
+            }
+        })?;
         serde_json::from_slice(&bytes)
             .map_err(|error| SessionError::new(format!("cannot decode session '{id}': {error}")))
     }
@@ -186,5 +216,15 @@ mod tests {
     fn invalid_session_ids_cannot_escape_the_store() {
         assert!(Session::new("../outside").is_err());
         assert!(Session::new("with space").is_err());
+    }
+
+    #[test]
+    fn missing_sessions_are_distinguished_from_storage_failures() {
+        let directory = test_directory("missing");
+        let store = SessionStore::new(&directory);
+
+        let error = store.load("missing").unwrap_err();
+
+        assert!(error.is_not_found());
     }
 }

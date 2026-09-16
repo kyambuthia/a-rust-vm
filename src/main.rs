@@ -708,13 +708,17 @@ fn run_session_command(arguments: &[String]) {
             let content = &arguments[3];
             let mut session = match store.load(id) {
                 Ok(existing) => existing,
-                Err(_) => match Session::new(id.clone()) {
+                Err(error) if error.is_not_found() => match Session::new(id.clone()) {
                     Ok(created) => created,
                     Err(error) => {
                         eprintln!("[session] {error}");
                         std::process::exit(1);
                     }
                 },
+                Err(error) => {
+                    eprintln!("[session] cannot resume {id}: {error}");
+                    std::process::exit(1);
+                }
             };
             session.push(role.clone(), content.clone());
             if let Err(error) = store.save(&session) {
@@ -1098,10 +1102,7 @@ fn run_live_agent(user_arguments: &[String]) {
                 let conversation = existing
                     .messages
                     .iter()
-                    .map(|message| ConversationMessage {
-                        role: message.role.clone(),
-                        content: message.content.clone(),
-                    })
+                    .map(|message| ConversationMessage::new(&message.role, &message.content))
                     .collect::<Vec<_>>();
                 agent.set_conversation(conversation);
                 existing

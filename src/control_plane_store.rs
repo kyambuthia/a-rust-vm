@@ -2,10 +2,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_store::ContentStore;
 use crate::control_plane::{ControlPlane, ControlPlaneError, ControlPlaneSnapshot};
 use crate::runtime::ResourceLimits;
+
+static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneStore {
@@ -70,7 +73,11 @@ impl ControlPlaneStore {
         let bytes = serde_json::to_vec_pretty(&plane.snapshot()).map_err(|error| {
             StoreError::new(format!("cannot encode control-plane state: {error}"))
         })?;
-        let temporary = parent.join(format!(".control-plane.{}.tmp", std::process::id()));
+        let temporary = parent.join(format!(
+            ".control-plane.{}.{}.tmp",
+            std::process::id(),
+            NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::write(&temporary, bytes).map_err(|error| {
             StoreError::new(format!("cannot write '{}': {error}", temporary.display()))
         })?;
