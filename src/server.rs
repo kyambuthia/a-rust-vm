@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,8 @@ use crate::jobs::{
 };
 use crate::openrouter::OpenRouterModel;
 use crate::runtime::VmInstance;
+use crate::session_snapshot::SessionSnapshot;
+use crate::session_snapshot_store::SessionSnapshotStore;
 
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -157,6 +159,7 @@ struct SessionData {
     last_seen: Mutex<Instant>,
     agent_active: Mutex<bool>,
     agent_cancel: Arc<AtomicBool>,
+    state_lock: Mutex<()>,
     rate_window: Mutex<Instant>,
     rate_count: Mutex<usize>,
 }
@@ -164,6 +167,7 @@ struct SessionData {
 struct AnonStore {
     sessions: Mutex<BTreeMap<String, Arc<SessionData>>>,
     secure_cookie: bool,
+    snapshot_store: Option<Arc<SessionSnapshotStore>>,
 }
 
 struct ServerState {
@@ -299,13 +303,17 @@ impl Drop for AgentActivityGuard<'_> {
 impl AnonStore {
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_secure_cookie(false)
+        Self::with_snapshot_store(false, None)
     }
 
-    fn with_secure_cookie(secure_cookie: bool) -> Self {
+    fn with_snapshot_store(
+        secure_cookie: bool,
+        snapshot_store: Option<Arc<SessionSnapshotStore>>,
+    ) -> Self {
         Self {
             sessions: Mutex::new(BTreeMap::new()),
             secure_cookie,
+            snapshot_store,
         }
     }
     fn resolve(
@@ -336,6 +344,54 @@ impl AnonStore {
                     }
                 }
             }
+            if let Some(store) = &self.snapshot_store {
+                let current_timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                match store.load(owner, &raw) {
+                    Ok(Some(stored))
+                        if current_timestamp.saturating_sub(stored.last_seen_at)
+                            <= SESSION_TTL.as_secs() =>
+                    {
+                        if map.len() >= MAX_GLOBAL_SESSIONS {
+                            if let Some(oldest) = map
+                                .iter()
+                                .min_by_key(|(_, s)| *s.last_seen.lock().unwrap())
+                                .map(|(k, _)| k.clone())
+                            {
+                                map.remove(&oldest);
+                            }
+                        }
+                        let restored = stored
+                            .snapshot
+                            .restore()
+                            .map_err(|error| format!("cannot restore session: {error}"))?;
+                        let session = Arc::new(SessionData {
+                            id: restored.session_id,
+                            owner: restored.owner,
+                            vm: Arc::new(Mutex::new(restored.vm)),
+                            jobs: Arc::new(Mutex::new(restored.jobs)),
+                            approvals: Arc::new(ApprovalStore::default()),
+                            last_seen: Mutex::new(now),
+                            agent_active: Mutex::new(false),
+                            agent_cancel: Arc::new(AtomicBool::new(false)),
+                            state_lock: Mutex::new(()),
+                            rate_window: Mutex::new(now),
+                            rate_count: Mutex::new(0),
+                        });
+                        map.insert(raw, session.clone());
+                        return Ok((session, None));
+                    }
+                    Ok(Some(_)) => {
+                        store
+                            .remove(owner, &raw)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
         }
         #[allow(clippy::collapsible_if)]
         if map.len() >= MAX_GLOBAL_SESSIONS {
@@ -358,11 +414,24 @@ impl AnonStore {
             last_seen: Mutex::new(now),
             agent_active: Mutex::new(false),
             agent_cancel: Arc::new(AtomicBool::new(false)),
+            state_lock: Mutex::new(()),
             rate_window: Mutex::new(now),
             rate_count: Mutex::new(0),
         });
         map.insert(id.clone(), sess.clone());
         Ok((sess, Some(cookie_header(&id, self.secure_cookie))))
+    }
+
+    fn persist(&self, session: &SessionData) -> Result<(), String> {
+        let Some(store) = &self.snapshot_store else {
+            return Ok(());
+        };
+        let vm = lock_recover(&session.vm);
+        let jobs = lock_recover(&session.jobs);
+        let snapshot =
+            SessionSnapshot::capture(session.owner.clone(), session.id.clone(), &vm, &jobs)
+                .map_err(|error| error.to_string())?;
+        store.save(&snapshot).map_err(|error| error.to_string())
     }
 }
 
@@ -384,6 +453,8 @@ pub fn run(root: PathBuf) {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or_else(|| !matches!(bind_address.as_str(), "127.0.0.1" | "localhost" | "::1"));
+    let snapshot_store = env::var_os("A_RVM_SESSION_STATE_DIR")
+        .map(|directory| Arc::new(SessionSnapshotStore::new(directory)));
     let listener = TcpListener::bind((bind_address.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("failed to bind browser host on port {port}: {e}");
         std::process::exit(2);
@@ -400,13 +471,19 @@ pub fn run(root: PathBuf) {
         }
     };
     let state = Arc::new(ServerState {
-        anon: Arc::new(AnonStore::with_secure_cookie(secure_cookie)),
+        anon: Arc::new(AnonStore::with_snapshot_store(
+            secure_cookie,
+            snapshot_store,
+        )),
         model,
         global_agents: Arc::new(Mutex::new(0)),
         active_connections: Arc::new(Mutex::new(0)),
         require_authenticated_identity,
         allowed_origin,
     });
+    if state.anon.snapshot_store.is_some() {
+        println!("A/RVM runtime sessions: durable filesystem snapshots enabled");
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -509,6 +586,8 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         return;
     }
     *session.last_seen.lock().unwrap() = Instant::now();
+    let should_persist_runtime_state = persists_runtime_state(&request.method, &request.path);
+    let _state_guard = should_persist_runtime_state.then(|| lock_recover(&session.state_lock));
     match (request.method.as_str(), request.path.as_str()) {
         ("GET" | "HEAD", "/") => write_redirect(&mut stream, "/web/", set_cookie.as_deref()),
         ("GET" | "HEAD", "/web/") | ("GET" | "HEAD", "/web/index.html") => serve_file(
@@ -571,6 +650,24 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         }
         _ => write_error(&mut stream, 404, "not found", set_cookie.as_deref()),
     }
+    if should_persist_runtime_state && let Err(error) = state.anon.persist(&session) {
+        eprintln!(
+            "failed to persist runtime session '{}': {error}",
+            session.id
+        );
+    }
+}
+
+fn persists_runtime_state(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/api/agent"
+                | "/api/upload"
+                | "/api/apps/operate"
+                | "/api/tabulate"
+                | "/api/pdf/inspect"
+        )
 }
 
 fn authenticated_owner(
@@ -931,9 +1028,12 @@ fn handle_app_operation(
     };
     let job = match session.jobs.lock() {
         Ok(mut jobs) => {
-            let Some(job) =
-                jobs.try_start_builtin_app(&session.id, executor, input_path, MAX_JOBS_PER_SESSION)
-            else {
+            let Some(job) = jobs.try_start_builtin_app(
+                &session.owner,
+                executor,
+                input_path,
+                MAX_JOBS_PER_SESSION,
+            ) else {
                 drop(jobs);
                 write_error(stream, 400, "job limit exceeded", set_cookie);
                 return;
@@ -1079,7 +1179,8 @@ fn handle_tabulate(
     };
     let job = {
         let mut jobs = session.jobs.lock().unwrap();
-        let Some(j) = jobs.try_start_tabulation(&session.id, &request.path, MAX_JOBS_PER_SESSION)
+        let Some(j) =
+            jobs.try_start_tabulation(&session.owner, &request.path, MAX_JOBS_PER_SESSION)
         else {
             drop(jobs);
             write_error(stream, 400, "job limit exceeded", set_cookie);
@@ -1118,7 +1219,7 @@ fn handle_tabulate(
 
 fn handle_jobs(stream: &mut TcpStream, session: &Arc<SessionData>, set_cookie: Option<&str>) {
     let jobs = match session.jobs.lock() {
-        Ok(j) => j.list(&session.id),
+        Ok(j) => j.list(&session.owner),
         Err(_) => {
             write_error(stream, 500, "internal error", set_cookie);
             return;
@@ -1150,7 +1251,7 @@ fn handle_pdf_inspection(
     let job = {
         let mut jobs = session.jobs.lock().unwrap();
         let Some(j) =
-            jobs.try_start_pdf_inspection(&session.id, &request.path, MAX_JOBS_PER_SESSION)
+            jobs.try_start_pdf_inspection(&session.owner, &request.path, MAX_JOBS_PER_SESSION)
         else {
             drop(jobs);
             write_error(stream, 400, "job limit exceeded", set_cookie);
@@ -1422,6 +1523,7 @@ mod tests {
     use super::{ApprovalReply, ApprovalStore, guest_system_prompt, guest_upload_path};
     use crate::agent::PermissionDecision;
     use crate::runtime::VmInstance;
+    use crate::session_snapshot_store::SessionSnapshotStore;
     use std::io::{Cursor, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1622,7 +1724,7 @@ mod tests {
         a.jobs
             .lock()
             .unwrap()
-            .start_tabulation(&a.id, "/workspace/uploads/a.txt")
+            .start_tabulation(&a.owner, "/workspace/uploads/a.txt")
             .unwrap();
         a.approvals
             .resolve("perm-a".to_owned(), ApprovalReply::Allow)
@@ -1656,6 +1758,44 @@ mod tests {
                 .unwrap(),
             "secret-a"
         );
+    }
+
+    #[test]
+    fn durable_sessions_reload_guest_state_after_store_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("a-rust-vm-server-snapshot-{}", std::process::id()));
+        let snapshot_store = Arc::new(SessionSnapshotStore::new(&directory));
+        let store = super::AnonStore::with_snapshot_store(false, Some(snapshot_store.clone()));
+        let (session, cookie) = store.resolve(None, "alice").unwrap();
+        let cookie = cookie.unwrap();
+        {
+            let mut vm = session.vm.lock().unwrap();
+            vm.write_file("/workspace/notes.txt", "durable").unwrap();
+        }
+        session
+            .jobs
+            .lock()
+            .unwrap()
+            .start_tabulation(&session.owner, "/workspace/notes.txt")
+            .unwrap();
+        store.persist(&session).unwrap();
+
+        let restarted = super::AnonStore::with_snapshot_store(false, Some(snapshot_store));
+        let (restored, no_cookie) = restarted.resolve(Some(&cookie), "alice").unwrap();
+
+        assert!(no_cookie.is_none());
+        assert_eq!(restored.id, session.id);
+        assert_eq!(
+            restored
+                .vm
+                .lock()
+                .unwrap()
+                .read_text("/workspace/notes.txt")
+                .unwrap(),
+            "durable"
+        );
+        assert_eq!(restored.jobs.lock().unwrap().list("alice").len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
