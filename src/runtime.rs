@@ -5,10 +5,10 @@
 //! process table. It models the guest environment that agent tools can target;
 //! a later host adapter can place each instance behind an OS sandbox.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Instruction, StepResult, Vm, VmError};
 
@@ -73,6 +73,9 @@ pub enum RuntimeError {
     InvalidProgram {
         reason: String,
     },
+    InvalidSnapshot {
+        reason: String,
+    },
     QuotaExceeded {
         resource: &'static str,
         limit: usize,
@@ -115,6 +118,7 @@ impl fmt::Display for RuntimeError {
                 "invalid {resource} limit: minimum={minimum} actual={actual}"
             ),
             Self::InvalidProgram { reason } => write!(formatter, "invalid guest program: {reason}"),
+            Self::InvalidSnapshot { reason } => write!(formatter, "invalid VM snapshot: {reason}"),
             Self::QuotaExceeded { resource, limit } => {
                 write!(formatter, "guest {resource} quota exceeded: limit={limit}")
             }
@@ -145,6 +149,31 @@ impl From<VmError> for RuntimeError {
 enum Node {
     Directory(BTreeMap<String, Node>),
     File(Vec<u8>),
+}
+
+pub const VM_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotEntry {
+    pub path: String,
+    pub kind: SnapshotEntryKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmSnapshot {
+    pub schema_version: u32,
+    pub id: String,
+    pub limits: ResourceLimits,
+    pub entries: Vec<SnapshotEntry>,
 }
 
 /// The kind of a guest filesystem entry.
@@ -405,6 +434,34 @@ fn node_at_mut<'a>(root: &'a mut Node, components: &[String]) -> Option<&'a mut 
         })
 }
 
+fn collect_snapshot_entries(node: &Node, prefix: &str, entries: &mut Vec<SnapshotEntry>) {
+    let Node::Directory(children) = node else {
+        return;
+    };
+    for (name, child) in children {
+        let path = if prefix.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match child {
+            Node::Directory(_) => {
+                entries.push(SnapshotEntry {
+                    path: path.clone(),
+                    kind: SnapshotEntryKind::Directory,
+                    bytes: Vec::new(),
+                });
+                collect_snapshot_entries(child, &path, entries);
+            }
+            Node::File(bytes) => entries.push(SnapshotEntry {
+                path,
+                kind: SnapshotEntryKind::File,
+                bytes: bytes.clone(),
+            }),
+        }
+    }
+}
+
 fn normalize_path(path: &str, cwd: &str) -> Result<Vec<String>, RuntimeError> {
     if path.is_empty() || path.contains('\0') {
         return Err(RuntimeError::InvalidPath {
@@ -611,6 +668,57 @@ impl VmInstance {
 
     pub fn filesystem(&self) -> &VirtualFileSystem {
         &self.filesystem
+    }
+
+    /// Capture durable guest state. Live process queues and instruction
+    /// counters are intentionally excluded because they cannot be resumed
+    /// safely across a service restart.
+    pub fn snapshot(&self) -> VmSnapshot {
+        let mut entries = Vec::new();
+        collect_snapshot_entries(&self.filesystem.root, "", &mut entries);
+        VmSnapshot {
+            schema_version: VM_SNAPSHOT_SCHEMA_VERSION,
+            id: self.id.clone(),
+            limits: self.limits,
+            entries,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: VmSnapshot) -> Result<Self, RuntimeError> {
+        if snapshot.schema_version != VM_SNAPSHOT_SCHEMA_VERSION {
+            return Err(RuntimeError::InvalidSnapshot {
+                reason: format!(
+                    "unsupported VM snapshot schema: expected {} got {}",
+                    VM_SNAPSHOT_SCHEMA_VERSION, snapshot.schema_version
+                ),
+            });
+        }
+        let mut vm = Self::with_limits(snapshot.id, snapshot.limits)?;
+        let mut paths = BTreeSet::new();
+        for entry in snapshot.entries {
+            let components = normalize_path(&entry.path, "/")?;
+            if components.is_empty() || !paths.insert(display_path(&components)) {
+                return Err(RuntimeError::InvalidSnapshot {
+                    reason: format!("duplicate or root snapshot entry: {}", entry.path),
+                });
+            }
+            match entry.kind {
+                SnapshotEntryKind::Directory => {
+                    if !entry.bytes.is_empty() {
+                        return Err(RuntimeError::InvalidSnapshot {
+                            reason: format!("directory entry contains bytes: {}", entry.path),
+                        });
+                    }
+                    vm.mkdir(&entry.path, true)?;
+                }
+                SnapshotEntryKind::File => {
+                    let parent = display_path(&components[..components.len() - 1]);
+                    vm.mkdir(&parent, true)?;
+                    vm.write_file(&entry.path, entry.bytes)?;
+                }
+            }
+        }
+        Ok(vm)
     }
 
     pub fn process_info(&self, pid: Pid) -> Result<ProcessInfo, RuntimeError> {
@@ -1056,6 +1164,40 @@ mod tests {
                 resource: "file bytes",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn vm_snapshots_round_trip_files_and_empty_directories() {
+        let mut vm = VmInstance::new("snapshot");
+        vm.mkdir("/workspace/empty", true).unwrap();
+        vm.write_file("/workspace/notes.txt", b"hello").unwrap();
+        vm.spawn(
+            None,
+            add_program(),
+            vec!["ignored-after-restart".to_owned()],
+        )
+        .unwrap();
+
+        let encoded = serde_json::to_vec(&vm.snapshot()).unwrap();
+        let restored =
+            VmInstance::from_snapshot(serde_json::from_slice(&encoded).unwrap()).unwrap();
+
+        assert_eq!(restored.id(), "snapshot");
+        assert_eq!(restored.read_text("/workspace/notes.txt").unwrap(), "hello");
+        assert!(restored.list_dir("/workspace/empty").unwrap().is_empty());
+        assert_eq!(restored.process_count(), 0);
+        assert_eq!(restored.snapshot(), vm.snapshot());
+    }
+
+    #[test]
+    fn vm_snapshot_rejects_unknown_schema() {
+        let mut snapshot = VmInstance::new("snapshot").snapshot();
+        snapshot.schema_version += 1;
+
+        assert!(matches!(
+            VmInstance::from_snapshot(snapshot),
+            Err(RuntimeError::InvalidSnapshot { .. })
         ));
     }
 

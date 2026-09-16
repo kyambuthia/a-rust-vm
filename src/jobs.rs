@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::runtime::{RuntimeError, VmInstance};
 
@@ -16,7 +16,7 @@ const MAX_TABLE_COLUMNS: usize = 256;
 const PREVIEW_ROWS: usize = 10;
 const PREVIEW_CELL_CHARS: usize = 160;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Queued,
@@ -25,7 +25,7 @@ pub enum JobState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub id: String,
     pub owner: String,
@@ -43,7 +43,52 @@ pub struct JobStore {
     jobs: Vec<JobRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStoreSnapshot {
+    pub next_id: u64,
+    pub jobs: Vec<JobRecord>,
+}
+
 impl JobStore {
+    pub fn snapshot(&self) -> JobStoreSnapshot {
+        JobStoreSnapshot {
+            next_id: self.next_id,
+            jobs: self.jobs.clone(),
+        }
+    }
+
+    pub fn from_snapshot(mut snapshot: JobStoreSnapshot) -> Result<Self, String> {
+        let mut ids = BTreeSet::new();
+        let mut highest_id = 0;
+        for job in &mut snapshot.jobs {
+            if !ids.insert(job.id.clone()) {
+                return Err(format!("duplicate job id in snapshot: {}", job.id));
+            }
+            let Some(sequence) = job.id.strip_prefix("job-") else {
+                return Err(format!("invalid job id in snapshot: {}", job.id));
+            };
+            let sequence = sequence
+                .parse::<u64>()
+                .map_err(|_| format!("invalid job id in snapshot: {}", job.id))?;
+            if sequence == 0 {
+                return Err(format!("invalid job id in snapshot: {}", job.id));
+            }
+            highest_id = highest_id.max(sequence);
+            if matches!(job.state, JobState::Queued | JobState::Running) {
+                job.state = JobState::Failed;
+                job.error = Some("job interrupted by service restart".to_owned());
+                job.output_path = None;
+            }
+        }
+        if snapshot.next_id < highest_id {
+            return Err("job counter is behind a stored job".to_owned());
+        }
+        Ok(Self {
+            next_id: snapshot.next_id,
+            jobs: snapshot.jobs,
+        })
+    }
+
     pub fn start_tabulation(&mut self, owner: &str, input_path: &str) -> JobRecord {
         self.start(owner, "builtin.tabulate.v1", input_path)
     }
@@ -417,7 +462,9 @@ fn parse_delimited(input: &str, delimiter: char) -> Result<Vec<Vec<String>>, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{JobState, JobStore, inspect_uploaded_pdf, tabulate_uploaded_file};
+    use super::{
+        JobState, JobStore, JobStoreSnapshot, inspect_uploaded_pdf, tabulate_uploaded_file,
+    };
     use crate::runtime::VmInstance;
 
     #[test]
@@ -478,6 +525,33 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.list("local").len(), 1);
+    }
+
+    #[test]
+    fn restoring_jobs_fails_in_flight_work_closed() {
+        let mut store = JobStore::default();
+        let job = store
+            .try_start_tabulation("alice", "/workspace/uploads/a.csv", 4)
+            .unwrap();
+        store.mark_running(&job.id);
+
+        let restored = JobStore::from_snapshot(store.snapshot()).unwrap();
+        let jobs = restored.list("alice");
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(
+            job.error.as_deref(),
+            Some("job interrupted by service restart")
+        );
+        assert!(
+            JobStore::from_snapshot(JobStoreSnapshot {
+                next_id: 1,
+                jobs: vec![job.clone(), job.clone()],
+            })
+            .is_err()
+        );
     }
 
     #[test]

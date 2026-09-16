@@ -26,6 +26,7 @@ pub mod program;
 pub mod protocol;
 pub mod runtime;
 pub mod session;
+pub mod session_snapshot;
 pub mod skills;
 pub mod workspace;
 
