@@ -106,7 +106,8 @@ impl SessionSnapshot {
             });
         }
         let vm = VmInstance::from_snapshot(self.vm).map_err(SessionSnapshotError::Runtime)?;
-        let jobs = JobStore::from_snapshot(self.jobs).map_err(SessionSnapshotError::Jobs)?;
+        let mut jobs = JobStore::from_snapshot(self.jobs).map_err(SessionSnapshotError::Jobs)?;
+        jobs.reconcile_output_paths(&vm);
         Ok(RestoredSession {
             owner: self.owner,
             session_id: self.session_id,

@@ -15,6 +15,7 @@ const MAX_TABLE_ROWS: usize = 50_000;
 const MAX_TABLE_COLUMNS: usize = 256;
 const PREVIEW_ROWS: usize = 10;
 const PREVIEW_CELL_CHARS: usize = 160;
+const MAX_JOB_SNAPSHOT_RECORDS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +59,11 @@ impl JobStore {
     }
 
     pub fn from_snapshot(mut snapshot: JobStoreSnapshot) -> Result<Self, String> {
+        if snapshot.jobs.len() > MAX_JOB_SNAPSHOT_RECORDS {
+            return Err(format!(
+                "too many jobs in snapshot: maximum is {MAX_JOB_SNAPSHOT_RECORDS}"
+            ));
+        }
         let mut ids = BTreeSet::new();
         let mut highest_id = 0;
         for job in &mut snapshot.jobs {
@@ -87,6 +93,21 @@ impl JobStore {
             next_id: snapshot.next_id,
             jobs: snapshot.jobs,
         })
+    }
+
+    pub(crate) fn reconcile_output_paths(&mut self, vm: &VmInstance) {
+        for job in &mut self.jobs {
+            if job.state == JobState::Succeeded
+                && job
+                    .output_path
+                    .as_deref()
+                    .is_none_or(|path| vm.read_file(path).is_err())
+            {
+                job.state = JobState::Failed;
+                job.output_path = None;
+                job.error = Some("job output missing after service restart".to_owned());
+            }
+        }
     }
 
     pub fn start_tabulation(&mut self, owner: &str, input_path: &str) -> Result<JobRecord, String> {
@@ -642,6 +663,53 @@ mod tests {
                 .is_none()
         );
         assert!(store.list("alice").is_empty());
+    }
+
+    #[test]
+    fn restoring_jobs_rejects_unbounded_history() {
+        let jobs = (1..=super::MAX_JOB_SNAPSHOT_RECORDS as u64 + 1)
+            .map(|id| crate::jobs::JobRecord {
+                id: format!("job-{id}"),
+                owner: "alice".to_owned(),
+                executor: "builtin.tabulate.v1".to_owned(),
+                input_path: "/workspace/uploads/input.csv".to_owned(),
+                output_path: None,
+                state: JobState::Failed,
+                error: Some("test".to_owned()),
+            })
+            .collect();
+        assert!(
+            JobStore::from_snapshot(JobStoreSnapshot {
+                next_id: super::MAX_JOB_SNAPSHOT_RECORDS as u64 + 1,
+                jobs,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn restoring_jobs_fails_when_a_success_output_is_missing() {
+        let mut store = JobStore::default();
+        let job = store
+            .try_start_tabulation("alice", "/workspace/uploads/input.csv", 1)
+            .unwrap();
+        assert!(store.mark_running(&job.id));
+        assert!(
+            store
+                .finish(&job.id, Ok("/workspace/output/missing.json"))
+                .is_some()
+        );
+
+        let mut restored = JobStore::from_snapshot(store.snapshot()).unwrap();
+        restored.reconcile_output_paths(&VmInstance::new("session"));
+
+        let job = &restored.list("alice")[0];
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.output_path, None);
+        assert_eq!(
+            job.error.as_deref(),
+            Some("job output missing after service restart")
+        );
     }
 
     #[test]
