@@ -1,8 +1,10 @@
 import * as cdk from "aws-cdk-lib";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import * as elbv2Actions from "aws-cdk-lib/aws-elasticloadbalancingv2-actions";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
@@ -58,13 +60,13 @@ export class ARvmStack extends cdk.Stack {
 
     const cluster = new ecs.Cluster(this, "Cluster", {
       vpc,
-      containerInsights: true,
+      containerInsightsV2: ecs.ContainerInsights.ENABLED,
     });
 
     const albSg = new ec2.SecurityGroup(this, "AlbSg", {
       vpc,
       description: "ALB security group",
-      allowAllOutbound: true,
+      allowAllOutbound: false,
     });
     albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), "HTTP");
     albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), "HTTPS");
@@ -76,6 +78,8 @@ export class ARvmStack extends cdk.Stack {
     });
     taskSg.addIngressRule(albSg, ec2.Port.tcp(8080), "ALB to task 8080");
     taskSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), "OpenRouter HTTPS egress");
+    albSg.addEgressRule(taskSg, ec2.Port.tcp(8080), "ALB to task 8080");
+    albSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), "Cognito HTTPS authentication");
 
     const executionRole = new iam.Role(this, "ExecutionRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
@@ -114,6 +118,7 @@ export class ARvmStack extends cdk.Stack {
         A_RVM_SECURE_COOKIES: "true",
         A_RVM_WEB_PORT: "8080",
         A_RVM_BIND_ADDRESS: "0.0.0.0",
+        A_RVM_REQUIRE_AUTH: "true",
       },
       secrets: {
         OPENROUTER_API_KEY: ecs.Secret.fromSecretsManager(secret),
@@ -129,22 +134,6 @@ export class ARvmStack extends cdk.Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
     });
 
-    const httpsListener = alb.addListener("HttpsListener", {
-      port: 443,
-      protocol: elbv2.ApplicationProtocol.HTTPS,
-      certificates: [elbv2.ListenerCertificate.fromArn(props.certificateArn)],
-    });
-
-    alb.addListener("HttpListener", {
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-      defaultAction: elbv2.ListenerAction.redirect({
-        protocol: "HTTPS",
-        port: "443",
-        permanent: true,
-      }),
-    });
-
     const service = new ecs.FargateService(this, "Service", {
       cluster,
       taskDefinition,
@@ -158,7 +147,8 @@ export class ARvmStack extends cdk.Stack {
       maxHealthyPercent: 200,
     });
 
-    const targetGroup = httpsListener.addTargets("EcsTargets", {
+    const targetGroup = new elbv2.ApplicationTargetGroup(this, "EcsTargets", {
+      vpc,
       port: 8080,
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [service],
@@ -174,7 +164,75 @@ export class ARvmStack extends cdk.Stack {
       deregistrationDelay: cdk.Duration.seconds(30),
     });
 
-    void targetGroup;
+    const userPool = new cognito.UserPool(this, "UserPool", {
+      userPoolName: "a-rust-vm-users",
+      selfSignUpEnabled: true,
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      passwordPolicy: {
+        minLength: 12,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: true,
+      },
+      mfa: cognito.Mfa.OPTIONAL,
+      mfaSecondFactor: { sms: false, otp: true },
+      deletionProtection: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    const userPoolClient = userPool.addClient("AlbClient", {
+      userPoolClientName: "a-rust-vm-alb",
+      generateSecret: true,
+      authFlows: { userPassword: true },
+      preventUserExistenceErrors: true,
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL],
+        callbackUrls: [`https://${props.domainName}/oauth2/idpresponse`],
+        logoutUrls: [`https://${props.domainName}/`],
+      },
+      idTokenValidity: cdk.Duration.minutes(5),
+      accessTokenValidity: cdk.Duration.minutes(5),
+      refreshTokenValidity: cdk.Duration.days(7),
+      refreshTokenRotationGracePeriod: cdk.Duration.seconds(10),
+      enableTokenRevocation: true,
+    });
+
+    const userPoolDomain = new cognito.UserPoolDomain(this, "UserPoolDomain", {
+      userPool,
+      cognitoDomain: {
+        domainPrefix: `a-rvm-${this.account}-${props.region}`,
+      },
+    });
+
+    const httpsListener = alb.addListener("HttpsListener", {
+      port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
+      certificates: [elbv2.ListenerCertificate.fromArn(props.certificateArn)],
+      defaultAction: new elbv2Actions.AuthenticateCognitoAction({
+        userPool,
+        userPoolClient,
+        userPoolDomain,
+        sessionCookieName: "ARVMAuthSession",
+        sessionTimeout: cdk.Duration.hours(8),
+        scope: "openid email",
+        next: elbv2.ListenerAction.forward([targetGroup]),
+      }),
+    });
+
+    alb.addListener("HttpListener", {
+      port: 80,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      defaultAction: elbv2.ListenerAction.redirect({
+        protocol: "HTTPS",
+        port: "443",
+        permanent: true,
+      }),
+    });
 
     const webAcl = new wafv2.CfnWebACL(this, "WebAcl", {
       scope: "REGIONAL",
@@ -228,6 +286,9 @@ export class ARvmStack extends cdk.Stack {
     new cdk.CfnOutput(this, "AlbDnsName", { value: alb.loadBalancerDnsName });
     new cdk.CfnOutput(this, "EcrRepositoryUri", { value: repository.repositoryUri });
     new cdk.CfnOutput(this, "ServiceName", { value: service.serviceName });
+    new cdk.CfnOutput(this, "CognitoUserPoolId", { value: userPool.userPoolId });
+    new cdk.CfnOutput(this, "CognitoAppClientId", { value: userPoolClient.userPoolClientId });
+    new cdk.CfnOutput(this, "CognitoDomain", { value: userPoolDomain.domainName });
 
     cdk.Tags.of(this).add("Project", "a-rust-vm");
   }
