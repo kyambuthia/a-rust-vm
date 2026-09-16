@@ -646,11 +646,12 @@ impl VmInstance {
         program: Vec<Instruction>,
         argv: Vec<String>,
     ) -> Result<Pid, RuntimeError> {
-        if program.is_empty() {
-            return Err(RuntimeError::InvalidProgram {
-                reason: "program cannot be empty".to_owned(),
-            });
-        }
+        let program = crate::program::Program::new(program)
+            .map_err(|error| RuntimeError::InvalidProgram {
+                reason: error.to_string(),
+            })?
+            .instructions()
+            .to_vec();
         if self.processes.len() >= self.limits.max_processes {
             return Err(RuntimeError::ProcessLimitReached {
                 limit: self.limits.max_processes,
@@ -708,39 +709,43 @@ impl VmInstance {
         if self.ticks >= self.limits.max_steps {
             return None;
         }
-        let pid = self.runnable.pop_front()?;
-        let process = self.processes.get_mut(&pid)?;
-        if !matches!(process.state, ProcessState::Ready) {
-            return self.tick();
+        while let Some(pid) = self.runnable.pop_front() {
+            let Some(process) = self.processes.get_mut(&pid) else {
+                continue;
+            };
+            if !matches!(process.state, ProcessState::Ready) {
+                continue;
+            }
+            process.state = ProcessState::Running;
+            let instruction_pointer = process.vm.instruction_pointer();
+            let result = process.vm.step(&process.program);
+            self.ticks = self.ticks.saturating_add(1);
+            return match result {
+                Ok(StepResult::Executed { instruction }) => {
+                    let stack = process.vm.stack().to_vec();
+                    process.state = ProcessState::Ready;
+                    self.runnable.push_back(pid);
+                    Some(ProcessEvent::InstructionExecuted {
+                        pid,
+                        instruction_pointer,
+                        instruction,
+                        stack,
+                    })
+                }
+                Ok(StepResult::Halted { result }) => {
+                    process.state = ProcessState::Exited { code: result };
+                    Some(ProcessEvent::ProcessExited { pid, code: result })
+                }
+                Err(error) => {
+                    let error = format!("{error:?}");
+                    process.state = ProcessState::Failed {
+                        error: error.clone(),
+                    };
+                    Some(ProcessEvent::ProcessFailed { pid, error })
+                }
+            };
         }
-        process.state = ProcessState::Running;
-        let instruction_pointer = process.vm.instruction_pointer();
-        let result = process.vm.step(&process.program);
-        self.ticks = self.ticks.saturating_add(1);
-        match result {
-            Ok(StepResult::Executed { instruction }) => {
-                let stack = process.vm.stack().to_vec();
-                process.state = ProcessState::Ready;
-                self.runnable.push_back(pid);
-                Some(ProcessEvent::InstructionExecuted {
-                    pid,
-                    instruction_pointer,
-                    instruction,
-                    stack,
-                })
-            }
-            Ok(StepResult::Halted { result }) => {
-                process.state = ProcessState::Exited { code: result };
-                Some(ProcessEvent::ProcessExited { pid, code: result })
-            }
-            Err(error) => {
-                let error = format!("{error:?}");
-                process.state = ProcessState::Failed {
-                    error: error.clone(),
-                };
-                Some(ProcessEvent::ProcessFailed { pid, error })
-            }
-        }
+        None
     }
 
     pub fn run_until_idle(&mut self, max_ticks: usize) -> Result<Vec<ProcessEvent>, RuntimeError> {
@@ -754,10 +759,15 @@ impl VmInstance {
                     limit: self.limits.max_steps,
                 });
             }
-            let event = self
-                .tick()
-                .expect("a ready process should produce an event before the step limit");
-            events.push(event);
+            match self.tick() {
+                Some(event) => events.push(event),
+                None if self.runnable.is_empty() => return Ok(events),
+                None => {
+                    return Err(RuntimeError::ExecutionLimitExceeded {
+                        limit: self.limits.max_steps,
+                    });
+                }
+            }
         }
         if self.runnable.is_empty() {
             Ok(events)
@@ -1081,10 +1091,42 @@ mod tests {
     }
 
     #[test]
+    fn spawn_rejects_programs_that_fail_structural_validation() {
+        let mut vm = VmInstance::new("validation");
+
+        assert!(matches!(
+            vm.spawn(None, vec![Instruction::Push(1)], vec![]),
+            Err(RuntimeError::InvalidProgram { .. })
+        ));
+        assert_eq!(vm.process_count(), 0);
+    }
+
+    #[test]
+    fn scheduler_discards_processes_exited_by_syscall() {
+        let mut vm = VmInstance::new("stale-queue");
+        let pid = vm
+            .spawn(
+                None,
+                vec![Instruction::Push(0), Instruction::Halt],
+                vec!["exit".to_owned()],
+            )
+            .unwrap();
+
+        vm.syscall(pid, Syscall::Exit { code: 0 }).unwrap();
+
+        assert_eq!(vm.run_until_idle(1), Ok(Vec::new()));
+        assert_eq!(vm.wait(pid), Ok(WaitStatus::Exited { code: 0 }));
+    }
+
+    #[test]
     fn syscalls_use_the_callers_guest_working_directory() {
         let mut vm = VmInstance::new("syscalls");
         let pid = vm
-            .spawn(None, vec![Instruction::Halt], vec!["init".to_owned()])
+            .spawn(
+                None,
+                vec![Instruction::Push(0), Instruction::Halt],
+                vec!["init".to_owned()],
+            )
             .unwrap();
         vm.syscall(
             pid,
@@ -1124,7 +1166,11 @@ mod tests {
     fn process_can_spawn_and_poll_a_child() {
         let mut vm = VmInstance::new("processes");
         let parent = vm
-            .spawn(None, vec![Instruction::Halt], vec!["parent".to_owned()])
+            .spawn(
+                None,
+                vec![Instruction::Push(0), Instruction::Halt],
+                vec!["parent".to_owned()],
+            )
             .unwrap();
         let child = match vm
             .syscall(
