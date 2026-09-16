@@ -282,12 +282,12 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = discover_skills(&[root.clone()]).unwrap();
+        let discovered = discover_skills(std::slice::from_ref(&root)).unwrap();
         assert_eq!(discovered.len(), 2);
         assert_eq!(discovered[0].name, "a-skill");
         assert_eq!(discovered[1].name, "b-skill");
-        assert!(load_skill(&[root.clone()], "missing").is_err());
-        assert!(load_skill(&[root.clone()], "bad name!").is_err());
+        assert!(load_skill(std::slice::from_ref(&root), "missing").is_err());
+        assert!(load_skill(std::slice::from_ref(&root), "bad name!").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -297,7 +297,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         skill_directory("mismatch", &root, "somesill", VALID);
-        assert!(load_skill(&[root.clone()], "somesill").is_err());
+        assert!(load_skill(std::slice::from_ref(&root), "somesill").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
