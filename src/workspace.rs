@@ -2,10 +2,16 @@
 
 use std::cell::RefCell;
 use std::fs;
+#[cfg(any(unix, windows))]
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(unix, windows))]
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
+#[cfg(any(unix, windows))]
+use std::thread;
+#[cfg(any(unix, windows))]
+use std::time::{Duration, Instant};
 
 use crate::agent::{
     PermissionRequest, Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ToolValue,
@@ -14,6 +20,8 @@ use crate::agent::{
 const MAX_FILE_BYTES: usize = 128 * 1024;
 const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_COMMAND_RUNTIME: Duration = Duration::from_secs(30);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Errors from workspace initialization or path resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,19 +480,90 @@ impl Tool for RunCommandTool {
 
 #[cfg(any(unix, windows))]
 fn shell_command(command: &str, directory: &Path) -> Result<std::process::Output, ToolError> {
-    #[cfg(unix)]
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(directory)
-        .output();
-    #[cfg(windows)]
-    let output = Command::new("cmd")
-        .args(["/C", command])
-        .current_dir(directory)
-        .output();
+    shell_command_with_timeout(command, directory, MAX_COMMAND_RUNTIME)
+}
 
-    output.map_err(|error| ToolError::new(format!("failed to run command: {error}")))
+#[cfg(any(unix, windows))]
+fn shell_command_with_timeout(
+    command: &str,
+    directory: &Path,
+    timeout: Duration,
+) -> Result<std::process::Output, ToolError> {
+    #[cfg(unix)]
+    let mut process = Command::new("sh");
+    #[cfg(windows)]
+    let mut process = Command::new("cmd");
+    #[cfg(unix)]
+    process.args(["-c", command]);
+    #[cfg(windows)]
+    process.args(["/C", command]);
+    process.current_dir(directory);
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = process
+        .spawn()
+        .map_err(|error| ToolError::new(format!("failed to run command: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::new("command stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::new("command stderr is unavailable"))?;
+    let stdout_reader = thread::spawn(|| bounded_pipe_output(stdout));
+    let stderr_reader = thread::spawn(|| bounded_pipe_output(stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(COMMAND_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ToolError::new("command exceeded the 30 second limit"));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ToolError::new(format!("failed to finish command: {error}")));
+            }
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ToolError::new("command stdout reader failed"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ToolError::new("command stderr reader failed"))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn bounded_pipe_output(mut pipe: impl Read) -> Vec<u8> {
+    let mut captured = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes) => {
+                if captured.len() < MAX_COMMAND_OUTPUT_BYTES {
+                    let remaining = MAX_COMMAND_OUTPUT_BYTES - captured.len();
+                    captured.extend_from_slice(&buffer[..bytes.min(remaining)]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    captured
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -520,7 +599,7 @@ fn reject_dangerous_command(command: &str) -> Result<(), ToolError> {
             )));
         }
     }
-    if tokens.iter().any(|token| *token == "dd") && joined.contains(" of=/dev/") {
+    if tokens.contains(&"dd") && joined.contains(" of=/dev/") {
         return Err(ToolError::new(format!(
             "refusing dangerous command '{command}'"
         )));
@@ -530,7 +609,7 @@ fn reject_dangerous_command(command: &str) -> Result<(), ToolError> {
             && token.contains('r')
             && token.chars().skip(1).all(|flag| "rfRxivfp".contains(flag))
     });
-    let removes_root = tokens.iter().any(|token| *token == "rm")
+    let removes_root = tokens.contains(&"rm")
         && recursive
         && ["/", "/*", "/.", "~", "~/*", "$home", "$home/*"]
             .iter()
@@ -796,6 +875,22 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn command_tool_terminates_a_command_that_exceeds_its_deadline() {
+        let root = test_root("command-timeout");
+
+        let error = super::shell_command_with_timeout(
+            "sleep 5",
+            &root,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeded"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn additional_directories_allow_absolute_access_and_reject_outsiders() {
         let root = test_root("extra-primary");
@@ -803,7 +898,7 @@ mod tests {
         let outside = test_root("extra-outside");
         std::fs::write(extra.join("shared.txt"), "shared\n").unwrap();
         let mut registry =
-            workspace_tool_registry_with_directories(&root, &[extra.clone()]).unwrap();
+            workspace_tool_registry_with_directories(&root, std::slice::from_ref(&extra)).unwrap();
         let absolute = extra.join("shared.txt").display().to_string();
 
         let read = registry.execute(&ToolCall::new(
@@ -847,7 +942,9 @@ mod tests {
         assert!(rejected.is_error);
         assert!(rejected.content.contains("path escapes the workspace"));
 
-        assert!(Workspace::with_additional_directories(&root, &[root.clone()]).is_err());
+        assert!(
+            Workspace::with_additional_directories(&root, std::slice::from_ref(&root)).is_err()
+        );
         std::fs::create_dir_all(root.join("nested")).unwrap();
         assert!(Workspace::with_additional_directories(&root, &[root.join("nested")]).is_err());
 

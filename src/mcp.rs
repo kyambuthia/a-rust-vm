@@ -1,13 +1,18 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 pub const MAX_MCP_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_MCP_PAGES: usize = 16;
+const MAX_MCP_TIMEOUT_SECS: u64 = 300;
+const MAX_MCP_STDERR_BYTES: usize = 16 * 1024;
+const MCP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -116,19 +121,60 @@ impl McpClient {
         method: &str,
         params: BTreeMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value, McpError> {
-        let mut child = spawn_server(&self.config)?;
-        let mut reader = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| McpError::new("mcp server stdout is unavailable"))?,
-        );
+        let child = spawn_server(&self.config)?;
+        let mut child = McpChildGuard::new(child);
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::new("mcp server stdout is unavailable"))?;
         let mut stdin = child
+            .child
             .stdin
             .take()
             .ok_or_else(|| McpError::new("mcp server stdin is unavailable"))?;
-        let timeout = Duration::from_secs(self.config.timeout.unwrap_or(30).max(1));
-        let deadline = std::time::Instant::now() + timeout;
+        let stderr = child
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| McpError::new("mcp server stderr is unavailable"))?;
+        let timeout = Duration::from_secs(
+            self.config
+                .timeout
+                .unwrap_or(30)
+                .clamp(1, MAX_MCP_TIMEOUT_SECS),
+        );
+        let deadline = Instant::now() + timeout;
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let message = read_bounded_line(&mut reader);
+                let should_stop = message.is_err();
+                if line_tx.send(message).is_err() || should_stop {
+                    break;
+                }
+            }
+        });
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut pipe = stderr;
+            let mut captured = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(bytes) => {
+                        if captured.len() < MAX_MCP_STDERR_BYTES {
+                            let remaining = MAX_MCP_STDERR_BYTES - captured.len();
+                            captured.extend_from_slice(&buffer[..bytes.min(remaining)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stderr_tx.send(String::from_utf8_lossy(&captured).into_owned());
+        });
         let mut next_id = 1;
         let initialize = serde_json::json!({
             "jsonrpc": "2.0",
@@ -142,15 +188,12 @@ impl McpClient {
         });
         next_id += 1;
         write_line(&mut stdin, &initialize)?;
-        let first = read_bounded_line(&mut reader)?;
+        let first = receive_line(&line_rx, deadline, "initialize")?;
         let first_value: serde_json::Value = serde_json::from_str(&first).map_err(|error| {
             McpError::new(format!("mcp initialize response is invalid: {error}"))
         })?;
         require_result(&first_value, "initialize")?;
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err(McpError::new(format!("mcp {method} timed out")));
-        }
+        ensure_before_deadline(deadline, method)?;
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": next_id,
@@ -159,25 +202,18 @@ impl McpClient {
         });
         write_line(&mut stdin, &request)?;
         drop(stdin);
-        let line = read_bounded_line(&mut reader)?;
+        let line = receive_line(&line_rx, deadline, method)?;
         let value: serde_json::Value = serde_json::from_str(&line)
             .map_err(|error| McpError::new(format!("mcp {method} response is invalid: {error}")))?;
         if let Some(error) = value.get("error") {
-            let _ = child.wait();
             return Err(McpError::new(format!(
                 "mcp {method} failed: {}",
                 compact_json(error)
             )));
         }
-        let status = child
-            .wait()
-            .map_err(|error| McpError::new(format!("failed to finish mcp server: {error}")))?;
+        let status = child.wait_until(deadline, method)?;
         if !status.success() {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                let mut limited = pipe.by_ref().take(1024);
-                let _ = limited.read_to_string(&mut stderr);
-            }
+            let stderr = stderr_rx.recv().unwrap_or_default();
             let detail = stderr.trim();
             if detail.is_empty() {
                 return Err(McpError::new(format!("mcp server exited with {status}")));
@@ -356,6 +392,87 @@ fn spawn_server(config: &McpConfig) -> Result<std::process::Child, McpError> {
     })
 }
 
+fn receive_line(
+    receiver: &mpsc::Receiver<Result<String, McpError>>,
+    deadline: Instant,
+    method: &str,
+) -> Result<String, McpError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(McpError::new(format!("mcp {method} timed out")));
+    }
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(line)) => Ok(line),
+        Ok(Err(error)) => Err(error),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(McpError::new(format!("mcp {method} timed out")))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(McpError::new("mcp server output reader stopped"))
+        }
+    }
+}
+
+fn ensure_before_deadline(deadline: Instant, method: &str) -> Result<(), McpError> {
+    if Instant::now() >= deadline {
+        Err(McpError::new(format!("mcp {method} timed out")))
+    } else {
+        Ok(())
+    }
+}
+
+struct McpChildGuard {
+    child: Child,
+    waited: bool,
+}
+
+impl McpChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            waited: false,
+        }
+    }
+
+    fn wait_until(&mut self, deadline: Instant, method: &str) -> Result<ExitStatus, McpError> {
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.waited = true;
+                    return Ok(status);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(MCP_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    self.waited = true;
+                    return Err(McpError::new(format!("mcp {method} timed out")));
+                }
+                Err(error) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    self.waited = true;
+                    return Err(McpError::new(format!(
+                        "failed to finish mcp server: {error}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for McpChildGuard {
+    fn drop(&mut self) {
+        if !self.waited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.waited = true;
+        }
+    }
+}
+
 fn write_line(
     stdin: &mut std::process::ChildStdin,
     value: &serde_json::Value,
@@ -517,6 +634,23 @@ mod tests {
             timeout: None,
         };
         assert!(McpClient::new(bad_env).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_reads_are_bounded_by_the_configured_timeout() {
+        let client = McpClient::new(McpConfig {
+            command: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "read request; sleep 5".to_owned()],
+            env: Vec::new(),
+            working_directory: None,
+            timeout: Some(1),
+        })
+        .unwrap();
+
+        let error = client.list_tools().unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]
