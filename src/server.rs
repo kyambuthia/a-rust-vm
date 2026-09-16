@@ -150,6 +150,7 @@ pub struct ApprovalStore {
 
 struct SessionData {
     id: String,
+    owner: String,
     vm: Arc<Mutex<VmInstance>>,
     jobs: Arc<Mutex<JobStore>>,
     approvals: Arc<ApprovalStore>,
@@ -170,6 +171,7 @@ struct ServerState {
     model: Option<OpenRouterModel>,
     global_agents: Arc<Mutex<usize>>,
     active_connections: Arc<Mutex<usize>>,
+    require_authenticated_identity: bool,
     allowed_origin: String,
 }
 
@@ -309,6 +311,7 @@ impl AnonStore {
     fn resolve(
         &self,
         cookie_header_value: Option<&str>,
+        owner: &str,
     ) -> Result<(Arc<SessionData>, Option<String>), String> {
         let now = Instant::now();
         let mut map = self.sessions.lock().expect("anon store poisoned");
@@ -324,11 +327,13 @@ impl AnonStore {
         if let Some(raw) = cookie_header_value.and_then(extract_sid) {
             if is_valid_sid_format(&raw) {
                 if let Some(sess) = map.get(&raw).cloned() {
-                    if now.duration_since(*sess.last_seen.lock().unwrap()) <= SESSION_TTL {
-                        *sess.last_seen.lock().unwrap() = now;
-                        return Ok((sess, None));
+                    if sess.owner == owner {
+                        if now.duration_since(*sess.last_seen.lock().unwrap()) <= SESSION_TTL {
+                            *sess.last_seen.lock().unwrap() = now;
+                            return Ok((sess, None));
+                        }
+                        map.remove(&raw);
                     }
-                    map.remove(&raw);
                 }
             }
         }
@@ -346,6 +351,7 @@ impl AnonStore {
             .ok_or_else(|| "secure anonymous session generation unavailable".to_owned())?;
         let sess = Arc::new(SessionData {
             id: id.clone(),
+            owner: owner.to_owned(),
             vm: Arc::new(Mutex::new(VmInstance::new(id.clone()))),
             jobs: Arc::new(Mutex::new(JobStore::default())),
             approvals: Arc::new(ApprovalStore::default()),
@@ -374,6 +380,10 @@ pub fn run(root: PathBuf) {
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or_else(|| allowed_origin.starts_with("https://"));
     let bind_address = env::var("A_RVM_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let require_authenticated_identity = env::var("A_RVM_REQUIRE_AUTH")
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or_else(|| !matches!(bind_address.as_str(), "127.0.0.1" | "localhost" | "::1"));
     let listener = TcpListener::bind((bind_address.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("failed to bind browser host on port {port}: {e}");
         std::process::exit(2);
@@ -394,6 +404,7 @@ pub fn run(root: PathBuf) {
         model,
         global_agents: Arc::new(Mutex::new(0)),
         active_connections: Arc::new(Mutex::new(0)),
+        require_authenticated_identity,
         allowed_origin,
     });
     for stream in listener.incoming() {
@@ -446,6 +457,17 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
     };
     let cookie_val = request.headers.get("cookie").map(|s| s.as_str());
     let is_state_changing = matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    if request.method == "GET" && request.path == "/healthz" {
+        write_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", None);
+        return;
+    }
+    let owner = match authenticated_owner(&request.headers, state.require_authenticated_identity) {
+        Ok(owner) => owner,
+        Err(error) => {
+            write_error(&mut stream, 401, &error, None);
+            return;
+        }
+    };
     if is_state_changing && !check_origin(&request.headers, &state.allowed_origin) {
         write_error(&mut stream, 403, "origin not allowed", None);
         return;
@@ -457,11 +479,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         write_error(&mut stream, 401, "anonymous session required", None);
         return;
     }
-    if request.method == "GET" && request.path == "/healthz" {
-        write_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", None);
-        return;
-    }
-    let (session, set_cookie) = match state.anon.resolve(cookie_val) {
+    let (session, set_cookie) = match state.anon.resolve(cookie_val, &owner) {
         Ok(value) => value,
         Err(_) => {
             write_error(&mut stream, 503, "anonymous sessions unavailable", None);
@@ -553,6 +571,28 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         }
         _ => write_error(&mut stream, 404, "not found", set_cookie.as_deref()),
     }
+}
+
+fn authenticated_owner(
+    headers: &BTreeMap<String, String>,
+    required: bool,
+) -> Result<String, String> {
+    if !required {
+        return Ok("anonymous".to_owned());
+    }
+    let identity = headers
+        .get("x-amzn-oidc-identity")
+        .filter(|identity| is_valid_authenticated_identity(identity))
+        .ok_or_else(|| "authentication required".to_owned())?;
+    Ok(identity.clone())
+}
+
+fn is_valid_authenticated_identity(identity: &str) -> bool {
+    !identity.is_empty()
+        && identity.len() <= 128
+        && identity.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
+        })
 }
 
 fn handle_system_info(stream: &mut TcpStream, state: &ServerState, set_cookie: Option<&str>) {
@@ -1475,7 +1515,7 @@ mod tests {
     #[test]
     fn uploaded_office_files_are_read_outside_the_guest_vm_as_bounded_artifacts() {
         let store = super::AnonStore::new();
-        let (session, _) = store.resolve(None).unwrap();
+        let (session, _) = store.resolve(None, "anonymous").unwrap();
         let docx = archive(&[(
             "word/document.xml",
             "<w:document><w:body><w:p><w:r><w:t>Imported plan</w:t></w:r></w:p></w:body></w:document>",
@@ -1534,6 +1574,31 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_owner_requires_a_valid_alb_identity() {
+        let headers = std::collections::BTreeMap::new();
+        assert_eq!(
+            super::authenticated_owner(&headers, true),
+            Err("authentication required".to_owned())
+        );
+
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("x-amzn-oidc-identity".to_owned(), "user-a".to_owned());
+        assert_eq!(
+            super::authenticated_owner(&headers, true),
+            Ok("user-a".to_owned())
+        );
+        headers.insert("x-amzn-oidc-identity".to_owned(), "user a".to_owned());
+        assert_eq!(
+            super::authenticated_owner(&headers, true),
+            Err("authentication required".to_owned())
+        );
+        assert_eq!(
+            super::authenticated_owner(&headers, false),
+            Ok("anonymous".to_owned())
+        );
+    }
+
+    #[test]
     fn production_cookie_can_be_marked_secure() {
         let secure = crate::anon_session::cookie_header("a", true);
         let local = crate::anon_session::cookie_header("a", false);
@@ -1545,7 +1610,7 @@ mod tests {
     #[test]
     fn anonymous_sessions_are_isolated() {
         let store = super::AnonStore::new();
-        let (a, cookie_a) = store.resolve(None).unwrap();
+        let (a, cookie_a) = store.resolve(None, "anonymous").unwrap();
         let cookie_a = cookie_a.expect("first session should set cookie");
         let sid_a = crate::anon_session::extract_sid(&cookie_a).unwrap();
         {
@@ -1562,7 +1627,7 @@ mod tests {
             .resolve("perm-a".to_owned(), ApprovalReply::Allow)
             .unwrap();
 
-        let (b, cookie_b) = store.resolve(None).unwrap();
+        let (b, cookie_b) = store.resolve(None, "anonymous").unwrap();
         let cookie_b = cookie_b.expect("second session should set cookie");
         let sid_b = crate::anon_session::extract_sid(&cookie_b).unwrap();
         assert_ne!(sid_a, sid_b);
@@ -1579,7 +1644,7 @@ mod tests {
                 .is_ok()
         );
 
-        let (a2, no_cookie) = store.resolve(Some(&cookie_a)).unwrap();
+        let (a2, no_cookie) = store.resolve(Some(&cookie_a), "anonymous").unwrap();
         assert!(no_cookie.is_none());
         assert_eq!(a2.id, a.id);
         assert_eq!(
@@ -1593,17 +1658,36 @@ mod tests {
     }
 
     #[test]
+    fn session_cookie_is_bound_to_authenticated_owner() {
+        let store = super::AnonStore::new();
+        let (user_a, cookie_a) = store.resolve(None, "user-a").unwrap();
+        let cookie_a = cookie_a.unwrap();
+
+        let (user_b, rotated_cookie) = store.resolve(Some(&cookie_a), "user-b").unwrap();
+        assert_ne!(user_b.id, user_a.id);
+        assert_eq!(user_b.owner, "user-b");
+        assert!(rotated_cookie.is_some());
+
+        let (user_a_again, no_cookie) = store.resolve(Some(&cookie_a), "user-a").unwrap();
+        assert_eq!(user_a_again.id, user_a.id);
+        assert_eq!(user_a_again.owner, "user-a");
+        assert!(no_cookie.is_none());
+    }
+
+    #[test]
     fn tampered_cookie_is_rotated() {
         let store = super::AnonStore::new();
-        let (a, cookie_a) = store.resolve(None).unwrap();
+        let (a, cookie_a) = store.resolve(None, "anonymous").unwrap();
         let sid_a = crate::anon_session::extract_sid(&cookie_a.unwrap()).unwrap();
         let tampered = format!("arvm_anon={}x; other=1", &sid_a[..63]);
-        let (b, cookie_b) = store.resolve(Some(&tampered)).unwrap();
+        let (b, cookie_b) = store.resolve(Some(&tampered), "anonymous").unwrap();
         assert!(cookie_b.is_some());
         let sid_b = crate::anon_session::extract_sid(&cookie_b.unwrap()).unwrap();
         assert_ne!(sid_a, sid_b);
         assert_ne!(a.id, b.id);
-        let (c, none) = store.resolve(Some(&format!("arvm_anon={sid_a}"))).unwrap();
+        let (c, none) = store
+            .resolve(Some(&format!("arvm_anon={sid_a}")), "anonymous")
+            .unwrap();
         assert!(none.is_none());
         assert_eq!(c.id, a.id);
     }
@@ -1617,7 +1701,9 @@ mod tests {
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
             "a/b..",
         ] {
-            let (_s, cookie) = store.resolve(Some(&format!("arvm_anon={bad}"))).unwrap();
+            let (_s, cookie) = store
+                .resolve(Some(&format!("arvm_anon={bad}")), "anonymous")
+                .unwrap();
             assert!(cookie.is_some(), "bad sid {bad} should rotate");
             let sid = crate::anon_session::extract_sid(&cookie.unwrap()).unwrap();
             assert!(crate::anon_session::is_valid_sid_format(&sid));
