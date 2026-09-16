@@ -34,6 +34,8 @@ pub mod workspace;
 pub mod anon_session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod server;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_snapshot_store;
 
 /// The instructions understood by the VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
