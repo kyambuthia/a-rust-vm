@@ -20,7 +20,9 @@ use crate::agent::{
 const MAX_FILE_BYTES: usize = 128 * 1024;
 const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+#[cfg(any(unix, windows))]
 const MAX_COMMAND_RUNTIME: Duration = Duration::from_secs(30);
+#[cfg(any(unix, windows))]
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Errors from workspace initialization or path resolution.
