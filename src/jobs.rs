@@ -89,7 +89,7 @@ impl JobStore {
         })
     }
 
-    pub fn start_tabulation(&mut self, owner: &str, input_path: &str) -> JobRecord {
+    pub fn start_tabulation(&mut self, owner: &str, input_path: &str) -> Result<JobRecord, String> {
         self.start(owner, "builtin.tabulate.v1", input_path)
     }
 
@@ -102,7 +102,11 @@ impl JobStore {
         self.try_start(owner, "builtin.tabulate.v1", input_path, max_jobs)
     }
 
-    pub fn start_pdf_inspection(&mut self, owner: &str, input_path: &str) -> JobRecord {
+    pub fn start_pdf_inspection(
+        &mut self,
+        owner: &str,
+        input_path: &str,
+    ) -> Result<JobRecord, String> {
         self.start(owner, "builtin.pdf_inspect.v1", input_path)
     }
 
@@ -126,8 +130,16 @@ impl JobStore {
         self.try_start(owner, &format!("builtin.{app}.v1"), input_path, max_jobs)
     }
 
-    fn start(&mut self, owner: &str, executor: &str, input_path: &str) -> JobRecord {
-        self.next_id += 1;
+    fn start(
+        &mut self,
+        owner: &str,
+        executor: &str,
+        input_path: &str,
+    ) -> Result<JobRecord, String> {
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| "job id counter exhausted".to_owned())?;
         let job = JobRecord {
             id: format!("job-{}", self.next_id),
             owner: owner.to_owned(),
@@ -138,7 +150,7 @@ impl JobStore {
             error: None,
         };
         self.jobs.push(job.clone());
-        job
+        Ok(job)
     }
 
     fn try_start(
@@ -148,27 +160,55 @@ impl JobStore {
         input_path: &str,
         max_jobs: usize,
     ) -> Option<JobRecord> {
-        if self.jobs.iter().filter(|job| job.owner == owner).count() >= max_jobs {
+        if self.next_id == u64::MAX {
             return None;
         }
-        Some(self.start(owner, executor, input_path))
+        let active_jobs = self
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.owner == owner && matches!(job.state, JobState::Queued | JobState::Running)
+            })
+            .count();
+        if active_jobs >= max_jobs {
+            return None;
+        }
+        let owner_jobs = self.jobs.iter().filter(|job| job.owner == owner).count();
+        if owner_jobs >= max_jobs {
+            let terminal = self.jobs.iter().position(|job| {
+                job.owner == owner && matches!(job.state, JobState::Succeeded | JobState::Failed)
+            })?;
+            self.jobs.remove(terminal);
+        }
+        self.start(owner, executor, input_path).ok()
     }
 
-    pub fn mark_running(&mut self, id: &str) {
-        if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
+    pub fn mark_running(&mut self, id: &str) -> bool {
+        if let Some(job) = self
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == id && job.state == JobState::Queued)
+        {
             job.state = JobState::Running;
+            return true;
         }
+        false
     }
 
     pub fn finish(&mut self, id: &str, result: Result<&str, &str>) -> Option<JobRecord> {
         let job = self.jobs.iter_mut().find(|job| job.id == id)?;
+        if job.state != JobState::Running {
+            return None;
+        }
         match result {
             Ok(output_path) => {
                 job.state = JobState::Succeeded;
                 job.output_path = Some(output_path.to_owned());
+                job.error = None;
             }
             Err(error) => {
                 job.state = JobState::Failed;
+                job.output_path = None;
                 job.error = Some(error.to_owned());
             }
         }
@@ -501,7 +541,9 @@ mod tests {
     #[test]
     fn jobs_track_success_and_failure() {
         let mut store = JobStore::default();
-        let job = store.start_tabulation("local", "/workspace/uploads/a.csv");
+        let job = store
+            .start_tabulation("local", "/workspace/uploads/a.csv")
+            .unwrap();
         store.mark_running(&job.id);
         let completed = store
             .finish(&job.id, Ok("/workspace/output/a.json"))
@@ -552,6 +594,54 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn completed_jobs_release_capacity_without_unbounded_history() {
+        let mut store = JobStore::default();
+        let first = store
+            .try_start_tabulation("alice", "/workspace/uploads/a.csv", 2)
+            .unwrap();
+        assert!(store.mark_running(&first.id));
+        assert!(
+            store
+                .finish(&first.id, Ok("/workspace/output/a.json"))
+                .is_some()
+        );
+
+        let second = store
+            .try_start_pdf_inspection("alice", "/workspace/uploads/b.pdf", 2)
+            .unwrap();
+        assert!(store.mark_running(&second.id));
+        assert!(store.finish(&second.id, Err("bad pdf")).is_some());
+
+        let third = store
+            .try_start_tabulation("alice", "/workspace/uploads/c.csv", 2)
+            .unwrap();
+        assert_eq!(store.list("alice").len(), 2);
+        assert!(store.list("alice").iter().all(|job| job.id != first.id));
+        assert!(store.list("alice").iter().any(|job| job.id == third.id));
+    }
+
+    #[test]
+    fn exhausted_job_ids_fail_without_mutating_the_store() {
+        let mut store = JobStore::from_snapshot(JobStoreSnapshot {
+            next_id: u64::MAX,
+            jobs: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(
+            store
+                .start_tabulation("alice", "/workspace/uploads/a.csv")
+                .is_err()
+        );
+        assert!(
+            store
+                .try_start_tabulation("alice", "/workspace/uploads/a.csv", 1)
+                .is_none()
+        );
+        assert!(store.list("alice").is_empty());
     }
 
     #[test]

@@ -1622,7 +1622,8 @@ mod tests {
         a.jobs
             .lock()
             .unwrap()
-            .start_tabulation(&a.id, "/workspace/uploads/a.txt");
+            .start_tabulation(&a.id, "/workspace/uploads/a.txt")
+            .unwrap();
         a.approvals
             .resolve("perm-a".to_owned(), ApprovalReply::Allow)
             .unwrap();
