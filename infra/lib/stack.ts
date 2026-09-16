@@ -3,6 +3,7 @@ import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecs from "aws-cdk-lib/aws-ecs";
+import * as efs from "aws-cdk-lib/aws-efs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as elbv2Actions from "aws-cdk-lib/aws-elasticloadbalancingv2-actions";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -81,6 +82,58 @@ export class ARvmStack extends cdk.Stack {
     albSg.addEgressRule(taskSg, ec2.Port.tcp(8080), "ALB to task 8080");
     albSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), "Cognito HTTPS authentication");
 
+    const efsSg = new ec2.SecurityGroup(this, "EfsSg", {
+      vpc,
+      description: "EFS security group for durable runtime state",
+      allowAllOutbound: false,
+    });
+    efsSg.addIngressRule(taskSg, ec2.Port.tcp(2049), "ECS task to EFS");
+    taskSg.addEgressRule(efsSg, ec2.Port.tcp(2049), "EFS durable runtime state");
+
+    const taskRole = new iam.Role(this, "TaskRole", {
+      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+      description: "ECS task role with scoped EFS runtime state access",
+    });
+
+    const fileSystem = new efs.FileSystem(this, "RuntimeStateFileSystem", {
+      vpc,
+      securityGroup: efsSg,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      encrypted: true,
+      enableAutomaticBackups: true,
+      // Supply the resource policy explicitly; this disables the construct's
+      // broad fallback policy while keeping only the task role authorized.
+      allowAnonymousAccess: true,
+      fileSystemPolicy: new iam.PolicyDocument({
+        statements: [
+          new iam.PolicyStatement({
+            actions: [
+              "elasticfilesystem:ClientMount",
+              "elasticfilesystem:ClientWrite",
+            ],
+            principals: [taskRole],
+            resources: ["*"],
+            conditions: {
+              Bool: { "elasticfilesystem:AccessedViaMountTarget": "true" },
+            },
+          }),
+        ],
+      }),
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    const accessPoint = fileSystem.addAccessPoint("RuntimeStateAccessPoint", {
+      path: "/arvm",
+      createAcl: {
+        ownerUid: "10001",
+        ownerGid: "10001",
+        permissions: "750",
+      },
+      posixUser: {
+        uid: "10001",
+        gid: "10001",
+      },
+    });
+
     const executionRole = new iam.Role(this, "ExecutionRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
       description: "ECS execution role for ECR/logs/Secrets Manager only",
@@ -89,10 +142,7 @@ export class ARvmStack extends cdk.Stack {
       iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AmazonECSTaskExecutionRolePolicy")
     );
 
-    const taskRole = new iam.Role(this, "TaskRole", {
-      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-      description: "ECS task role with no extra permissions",
-    });
+    fileSystem.grantReadWrite(taskRole);
 
     const secret = secretsmanager.Secret.fromSecretNameV2(this, "OpenRouterSecret", props.secretName);
     secret.grantRead(executionRole);
@@ -108,7 +158,7 @@ export class ARvmStack extends cdk.Stack {
       taskRole,
     });
 
-    taskDefinition.addContainer("app", {
+    const container = taskDefinition.addContainer("app", {
       image: ecs.ContainerImage.fromEcrRepository(repository, props.imageTag),
       portMappings: [{ containerPort: 8080, protocol: ecs.Protocol.TCP }],
       logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: "a-rust-vm" }),
@@ -116,6 +166,7 @@ export class ARvmStack extends cdk.Stack {
         OPENROUTER_MODEL: props.openRouterModel,
         A_RVM_ALLOWED_ORIGIN: `https://${props.domainName}`,
         A_RVM_SECURE_COOKIES: "true",
+        A_RVM_SESSION_STATE_DIR: "/var/lib/arvm/sessions",
         A_RVM_WEB_PORT: "8080",
         A_RVM_BIND_ADDRESS: "0.0.0.0",
         A_RVM_REQUIRE_AUTH: "true",
@@ -125,6 +176,22 @@ export class ARvmStack extends cdk.Stack {
       },
       stopTimeout: cdk.Duration.seconds(30),
       readonlyRootFilesystem: true,
+    });
+    taskDefinition.addVolume({
+      name: "runtimeState",
+      efsVolumeConfiguration: {
+        fileSystemId: fileSystem.fileSystemId,
+        authorizationConfig: {
+          accessPointId: accessPoint.accessPointId,
+          iam: "ENABLED",
+        },
+        transitEncryption: "ENABLED",
+      },
+    });
+    container.addMountPoints({
+      sourceVolume: "runtimeState",
+      containerPath: "/var/lib/arvm",
+      readOnly: false,
     });
 
     const alb = new elbv2.ApplicationLoadBalancer(this, "Alb", {
@@ -286,6 +353,7 @@ export class ARvmStack extends cdk.Stack {
     new cdk.CfnOutput(this, "AlbDnsName", { value: alb.loadBalancerDnsName });
     new cdk.CfnOutput(this, "EcrRepositoryUri", { value: repository.repositoryUri });
     new cdk.CfnOutput(this, "ServiceName", { value: service.serviceName });
+    new cdk.CfnOutput(this, "RuntimeStateFileSystemId", { value: fileSystem.fileSystemId });
     new cdk.CfnOutput(this, "CognitoUserPoolId", { value: userPool.userPoolId });
     new cdk.CfnOutput(this, "CognitoAppClientId", { value: userPoolClient.userPoolClientId });
     new cdk.CfnOutput(this, "CognitoDomain", { value: userPoolDomain.domainName });
