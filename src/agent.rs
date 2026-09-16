@@ -8,9 +8,10 @@ use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -105,13 +106,37 @@ pub struct ToolSpec {
 pub struct ConversationMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ConversationMessage {
-    fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             content: content.into(),
+            tool_call: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn assistant_tool_call(call: &ToolCall) -> Self {
+        Self {
+            role: "assistant".to_owned(),
+            content: String::new(),
+            tool_call: Some(call.clone()),
+            tool_call_id: None,
+        }
+    }
+
+    fn tool_result(result: &ToolResult) -> Self {
+        Self {
+            role: "tool".to_owned(),
+            content: format_tool_result(result),
+            tool_call: None,
+            tool_call_id: Some(result.id.clone()),
         }
     }
 }
@@ -185,6 +210,8 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     #[serde(default)]
     pub conversation: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub current_turn: Vec<ConversationMessage>,
     #[serde(default)]
     pub route: RouteRequest,
 }
@@ -626,7 +653,12 @@ pub struct ProcessModel {
     program: PathBuf,
     arguments: Vec<String>,
     working_directory: Option<PathBuf>,
+    timeout: Duration,
 }
+
+const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_PROCESS_STDERR_BYTES: usize = 16 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl ProcessModel {
     pub fn new(program: impl Into<PathBuf>) -> Self {
@@ -634,6 +666,7 @@ impl ProcessModel {
             program: program.into(),
             arguments: Vec::new(),
             working_directory: None,
+            timeout: DEFAULT_PROCESS_TIMEOUT,
         }
     }
 
@@ -648,6 +681,11 @@ impl ProcessModel {
 
     pub fn with_working_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.working_directory = Some(directory.into());
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -666,36 +704,92 @@ impl ProcessModel {
             command.current_dir(directory);
         }
 
-        let mut child = command.spawn().map_err(|error| {
+        let child = command.spawn().map_err(|error| {
             ModelError::new(format!(
                 "failed to start model process '{}': {error}",
                 self.program.display()
             ))
         })?;
+        let mut child = ChildGuard::new(child);
 
         let request_json = serde_json::to_vec(request)
             .map_err(|error| ModelError::new(format!("failed to encode model request: {error}")))?;
-        let stdin = child
+        let mut stdin = child
+            .child
             .stdin
-            .as_mut()
+            .take()
             .ok_or_else(|| ModelError::new("model process stdin is unavailable"))?;
-        stdin
-            .write_all(&request_json)
-            .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|error| ModelError::new(format!("failed to send model request: {error}")))?;
-        child.stdin.take();
-
         let stdout = child
+            .child
             .stdout
             .take()
             .ok_or_else(|| ModelError::new("model process stdout is unavailable"))?;
+        let stderr = child
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| ModelError::new("model process stderr is unavailable"))?;
+
+        let (input_tx, input_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = stdin
+                .write_all(&request_json)
+                .and_then(|_| stdin.write_all(b"\n"))
+                .map_err(|error| format!("failed to send model request: {error}"));
+            let _ = input_tx.send(result);
+        });
+
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let message = line
+                    .map(Some)
+                    .map_err(|error| format!("failed to read model output: {error}"));
+                let should_stop = message.is_err() || matches!(message, Ok(None));
+                if line_tx.send(message).is_err() || should_stop {
+                    break;
+                }
+            }
+            let _ = line_tx.send(Ok(None));
+        });
+
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut pipe = stderr;
+            let mut captured = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(bytes) => {
+                        if captured.len() < MAX_PROCESS_STDERR_BYTES {
+                            let remaining = MAX_PROCESS_STDERR_BYTES - captured.len();
+                            captured.extend_from_slice(&buffer[..bytes.min(remaining)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stderr_tx.send(String::from_utf8_lossy(&captured).into_owned());
+        });
+
+        let deadline = Instant::now() + self.timeout;
         let mut response = None;
         let mut text = String::new();
 
-        for line in BufReader::new(stdout).lines() {
-            let line = line.map_err(|error| {
-                ModelError::new(format!("failed to read model output: {error}"))
-            })?;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ModelError::new("model process timed out"));
+            }
+            let line = match line_rx.recv_timeout(remaining) {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(Err(error)) => return Err(ModelError::new(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(ModelError::new("model process timed out"));
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -737,18 +831,10 @@ impl ProcessModel {
             }
         }
 
-        let status = child
-            .wait()
-            .map_err(|error| ModelError::new(format!("failed to finish model process: {error}")))?;
+        let status = child.wait_until(deadline)?;
+        let _ = input_rx.recv_timeout(Duration::from_millis(100));
         if !status.success() {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                pipe.read_to_string(&mut stderr).map_err(|error| {
-                    ModelError::new(format!(
-                        "model process failed and stderr was unreadable: {error}"
-                    ))
-                })?;
-            }
+            let stderr = stderr_rx.recv().unwrap_or_default();
             let detail = stderr.trim();
             return Err(ModelError::new(if detail.is_empty() {
                 format!("model process exited with {status}")
@@ -760,6 +846,58 @@ impl ProcessModel {
         response
             .or_else(|| (!text.is_empty()).then_some(ModelResponse::Text(text)))
             .ok_or_else(|| ModelError::new("model process emitted no response"))
+    }
+}
+
+struct ChildGuard {
+    child: Child,
+    waited: bool,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            waited: false,
+        }
+    }
+
+    fn wait_until(&mut self, deadline: Instant) -> Result<ExitStatus, ModelError> {
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.waited = true;
+                    return Ok(status);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    self.waited = true;
+                    return Err(ModelError::new("model process timed out"));
+                }
+                Err(error) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    self.waited = true;
+                    return Err(ModelError::new(format!(
+                        "failed to finish model process: {error}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.waited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.waited = true;
+        }
     }
 }
 
@@ -1125,6 +1263,7 @@ where
                     tools: self.tools.specs(),
                     system_prompt: self.system_prompt.clone(),
                     conversation: self.bounded_context(),
+                    current_turn: turn_context.clone(),
                     route: self.route_request.clone(),
                 })
                 .map_err(AgentError::Model)?;
@@ -1144,28 +1283,23 @@ where
                         });
                     }
                     let canonical = canonical_arguments(&call.arguments);
-                    if let Some((last_name, last_args)) = last_call.as_ref() {
-                        if last_name == &call.name && last_args == &canonical {
-                            events.push(AgentEvent::RepeatedToolCall {
-                                tool: call.name.clone(),
-                                count: 2,
-                            });
-                            events.push(AgentEvent::Done);
-                            return Ok(events);
-                        }
+                    if let Some((last_name, last_args)) = last_call.as_ref()
+                        && last_name == &call.name
+                        && last_args == &canonical
+                    {
+                        events.push(AgentEvent::RepeatedToolCall {
+                            tool: call.name.clone(),
+                            count: 2,
+                        });
+                        events.push(AgentEvent::Done);
+                        return Ok(events);
                     }
                     events.push(AgentEvent::ToolCall(call.clone()));
                     let result =
                         self.execute_with_approval(&call, &mut approve, |event| events.push(event));
                     tool_results.push(result.clone());
-                    turn_context.push(ConversationMessage::new(
-                        "assistant",
-                        format_tool_call(&call),
-                    ));
-                    turn_context.push(ConversationMessage::new(
-                        "tool",
-                        format_tool_result(&result),
-                    ));
+                    turn_context.push(ConversationMessage::assistant_tool_call(&call));
+                    turn_context.push(ConversationMessage::tool_result(&result));
                     events.push(AgentEvent::ToolResult(result));
                     tool_calls += 1;
                     let key = format!("{} {canonical}", call.name);
@@ -1243,6 +1377,7 @@ where
                         tools: self.tools.specs(),
                         system_prompt: self.system_prompt.clone(),
                         conversation: self.bounded_context(),
+                        current_turn: turn_context.clone(),
                         route: self.route_request.clone(),
                     },
                     &mut |event| match event {
@@ -1271,27 +1406,22 @@ where
                         });
                     }
                     let canonical = canonical_arguments(&call.arguments);
-                    if let Some((last_name, last_args)) = last_call.as_ref() {
-                        if last_name == &call.name && last_args == &canonical {
-                            emit(AgentEvent::RepeatedToolCall {
-                                tool: call.name.clone(),
-                                count: 2,
-                            });
-                            emit(AgentEvent::Done);
-                            return Ok(());
-                        }
+                    if let Some((last_name, last_args)) = last_call.as_ref()
+                        && last_name == &call.name
+                        && last_args == &canonical
+                    {
+                        emit(AgentEvent::RepeatedToolCall {
+                            tool: call.name.clone(),
+                            count: 2,
+                        });
+                        emit(AgentEvent::Done);
+                        return Ok(());
                     }
                     emit(AgentEvent::ToolCall(call.clone()));
                     let result = self.execute_with_approval(&call, &mut approve, &mut emit);
                     tool_results.push(result.clone());
-                    turn_context.push(ConversationMessage::new(
-                        "assistant",
-                        format_tool_call(&call),
-                    ));
-                    turn_context.push(ConversationMessage::new(
-                        "tool",
-                        format_tool_result(&result),
-                    ));
+                    turn_context.push(ConversationMessage::assistant_tool_call(&call));
+                    turn_context.push(ConversationMessage::tool_result(&result));
                     emit(AgentEvent::ToolResult(result));
                     tool_calls += 1;
                     let key = format!("{} {canonical}", call.name);
@@ -1401,14 +1531,6 @@ fn rule_target(call: &ToolCall) -> String {
 
 fn canonical_arguments(arguments: &ToolArguments) -> String {
     serde_json::to_string(arguments).unwrap_or_default()
-}
-
-fn format_tool_call(call: &ToolCall) -> String {
-    let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
-    format!(
-        "tool_call id={} name={} arguments={arguments}",
-        call.id, call.name
-    )
 }
 
 fn format_tool_result(result: &ToolResult) -> String {
@@ -1710,7 +1832,7 @@ impl SubagentSession {
     }
 }
 
-/// A parent-visible tool that delegates one bounded subtask to an isolated child.
+// A parent-visible tool that delegates one bounded subtask to an isolated child.
 std::thread_local! {
     static SUBAGENT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -2159,6 +2281,7 @@ mod tests {
             tool_results: Vec::new(),
             tools: Vec::new(),
             conversation: Vec::new(),
+            current_turn: Vec::new(),
             route,
         }
     }
@@ -2455,6 +2578,19 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].system_prompt, "workspace rules");
         assert!(requests[0].conversation.is_empty());
+        assert_eq!(requests[1].current_turn.len(), 3);
+        assert_eq!(requests[1].current_turn[0].role, "user");
+        assert_eq!(
+            requests[1].current_turn[1]
+                .tool_call
+                .as_ref()
+                .map(|call| call.name.as_str()),
+            Some("inspect_vm")
+        );
+        assert_eq!(
+            requests[1].current_turn[2].tool_call_id.as_deref(),
+            Some("inspect-1")
+        );
         assert_eq!(requests[2].prompt, "what did we learn?");
         assert!(
             requests[2]
@@ -2668,6 +2804,7 @@ mod tests {
             tool_results: Vec::new(),
             tools: Vec::new(),
             conversation: Vec::new(),
+            current_turn: Vec::new(),
             route: RouteRequest::default(),
         };
         let mut chunks = Vec::new();
@@ -2680,6 +2817,27 @@ mod tests {
 
         assert_eq!(response, ModelResponse::Text("hello world".to_owned()));
         assert_eq!(chunks, vec!["hello ".to_owned(), "world".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_model_terminates_a_child_that_exceeds_its_deadline() {
+        let mut model = super::ProcessModel::new("/bin/sh")
+            .with_arguments(["-c", "read request; sleep 5"])
+            .with_timeout(std::time::Duration::from_millis(100));
+        let request = super::ModelRequest {
+            system_prompt: String::new(),
+            prompt: "never finish".to_owned(),
+            tool_results: Vec::new(),
+            tools: Vec::new(),
+            conversation: Vec::new(),
+            current_turn: Vec::new(),
+            route: RouteRequest::default(),
+        };
+
+        let error = model.respond(&request).unwrap_err();
+
+        assert_eq!(error.message, "model process timed out");
     }
 
     #[test]
@@ -3311,7 +3469,7 @@ mod tests {
     #[test]
     fn delegation_tool_blocks_nested_delegation_at_default_depth() {
         let outer = SubagentTool::new(
-            || EchoAfterOneToolCall::default(),
+            EchoAfterOneToolCall::default,
             nested_child_tools,
             SubagentConfig::default(),
         );

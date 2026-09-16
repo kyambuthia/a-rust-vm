@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::agent::{Model, ModelError, ModelRequest, ModelResponse, ToolCall};
+use crate::agent::{ConversationMessage, Model, ModelError, ModelRequest, ModelResponse, ToolCall};
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL: &str = "~openai/gpt-latest";
@@ -189,23 +189,16 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
     if !system.trim().is_empty() {
         messages.push(serde_json::json!({"role":"system","content":system}));
     }
-    for entry in &request.conversation {
-        let role = normalize_role(&entry.role);
-        let content = bounded_text(&entry.content, 4096);
-        if role == "tool" {
-            messages.push(serde_json::json!({
-                "role":"user",
-                "content": format!("Previous tool result:\n{content}")
-            }));
-        } else {
-            messages.push(serde_json::json!({"role":role,"content":content}));
-        }
+    for entry in request.conversation.iter().chain(&request.current_turn) {
+        messages.push(conversation_message(entry));
     }
-    messages.push(serde_json::json!({
-        "role":"user",
-        "content": bounded_text(&request.prompt, 8192)
-    }));
-    if !request.tool_results.is_empty() {
+    if request.current_turn.is_empty() {
+        messages.push(serde_json::json!({
+            "role":"user",
+            "content": bounded_text(&request.prompt, 8192)
+        }));
+    }
+    if request.current_turn.is_empty() && !request.tool_results.is_empty() {
         let results = request
             .tool_results
             .iter()
@@ -250,6 +243,35 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
         body["tool_choice"] = serde_json::json!("auto");
     }
     body
+}
+
+fn conversation_message(entry: &ConversationMessage) -> serde_json::Value {
+    if let Some(call) = &entry.tool_call {
+        let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
+        return serde_json::json!({
+            "role": "assistant",
+            "content": bounded_text(&entry.content, 4096),
+            "tool_calls": [{
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": arguments
+                }
+            }]
+        });
+    }
+    if let Some(tool_call_id) = &entry.tool_call_id {
+        return serde_json::json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": bounded_text(&entry.content, 4096)
+        });
+    }
+    serde_json::json!({
+        "role": normalize_role(&entry.role),
+        "content": bounded_text(&entry.content, 4096)
+    })
 }
 
 fn normalize_role(role: &str) -> &str {
@@ -330,9 +352,15 @@ fn parse_chat_response(text: &str) -> Result<ModelResponse, String> {
     let message = choice
         .message
         .ok_or_else(|| "provider response has no message".to_owned())?;
-    if let Some(calls) = message.tool_calls
-        && let Some(entry) = calls.into_iter().next()
-    {
+    if let Some(calls) = message.tool_calls {
+        if calls.len() > 1 {
+            return Err(
+                "provider returned multiple tool calls; one call per turn is required".to_owned(),
+            );
+        }
+        let Some(entry) = calls.into_iter().next() else {
+            return Err("provider returned an empty tool call list".to_owned());
+        };
         let id = entry.id.unwrap_or_else(|| "call-1".to_owned());
         let function = entry
             .function
@@ -484,7 +512,10 @@ mod tests {
             conversation: vec![crate::agent::ConversationMessage {
                 role: "user".to_owned(),
                 content: "prev".to_owned(),
+                tool_call: None,
+                tool_call_id: None,
             }],
+            current_turn: Vec::new(),
             route: crate::agent::RouteRequest::default(),
         };
         let body = model.build_request_body(&request);
@@ -525,10 +556,62 @@ mod tests {
                 input_schema: "not-json".to_owned(),
             }],
             conversation: vec![],
+            current_turn: Vec::new(),
             route: crate::agent::RouteRequest::default(),
         };
         let body = model.build_request_body(&request);
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn encodes_structured_tool_turns_as_provider_messages() {
+        let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "openai/gpt-4o-mini");
+        let model = OpenRouterModel::from_config(config).unwrap();
+        let call = ToolCall::new("call-7", "guest_read_file", Default::default());
+        let result = crate::agent::ToolResult {
+            id: "call-7".to_owned(),
+            name: "guest_read_file".to_owned(),
+            content: "contents".to_owned(),
+            is_error: false,
+        };
+        let request = ModelRequest {
+            system_prompt: String::new(),
+            prompt: "read it".to_owned(),
+            tool_results: vec![result.clone()],
+            tools: Vec::new(),
+            conversation: Vec::new(),
+            current_turn: vec![
+                ConversationMessage::new("user", "read it"),
+                ConversationMessage {
+                    role: "assistant".to_owned(),
+                    content: String::new(),
+                    tool_call: Some(call),
+                    tool_call_id: None,
+                },
+                ConversationMessage {
+                    role: "tool".to_owned(),
+                    content: result.content.clone(),
+                    tool_call: None,
+                    tool_call_id: Some(result.id),
+                },
+            ],
+            route: crate::agent::RouteRequest::default(),
+        };
+
+        let body = model.build_request_body(&request);
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-7");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "guest_read_file"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-7");
+        assert_eq!(messages[2]["content"], "contents");
+        assert_eq!(messages.len(), 3);
     }
 
     #[test]
@@ -550,6 +633,16 @@ mod tests {
             }
             _ => panic!("expected tool call"),
         }
+    }
+
+    #[test]
+    fn rejects_multiple_provider_tool_calls_in_one_turn() {
+        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"one","arguments":"{}"}},{"id":"call-2","type":"function","function":{"name":"two","arguments":"{}"}}]}}]}"#;
+
+        assert_eq!(
+            parse_chat_response(json).unwrap_err(),
+            "provider returned multiple tool calls; one call per turn is required"
+        );
     }
 
     #[test]
