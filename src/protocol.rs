@@ -62,7 +62,7 @@ impl SystemInfo {
                 },
                 sessions: FeatureStatus {
                     available: true,
-                    durable: true,
+                    durable: false,
                 },
                 workflows: FeatureStatus {
                     available: false,
@@ -85,5 +85,6 @@ mod tests {
         assert_eq!(decoded, info);
         assert_eq!(decoded.api_version, API_VERSION);
         assert!(!decoded.features.wasm_executor.available);
+        assert!(!decoded.features.sessions.durable);
     }
 }

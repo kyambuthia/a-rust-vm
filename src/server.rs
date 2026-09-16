@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,8 @@ use crate::jobs::{
 use crate::openrouter::OpenRouterModel;
 use crate::runtime::VmInstance;
 
-const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UPLOAD_BYTES: usize = 1024 * 1024;
 const MAX_PROMPT_CHARS: usize = 8 * 1024;
 const MAX_FILES_PER_SESSION: usize = 32;
@@ -40,6 +41,11 @@ const MAX_GLOBAL_SESSIONS: usize = 128;
 const AGENT_TTL_STEP_LIMIT: usize = 8;
 const SESSION_TTL: Duration = Duration::from_secs(1800);
 const MAX_GLOBAL_CONCURRENT_AGENTS: usize = 32;
+const MAX_ACTIVE_CONNECTIONS: usize = 256;
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_AGENT_EVENT_BYTES: usize = 256 * 1024;
+const MAX_AGENT_STREAM_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct AgentRequest {
@@ -129,6 +135,7 @@ struct ApprovalRequest {
 enum ApprovalReply {
     Allow,
     Deny,
+    Cancelled,
 }
 
 enum ApprovalState {
@@ -162,6 +169,7 @@ struct ServerState {
     anon: Arc<AnonStore>,
     model: Option<OpenRouterModel>,
     global_agents: Arc<Mutex<usize>>,
+    active_connections: Arc<Mutex<usize>>,
     allowed_origin: String,
 }
 
@@ -176,11 +184,22 @@ impl Default for ApprovalStore {
 
 impl ApprovalStore {
     pub fn wait(&self, id: &str) -> crate::agent::PermissionDecision {
+        static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+        self.wait_with_cancel(id, &NEVER_CANCEL)
+    }
+
+    fn wait_with_cancel(&self, id: &str, cancel: &AtomicBool) -> crate::agent::PermissionDecision {
         let mut states = self.states.lock().expect("approval poisoned");
         states
             .entry(id.to_owned())
             .or_insert(ApprovalState::Pending);
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                states.remove(id);
+                return crate::agent::PermissionDecision::Deny {
+                    reason: "approval cancelled".to_owned(),
+                };
+            }
             if matches!(states.get(id), Some(ApprovalState::Pending)) {
                 let (next, timeout) = self
                     .changed
@@ -204,10 +223,28 @@ impl ApprovalStore {
                         reason: "approval denied in browser".to_owned(),
                     };
                 }
+                Some(ApprovalState::Resolved(ApprovalReply::Cancelled)) => {
+                    return crate::agent::PermissionDecision::Deny {
+                        reason: "approval cancelled".to_owned(),
+                    };
+                }
                 _ => unreachable!(),
             }
         }
     }
+
+    fn cancel_pending(&self) {
+        let Ok(mut states) = self.states.lock() else {
+            return;
+        };
+        for state in states.values_mut() {
+            if matches!(state, ApprovalState::Pending) {
+                *state = ApprovalState::Resolved(ApprovalReply::Cancelled);
+            }
+        }
+        self.changed.notify_all();
+    }
+
     fn resolve(&self, id: String, reply: ApprovalReply) -> Result<(), String> {
         if id.trim().is_empty() {
             return Err("approval id is empty".to_owned());
@@ -224,6 +261,36 @@ impl ApprovalStore {
         }
         self.changed.notify_all();
         Ok(())
+    }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct AgentActivityGuard<'a> {
+    session: &'a SessionData,
+    global_agents: &'a Arc<Mutex<usize>>,
+}
+
+struct ConnectionGuard {
+    active_connections: Arc<Mutex<usize>>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let mut active = lock_recover(&self.active_connections);
+        *active = active.saturating_sub(1);
+    }
+}
+
+impl Drop for AgentActivityGuard<'_> {
+    fn drop(&mut self) {
+        *lock_recover(&self.session.agent_active) = false;
+        let mut global = lock_recover(self.global_agents);
+        *global = global.saturating_sub(1);
     }
 }
 
@@ -326,14 +393,41 @@ pub fn run(root: PathBuf) {
         anon: Arc::new(AnonStore::with_secure_cookie(secure_cookie)),
         model,
         global_agents: Arc::new(Mutex::new(0)),
+        active_connections: Arc::new(Mutex::new(0)),
         allowed_origin,
     });
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let active_connections = state.active_connections.clone();
+                let connection_reserved = {
+                    let mut active = lock_recover(&active_connections);
+                    if *active >= MAX_ACTIVE_CONNECTIONS {
+                        false
+                    } else {
+                        *active += 1;
+                        true
+                    }
+                };
+                if !connection_reserved {
+                    let mut stream = stream;
+                    write_error(&mut stream, 503, "server is busy", None);
+                    continue;
+                }
                 let root = root.clone();
                 let state = state.clone();
-                thread::spawn(move || handle_connection(stream, &root, &state));
+                let failed_counter = active_connections.clone();
+                let result = thread::Builder::new()
+                    .name("arvm-http".to_owned())
+                    .spawn(move || {
+                        let _connection = ConnectionGuard { active_connections };
+                        handle_connection(stream, &root, &state);
+                    });
+                if let Err(error) = result {
+                    eprintln!("failed to start browser connection handler: {error}");
+                    let mut active = lock_recover(&failed_counter);
+                    *active = active.saturating_sub(1);
+                }
             }
             Err(e) => eprintln!("browser connection failed: {e}"),
         }
@@ -341,6 +435,8 @@ pub fn run(root: PathBuf) {
 }
 
 fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
+    let _ = stream.set_read_timeout(Some(HTTP_READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT));
     let request = match read_request(&mut stream) {
         Ok(r) => r,
         Err(e) => {
@@ -385,7 +481,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
             *c > 60
         }
     };
-    if rate_hit && is_state_changing {
+    if rate_hit {
         write_error(
             &mut stream,
             429,
@@ -497,7 +593,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             return Err("request ended before headers".to_owned());
         }
         header_bytes.extend_from_slice(&line);
-        if header_bytes.len() > MAX_REQUEST_BYTES {
+        if header_bytes.len() > MAX_REQUEST_HEADER_BYTES {
             return Err("request headers are too large".to_owned());
         }
         if header_bytes.ends_with(b"\r\n\r\n") || header_bytes.ends_with(b"\n\n") {
@@ -534,7 +630,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             .map_err(|_| "content-length is invalid".to_owned())?,
         None => 0,
     };
-    if content_length > MAX_REQUEST_BYTES {
+    if content_length > MAX_REQUEST_BODY_BYTES {
         return Err("request body is too large".to_owned());
     }
     let mut body = vec![0; content_length];
@@ -572,7 +668,7 @@ fn handle_agent(
         return;
     }
     {
-        let mut active = session.agent_active.lock().unwrap();
+        let mut active = lock_recover(&session.agent_active);
         if *active {
             write_error(
                 stream,
@@ -586,17 +682,19 @@ fn handle_agent(
     }
     session.agent_cancel.store(false, Ordering::SeqCst);
     {
-        let mut global = state.global_agents.lock().unwrap();
+        let mut global = lock_recover(&state.global_agents);
         if *global >= MAX_GLOBAL_CONCURRENT_AGENTS {
-            *session.agent_active.lock().unwrap() = false;
+            *lock_recover(&session.agent_active) = false;
             write_error(stream, 429, "too many concurrent agents", set_cookie);
             return;
         }
         *global += 1;
     }
+    let _activity = AgentActivityGuard {
+        session,
+        global_agents: &state.global_agents,
+    };
     let Some(model) = state.model.clone() else {
-        *session.agent_active.lock().unwrap() = false;
-        *state.global_agents.lock().unwrap() -= 1;
         write_error(stream, 503, "model is not configured", set_cookie);
         return;
     };
@@ -605,8 +703,6 @@ fn handle_agent(
         .register_model("guest", ModelCapabilities::STREAMING_TOOLS, model)
         .and_then(|_| router.set_default("guest"))
     {
-        *session.agent_active.lock().unwrap() = false;
-        *state.global_agents.lock().unwrap() -= 1;
         write_error(stream, 500, "internal error", set_cookie);
         let _ = e;
         return;
@@ -617,8 +713,6 @@ fn handle_agent(
         match guest_coding_tool_registry_shared(vm_clone.clone()) {
             Ok(t) => t,
             Err(_) => {
-                *session.agent_active.lock().unwrap() = false;
-                *state.global_agents.lock().unwrap() -= 1;
                 write_error(stream, 500, "internal error", set_cookie);
                 return;
             }
@@ -633,11 +727,12 @@ fn handle_agent(
     .with_cancel_token(session.agent_cancel.clone());
     write_stream_headers(stream, set_cookie);
     let approvals = session.approvals.clone();
+    let mut stream_bytes = 0;
     let result = agent.run_streaming_with_approval(
         request.prompt,
-        |p| approvals.wait(&p.id),
+        |p| approvals.wait_with_cancel(&p.id, session.agent_cancel.as_ref()),
         |event| {
-            if !write_event(stream, &event) {
+            if !write_event(stream, &event, &mut stream_bytes) {
                 session.agent_cancel.store(true, Ordering::SeqCst);
             }
         },
@@ -648,10 +743,10 @@ fn handle_agent(
             &AgentEvent::Error {
                 message: format!("agent error: {e}"),
             },
+            &mut stream_bytes,
         );
+        write_event(stream, &AgentEvent::Done, &mut stream_bytes);
     }
-    *session.agent_active.lock().unwrap() = false;
-    *state.global_agents.lock().unwrap() -= 1;
 }
 
 fn handle_agent_cancel(
@@ -659,12 +754,12 @@ fn handle_agent_cancel(
     session: &Arc<SessionData>,
     set_cookie: Option<&str>,
 ) {
-    let active = session.agent_active.lock().unwrap();
-    if !*active {
+    if !*lock_recover(&session.agent_active) {
         write_error(stream, 409, "agent is not running", set_cookie);
         return;
     }
     session.agent_cancel.store(true, Ordering::SeqCst);
+    session.approvals.cancel_pending();
     write_response(
         stream,
         200,
@@ -715,7 +810,13 @@ fn handle_upload(
         write_error(stream, 400, "file limit exceeded", set_cookie);
         return;
     }
-    if vm.filesystem().byte_count() + request.bytes.len() > MAX_TOTAL_BYTES_PER_SESSION {
+    let previous_bytes = vm.read_file(&path).map(|bytes| bytes.len()).unwrap_or(0);
+    let projected_bytes = vm
+        .filesystem()
+        .byte_count()
+        .checked_sub(previous_bytes)
+        .and_then(|bytes| bytes.checked_add(request.bytes.len()));
+    if projected_bytes.is_none_or(|bytes| bytes > MAX_TOTAL_BYTES_PER_SESSION) {
         write_error(stream, 400, "session storage limit exceeded", set_cookie);
         return;
     }
@@ -788,18 +889,15 @@ fn handle_app_operation(
         AppId::Docs => ("docs", DOCS_DOCUMENT_PATH),
         AppId::Sheets => ("sheets", SHEETS_INPUT_PATH),
     };
-    if session
-        .jobs
-        .lock()
-        .map(|jobs| jobs.list(&session.id).len() >= MAX_JOBS_PER_SESSION)
-        .unwrap_or(true)
-    {
-        write_error(stream, 400, "job limit exceeded", set_cookie);
-        return;
-    }
     let job = match session.jobs.lock() {
         Ok(mut jobs) => {
-            let job = jobs.start_builtin_app(&session.id, executor, input_path);
+            let Some(job) =
+                jobs.try_start_builtin_app(&session.id, executor, input_path, MAX_JOBS_PER_SESSION)
+            else {
+                drop(jobs);
+                write_error(stream, 400, "job limit exceeded", set_cookie);
+                return;
+            };
             jobs.mark_running(&job.id);
             job
         }
@@ -939,16 +1037,14 @@ fn handle_tabulate(
             return;
         }
     };
-    {
-        let jobs = session.jobs.lock().unwrap();
-        if jobs.list(&session.id).len() >= MAX_JOBS_PER_SESSION {
-            write_error(stream, 400, "job limit exceeded", set_cookie);
-            return;
-        }
-    }
     let job = {
         let mut jobs = session.jobs.lock().unwrap();
-        let j = jobs.start_tabulation(&session.id, &request.path);
+        let Some(j) = jobs.try_start_tabulation(&session.id, &request.path, MAX_JOBS_PER_SESSION)
+        else {
+            drop(jobs);
+            write_error(stream, 400, "job limit exceeded", set_cookie);
+            return;
+        };
         jobs.mark_running(&j.id);
         j
     };
@@ -1011,16 +1107,15 @@ fn handle_pdf_inspection(
             return;
         }
     };
-    {
-        let jobs = session.jobs.lock().unwrap();
-        if jobs.list(&session.id).len() >= MAX_JOBS_PER_SESSION {
-            write_error(stream, 400, "job limit exceeded", set_cookie);
-            return;
-        }
-    }
     let job = {
         let mut jobs = session.jobs.lock().unwrap();
-        let j = jobs.start_pdf_inspection(&session.id, &request.path);
+        let Some(j) =
+            jobs.try_start_pdf_inspection(&session.id, &request.path, MAX_JOBS_PER_SESSION)
+        else {
+            drop(jobs);
+            write_error(stream, 400, "job limit exceeded", set_cookie);
+            return;
+        };
         jobs.mark_running(&j.id);
         j
     };
@@ -1119,11 +1214,19 @@ fn write_stream_headers(stream: &mut TcpStream, set_cookie: Option<&str>) {
     let _ = stream.flush();
 }
 
-fn write_event(stream: &mut TcpStream, event: &AgentEvent) -> bool {
+fn write_event(stream: &mut TcpStream, event: &AgentEvent, bytes_written: &mut usize) -> bool {
     let Ok(mut body) = serde_json::to_vec(event) else {
         return false;
     };
+    if body.len() > MAX_AGENT_EVENT_BYTES
+        || bytes_written
+            .checked_add(body.len() + 1)
+            .is_none_or(|bytes| bytes > MAX_AGENT_STREAM_BYTES)
+    {
+        return false;
+    }
     body.push(b'\n');
+    *bytes_written += body.len();
     stream.write_all(&body).is_ok() && stream.flush().is_ok()
 }
 
@@ -1280,6 +1383,7 @@ mod tests {
     use crate::agent::PermissionDecision;
     use crate::runtime::VmInstance;
     use std::io::{Cursor, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1318,6 +1422,28 @@ mod tests {
             store.wait("permission-2"),
             PermissionDecision::Deny {
                 reason: "approval denied in browser".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn approval_store_releases_a_waiting_agent_when_cancelled() {
+        let store = Arc::new(ApprovalStore::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiting_store = store.clone();
+        let waiting_cancel = cancel.clone();
+        let handle = thread::spawn(move || {
+            waiting_store.wait_with_cancel("permission-cancel", &waiting_cancel)
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        cancel.store(true, Ordering::Release);
+        store.cancel_pending();
+
+        assert_eq!(
+            handle.join().unwrap(),
+            PermissionDecision::Deny {
+                reason: "approval cancelled".to_owned()
             }
         );
     }

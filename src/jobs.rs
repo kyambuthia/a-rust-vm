@@ -48,22 +48,37 @@ impl JobStore {
         self.start(owner, "builtin.tabulate.v1", input_path)
     }
 
+    pub fn try_start_tabulation(
+        &mut self,
+        owner: &str,
+        input_path: &str,
+        max_jobs: usize,
+    ) -> Option<JobRecord> {
+        self.try_start(owner, "builtin.tabulate.v1", input_path, max_jobs)
+    }
+
     pub fn start_pdf_inspection(&mut self, owner: &str, input_path: &str) -> JobRecord {
         self.start(owner, "builtin.pdf_inspect.v1", input_path)
     }
 
-    /// Record one operation from a fixed built-in guest application.
-    ///
-    /// The caller supplies only server-selected app identifiers and fixed guest
-    /// paths; this is not an arbitrary executor registration API.
+    pub fn try_start_pdf_inspection(
+        &mut self,
+        owner: &str,
+        input_path: &str,
+        max_jobs: usize,
+    ) -> Option<JobRecord> {
+        self.try_start(owner, "builtin.pdf_inspect.v1", input_path, max_jobs)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn start_builtin_app(
+    pub(crate) fn try_start_builtin_app(
         &mut self,
         owner: &str,
         app: &str,
         input_path: &str,
-    ) -> JobRecord {
-        self.start(owner, &format!("builtin.{app}.v1"), input_path)
+        max_jobs: usize,
+    ) -> Option<JobRecord> {
+        self.try_start(owner, &format!("builtin.{app}.v1"), input_path, max_jobs)
     }
 
     fn start(&mut self, owner: &str, executor: &str, input_path: &str) -> JobRecord {
@@ -79,6 +94,19 @@ impl JobStore {
         };
         self.jobs.push(job.clone());
         job
+    }
+
+    fn try_start(
+        &mut self,
+        owner: &str,
+        executor: &str,
+        input_path: &str,
+        max_jobs: usize,
+    ) -> Option<JobRecord> {
+        if self.jobs.iter().filter(|job| job.owner == owner).count() >= max_jobs {
+            return None;
+        }
+        Some(self.start(owner, executor, input_path))
     }
 
     pub fn mark_running(&mut self, id: &str) {
@@ -432,6 +460,23 @@ mod tests {
             .finish(&job.id, Ok("/workspace/output/a.json"))
             .unwrap();
         assert_eq!(completed.state, JobState::Succeeded);
+        assert_eq!(store.list("local").len(), 1);
+    }
+
+    #[test]
+    fn try_start_enforces_the_owner_limit_before_inserting() {
+        let mut store = JobStore::default();
+
+        assert!(
+            store
+                .try_start_tabulation("local", "/workspace/uploads/a.csv", 1)
+                .is_some()
+        );
+        assert!(
+            store
+                .try_start_pdf_inspection("local", "/workspace/uploads/b.pdf", 1)
+                .is_none()
+        );
         assert_eq!(store.list("local").len(), 1);
     }
 
