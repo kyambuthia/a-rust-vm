@@ -50,6 +50,18 @@ pub enum Instruction {
     Mul,
     /// Pop two values and push the first value divided by the second.
     Div,
+    /// Duplicate the value at the top of the stack.
+    Dup,
+    /// Discard the value at the top of the stack.
+    Pop,
+    /// Pop two values and push 1 if they are equal, else 0.
+    Eq,
+    /// Pop two values and push 1 if the first is less than the second, else 0.
+    Lt,
+    /// Jump unconditionally to the instruction at the given index.
+    Jmp(usize),
+    /// Pop a condition and jump to the given index if it is zero.
+    Jz(usize),
     /// Stop execution and return the value at the top of the stack.
     Halt,
 }
@@ -62,6 +74,12 @@ impl Instruction {
             Self::Sub => "SUB",
             Self::Mul => "MUL",
             Self::Div => "DIV",
+            Self::Dup => "DUP",
+            Self::Pop => "POP",
+            Self::Eq => "EQ",
+            Self::Lt => "LT",
+            Self::Jmp(_) => "JMP",
+            Self::Jz(_) => "JZ",
             Self::Halt => "HALT",
         }
     }
@@ -71,6 +89,8 @@ impl std::fmt::Display for Instruction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Push(value) => write!(formatter, "PUSH {value}"),
+            Self::Jmp(target) => write!(formatter, "JMP {target}"),
+            Self::Jz(target) => write!(formatter, "JZ {target}"),
             instruction => formatter.write_str(instruction.name()),
         }
     }
@@ -111,9 +131,20 @@ pub enum VmError {
     MissingHalt,
     /// `Halt` was reached without a result on the stack.
     EmptyStack,
+    /// A jump targeted an instruction index outside the program.
+    InvalidJump { target: usize },
+    /// Execution exceeded the bounded step budget (loops must terminate).
+    StepLimitExceeded { limit: usize },
     /// The VM was stepped after it had already halted.
     AlreadyHalted,
 }
+
+/// Upper bound on executed instructions for one `run` or `trace` call.
+///
+/// Jumps make non-termination expressible, so the direct-execution paths
+/// fail closed instead of looping forever. Guest processes are bounded
+/// separately by the scheduler tick limits.
+pub const MAX_VM_STEPS: usize = 1_000_000;
 
 /// A simple integer stack virtual machine.
 #[derive(Debug, Default)]
@@ -144,12 +175,15 @@ impl Vm {
     pub fn run(&mut self, program: &[Instruction]) -> Result<i32, VmError> {
         self.reset();
 
-        loop {
+        for _ in 0..MAX_VM_STEPS {
             match self.step(program)? {
                 StepResult::Executed { .. } => {}
                 StepResult::Halted { result } => return Ok(result),
             }
         }
+        Err(VmError::StepLimitExceeded {
+            limit: MAX_VM_STEPS,
+        })
     }
 
     /// Execute a program that was validated at its input boundary.
@@ -161,7 +195,7 @@ impl Vm {
     pub fn trace(&mut self, program: &program::Program) -> Result<Vec<TraceEntry>, VmError> {
         self.reset();
         let mut entries = Vec::with_capacity(program.instructions().len());
-        loop {
+        for _ in 0..MAX_VM_STEPS {
             let instruction_pointer = self.instruction_pointer;
             let step = self.step(program.instructions())?;
             let (instruction, result) = match step {
@@ -178,6 +212,9 @@ impl Vm {
                 return Ok(entries);
             }
         }
+        Err(VmError::StepLimitExceeded {
+            limit: MAX_VM_STEPS,
+        })
     }
 
     /// Execute exactly one instruction from the current instruction pointer.
@@ -211,6 +248,48 @@ impl Vm {
                     operation: "divide",
                 })?;
                 self.stack.push(result);
+            }
+            Instruction::Dup => {
+                let value = self.stack.last().copied().ok_or(VmError::StackUnderflow {
+                    operation: "duplicate",
+                    needed: 1,
+                    available: 0,
+                })?;
+                self.stack.push(value);
+            }
+            Instruction::Pop => {
+                self.stack.pop().ok_or(VmError::StackUnderflow {
+                    operation: "pop",
+                    needed: 1,
+                    available: 0,
+                })?;
+            }
+            Instruction::Eq => {
+                let (lhs, rhs) = self.pop_binary_operands("equal")?;
+                self.stack.push(i32::from(lhs == rhs));
+            }
+            Instruction::Lt => {
+                let (lhs, rhs) = self.pop_binary_operands("less-than")?;
+                self.stack.push(i32::from(lhs < rhs));
+            }
+            Instruction::Jmp(target) => {
+                if target >= program.len() {
+                    return Err(VmError::InvalidJump { target });
+                }
+                self.instruction_pointer = target;
+            }
+            Instruction::Jz(target) => {
+                if target >= program.len() {
+                    return Err(VmError::InvalidJump { target });
+                }
+                let condition = self.stack.pop().ok_or(VmError::StackUnderflow {
+                    operation: "jump-if-zero",
+                    needed: 1,
+                    available: 0,
+                })?;
+                if condition == 0 {
+                    self.instruction_pointer = target;
+                }
             }
             Instruction::Halt => {
                 let result = self.stack.last().copied().ok_or(VmError::EmptyStack)?;
@@ -336,6 +415,8 @@ fn debug_error_code(error: VmError) -> i32 {
         VmError::IntegerOverflow { .. } => -5,
         VmError::EmptyStack => -6,
         VmError::AlreadyHalted => -7,
+        VmError::InvalidJump { .. } => -10,
+        VmError::StepLimitExceeded { .. } => -11,
     }
 }
 
@@ -374,7 +455,9 @@ pub extern "C" fn debug_program_begin() {
 }
 
 /// Append an instruction. Codes are `0 = PUSH`, `1 = ADD`, `2 = SUB`,
-/// `3 = MUL`, `4 = DIV`, and `5 = HALT`; only PUSH uses `operand`.
+/// `3 = MUL`, `4 = DIV`, `5 = HALT`, `6 = DUP`, `7 = POP`, `8 = EQ`,
+/// `9 = LT`, `10 = JMP`, and `11 = JZ`; PUSH uses `operand` as the value
+/// and JMP/JZ use it as the target instruction index.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
@@ -385,6 +468,22 @@ pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
         3 => Instruction::Mul,
         4 => Instruction::Div,
         5 => Instruction::Halt,
+        6 => Instruction::Dup,
+        7 => Instruction::Pop,
+        8 => Instruction::Eq,
+        9 => Instruction::Lt,
+        10 => {
+            let Ok(target) = usize::try_from(operand) else {
+                return -10;
+            };
+            Instruction::Jmp(target)
+        }
+        11 => {
+            let Ok(target) = usize::try_from(operand) else {
+                return -10;
+            };
+            Instruction::Jz(target)
+        }
         _ => return -8,
     };
     PROGRAM_BUILDER.with(|builder| {
@@ -496,7 +595,7 @@ pub extern "C" fn debug_stack_at(index: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, StepResult, Vm, VmError};
+    use super::{Instruction, MAX_VM_STEPS, StepResult, Vm, VmError};
 
     #[test]
     fn adds_two_values() {
@@ -679,5 +778,103 @@ mod tests {
         vm.run(&program).unwrap();
 
         assert_eq!(vm.step(&program), Err(VmError::AlreadyHalted));
+    }
+
+    #[test]
+    fn duplicates_discards_and_compares_values() {
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(9),
+                Instruction::Dup,
+                Instruction::Add,
+                Instruction::Halt,
+            ]),
+            Ok(18)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(9),
+                Instruction::Push(1),
+                Instruction::Pop,
+                Instruction::Halt,
+            ]),
+            Ok(9)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(3),
+                Instruction::Push(3),
+                Instruction::Eq,
+                Instruction::Halt,
+            ]),
+            Ok(1)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(3),
+                Instruction::Push(4),
+                Instruction::Eq,
+                Instruction::Halt,
+            ]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(2),
+                Instruction::Push(5),
+                Instruction::Lt,
+                Instruction::Halt,
+            ]),
+            Ok(1)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(5),
+                Instruction::Push(2),
+                Instruction::Lt,
+                Instruction::Halt,
+            ]),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn executes_a_countdown_loop_to_zero() {
+        // 0: PUSH 5 | 1: DUP | 2: JZ 6 | 3: PUSH 1 | 4: SUB | 5: JMP 1 | 6: HALT
+        let program = [
+            Instruction::Push(5),
+            Instruction::Dup,
+            Instruction::Jz(6),
+            Instruction::Push(1),
+            Instruction::Sub,
+            Instruction::Jmp(1),
+            Instruction::Halt,
+        ];
+
+        assert_eq!(Vm::new().run(&program), Ok(0));
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_jump_at_runtime() {
+        let program = [Instruction::Jmp(99)];
+
+        assert_eq!(
+            Vm::new().step(&program),
+            Err(VmError::InvalidJump { target: 99 })
+        );
+    }
+
+    #[test]
+    fn bounds_execution_of_non_terminating_loops() {
+        let program = [Instruction::Jmp(0)];
+
+        assert_eq!(
+            Vm::new().run(&program),
+            Err(VmError::StepLimitExceeded {
+                limit: MAX_VM_STEPS
+            })
+        );
     }
 }

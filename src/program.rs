@@ -29,42 +29,117 @@ impl Program {
                 ),
             ));
         }
-
-        let mut depth = 0usize;
-        let mut max_stack_depth = 0usize;
+        // Reject out-of-range jump targets anywhere in the program,
+        // including unreachable instructions, so invalid targets fail
+        // closed at the validation boundary rather than at runtime.
+        // Likewise, instructions after HALT stay unreachable by
+        // construction; both checks precede the end-with-HALT check to
+        // preserve the historical error precedence.
         for (index, instruction) in instructions.iter().enumerate() {
-            match instruction {
-                Instruction::Push(_) => {
-                    depth += 1;
-                    max_stack_depth = max_stack_depth.max(depth);
-                }
-                Instruction::Add | Instruction::Sub | Instruction::Mul | Instruction::Div => {
-                    if depth < 2 {
-                        return Err(ProgramError::new(
-                            Some(index + 1),
-                            format!("{} requires two stack values", instruction.name()),
-                        ));
-                    }
-                    depth -= 1;
-                }
-                Instruction::Halt => {
-                    if depth == 0 {
-                        return Err(ProgramError::new(
-                            Some(index + 1),
-                            "HALT requires a result on the stack",
-                        ));
-                    }
-                    if index + 1 != instructions.len() {
-                        return Err(ProgramError::new(
-                            Some(index + 2),
-                            "instructions after HALT are unreachable",
-                        ));
-                    }
-                }
+            if matches!(instruction, Instruction::Halt) && index + 1 != instructions.len() {
+                return Err(ProgramError::new(
+                    Some(index + 2),
+                    "instructions after HALT are unreachable",
+                ));
+            }
+            let target = match instruction {
+                Instruction::Jmp(target) | Instruction::Jz(target) => *target,
+                _ => continue,
+            };
+            if target >= instructions.len() {
+                return Err(ProgramError::new(
+                    Some(index + 1),
+                    format!(
+                        "{} target {target} is outside the program",
+                        instruction.name()
+                    ),
+                ));
             }
         }
         if !matches!(instructions.last(), Some(Instruction::Halt)) {
             return Err(ProgramError::new(None, "program must end with HALT"));
+        }
+
+        // Static stack validation is flow-sensitive because jumps create
+        // branches and loops. Walk the reachable control-flow graph with an
+        // explicit worklist, tracking the stack depth at each instruction.
+        // Joins must agree on one depth so every execution has an
+        // unambiguous stack; runtime checks remain the authority for
+        // underflow on unvalidated paths.
+        let mut depth_at: Vec<Option<usize>> = vec![None; instructions.len()];
+        let mut max_stack_depth = 0usize;
+        let mut worklist = vec![(0usize, 0usize)];
+        while let Some((index, depth)) = worklist.pop() {
+            if let Some(known) = depth_at[index] {
+                if known != depth {
+                    return Err(ProgramError::new(
+                        Some(index + 1),
+                        format!(
+                            "ambiguous stack depth at instruction {}: joined paths disagree ({known} vs {depth})",
+                            index + 1
+                        ),
+                    ));
+                }
+                continue;
+            }
+            depth_at[index] = Some(depth);
+            let instruction = instructions[index];
+            // Minimum stack depth required before this instruction.
+            let required = match instruction {
+                Instruction::Push(_) | Instruction::Jmp(_) => 0,
+                Instruction::Dup | Instruction::Pop | Instruction::Jz(_) => 1,
+                Instruction::Halt => 1,
+                Instruction::Add
+                | Instruction::Sub
+                | Instruction::Mul
+                | Instruction::Div
+                | Instruction::Eq
+                | Instruction::Lt => 2,
+            };
+            if depth < required {
+                return Err(ProgramError::new(
+                    Some(index + 1),
+                    format!("{} requires {required} stack values", instruction.name()),
+                ));
+            }
+            // Depth after this instruction executes.
+            let next_depth = match instruction {
+                Instruction::Push(_) | Instruction::Dup => depth + 1,
+                Instruction::Jmp(_) | Instruction::Halt => depth,
+                Instruction::Pop
+                | Instruction::Jz(_)
+                | Instruction::Add
+                | Instruction::Sub
+                | Instruction::Mul
+                | Instruction::Div
+                | Instruction::Eq
+                | Instruction::Lt => depth - 1,
+            };
+            max_stack_depth = max_stack_depth.max(next_depth);
+            match instruction {
+                Instruction::Push(_)
+                | Instruction::Dup
+                | Instruction::Pop
+                | Instruction::Add
+                | Instruction::Sub
+                | Instruction::Mul
+                | Instruction::Div
+                | Instruction::Eq
+                | Instruction::Lt => {
+                    worklist.push((index + 1, next_depth));
+                }
+                Instruction::Jmp(target) => {
+                    worklist.push((target, next_depth));
+                }
+                Instruction::Jz(target) => {
+                    // Explore the fallthrough first so joins report the
+                    // target path against the linear path, matching the
+                    // order a reader follows through the program.
+                    worklist.push((target, next_depth));
+                    worklist.push((index + 1, next_depth));
+                }
+                Instruction::Halt => {}
+            }
         }
 
         Ok(Self {
@@ -119,7 +194,9 @@ impl FromStr for Program {
                         "PUSH requires exactly one operand",
                     ));
                 }
-                "ADD" | "SUB" | "MUL" | "DIV" | "HALT" if fields.len() != 1 => {
+                "ADD" | "SUB" | "MUL" | "DIV" | "DUP" | "POP" | "EQ" | "LT" | "HALT"
+                    if fields.len() != 1 =>
+                {
                     return Err(ProgramError::new(
                         Some(source_line),
                         format!("{opcode} does not accept operands"),
@@ -129,7 +206,30 @@ impl FromStr for Program {
                 "SUB" => Instruction::Sub,
                 "MUL" => Instruction::Mul,
                 "DIV" => Instruction::Div,
+                "DUP" => Instruction::Dup,
+                "POP" => Instruction::Pop,
+                "EQ" => Instruction::Eq,
+                "LT" => Instruction::Lt,
                 "HALT" => Instruction::Halt,
+                "JMP" | "JZ" if fields.len() == 2 => {
+                    let target: usize = fields[1].parse().map_err(|_| {
+                        ProgramError::new(
+                            Some(source_line),
+                            format!("{opcode} target must be an instruction index"),
+                        )
+                    })?;
+                    if opcode.as_str() == "JMP" {
+                        Instruction::Jmp(target)
+                    } else {
+                        Instruction::Jz(target)
+                    }
+                }
+                "JMP" | "JZ" => {
+                    return Err(ProgramError::new(
+                        Some(source_line),
+                        format!("{opcode} requires exactly one target index"),
+                    ));
+                }
                 _ => {
                     return Err(ProgramError::new(
                         Some(source_line),
@@ -217,6 +317,48 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("after HALT")
+        );
+    }
+
+    #[test]
+    fn parses_control_flow_and_disassembles_targets() {
+        let program: Program = "PUSH 5\nDUP\nJZ 6\nPUSH 1\nSUB\nJMP 1\nHALT"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            program.disassemble(),
+            "0000  PUSH 5\n0001  DUP\n0002  JZ 6\n0003  PUSH 1\n0004  SUB\n0005  JMP 1\n0006  HALT"
+        );
+        assert_eq!(program.max_stack_depth(), 2);
+    }
+
+    #[test]
+    fn rejects_out_of_range_jump_targets() {
+        assert!(
+            "PUSH 1\nJMP 9\nHALT"
+                .parse::<Program>()
+                .unwrap_err()
+                .to_string()
+                .contains("outside the program")
+        );
+        assert!(
+            "JZ".parse::<Program>()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one target index")
+        );
+    }
+
+    #[test]
+    fn rejects_branches_that_disagree_on_stack_depth() {
+        // The fallthrough path reaches HALT with depth 1 while the JZ path
+        // arrives with depth 0: the join is ambiguous, so validation fails.
+        assert!(
+            "PUSH 1\nJZ 3\nPUSH 2\nHALT"
+                .parse::<Program>()
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous stack depth")
         );
     }
 }

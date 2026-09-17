@@ -536,13 +536,16 @@ function debugErrorMessage(code) {
     "-7": "the VM is already halted",
     "-8": "unknown operation",
     "-9": "program failed validation or exceeds the instruction limit",
+    "-10": "jump target is outside the program",
+    "-11": "execution exceeded the step limit (possible infinite loop)",
   };
 
   return messages[code] ?? `VM error (${code})`;
 }
 
 function loadAssembly(source, instance) {
-  const opcodeByName = { ADD: 1, SUB: 2, MUL: 3, DIV: 4, HALT: 5 };
+  const opcodeByName = { ADD: 1, SUB: 2, MUL: 3, DIV: 4, HALT: 5, DUP: 6, POP: 7, EQ: 8, LT: 9 };
+  const jumpOpcodes = { JMP: 10, JZ: 11 };
   const lines = source.split(/;|\n/).map(line => line.trim()).filter(Boolean);
   const instructions = [];
   for (const line of lines) {
@@ -555,6 +558,13 @@ function loadAssembly(source, instance) {
         return false;
       }
       instructions.push({ opcode: 0, operand, text: `PUSH ${operand}` });
+    } else if (Object.hasOwn(jumpOpcodes, name) && fields.length === 2) {
+      const operand = Number(fields[1]);
+      if (!Number.isInteger(operand) || operand < 0) {
+        writeLine(`[error] ${name} target must be an instruction index: ${fields[1]}`, "error");
+        return false;
+      }
+      instructions.push({ opcode: jumpOpcodes[name], operand, text: `${name} ${operand}` });
     } else if (Object.hasOwn(opcodeByName, name) && fields.length === 1) {
       instructions.push({ opcode: opcodeByName[name], operand: 0, text: name });
     } else {
