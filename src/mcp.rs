@@ -278,8 +278,9 @@ impl crate::agent::Tool for McpToolAdapter {
         &self,
         _arguments: &crate::agent::ToolArguments,
     ) -> Option<crate::agent::PermissionRequest> {
+        let safe_name = self.remote_name.replace([':', ' ', '\n', '\r', '\t'], "_");
         Some(crate::agent::PermissionRequest {
-            id: format!("mcp:{}", self.remote_name),
+            id: format!("mcp:{}", safe_name),
             tool: self.registry_name.clone(),
             description: format!("call MCP tool '{}'", self.remote_name),
         })

@@ -17,6 +17,10 @@ use crate::agent::{
     PermissionRequest, Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ToolValue,
 };
 
+fn sanitize_permission_component(value: &str) -> String {
+    value.replace([':', ' ', '\n', '\r', '\t'], "_")
+}
+
 const MAX_FILE_BYTES: usize = 128 * 1024;
 const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
@@ -412,7 +416,7 @@ impl Tool for WriteFileTool {
     fn permission(&self, arguments: &ToolArguments) -> Option<PermissionRequest> {
         let path = optional_text(arguments, "path").unwrap_or("<invalid path>");
         Some(PermissionRequest {
-            id: format!("write_file:{path}"),
+            id: format!("write_file:{}", sanitize_permission_component(path)),
             tool: "write_file".to_owned(),
             description: format!("write workspace file '{path}'"),
         })
@@ -464,7 +468,7 @@ impl Tool for RunCommandTool {
     fn permission(&self, arguments: &ToolArguments) -> Option<PermissionRequest> {
         let command = optional_text(arguments, "command").unwrap_or("<invalid command>");
         Some(PermissionRequest {
-            id: format!("run_command:{command}"),
+            id: format!("run_command:{}", sanitize_permission_component(command)),
             tool: "run_command".to_owned(),
             description: format!("run command in workspace: {command}"),
         })
