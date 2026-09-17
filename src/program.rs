@@ -89,6 +89,7 @@ impl Program {
                 Instruction::Push(_) | Instruction::Jmp(_) => 0,
                 Instruction::Dup | Instruction::Pop | Instruction::Jz(_) => 1,
                 Instruction::Halt => 1,
+                Instruction::Swap | Instruction::Over => 2,
                 Instruction::Add
                 | Instruction::Sub
                 | Instruction::Mul
@@ -104,8 +105,8 @@ impl Program {
             }
             // Depth after this instruction executes.
             let next_depth = match instruction {
-                Instruction::Push(_) | Instruction::Dup => depth + 1,
-                Instruction::Jmp(_) | Instruction::Halt => depth,
+                Instruction::Push(_) | Instruction::Dup | Instruction::Over => depth + 1,
+                Instruction::Jmp(_) | Instruction::Halt | Instruction::Swap => depth,
                 Instruction::Pop
                 | Instruction::Jz(_)
                 | Instruction::Add
@@ -120,6 +121,8 @@ impl Program {
                 Instruction::Push(_)
                 | Instruction::Dup
                 | Instruction::Pop
+                | Instruction::Swap
+                | Instruction::Over
                 | Instruction::Add
                 | Instruction::Sub
                 | Instruction::Mul
@@ -194,7 +197,8 @@ impl FromStr for Program {
                         "PUSH requires exactly one operand",
                     ));
                 }
-                "ADD" | "SUB" | "MUL" | "DIV" | "DUP" | "POP" | "EQ" | "LT" | "HALT"
+                "ADD" | "SUB" | "MUL" | "DIV" | "DUP" | "POP" | "SWAP" | "OVER" | "EQ" | "LT"
+                | "HALT"
                     if fields.len() != 1 =>
                 {
                     return Err(ProgramError::new(
@@ -208,6 +212,8 @@ impl FromStr for Program {
                 "DIV" => Instruction::Div,
                 "DUP" => Instruction::Dup,
                 "POP" => Instruction::Pop,
+                "SWAP" => Instruction::Swap,
+                "OVER" => Instruction::Over,
                 "EQ" => Instruction::Eq,
                 "LT" => Instruction::Lt,
                 "HALT" => Instruction::Halt,
@@ -359,6 +365,23 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("ambiguous stack depth")
+        );
+    }
+
+    #[test]
+    fn validates_an_accumulator_loop_with_swap_and_over() {
+        let program: Program = "PUSH 0\nPUSH 5\nDUP\nJZ 14\nSWAP\nOVER\nADD\nSWAP\nDUP\nPUSH 1\nSUB\nSWAP\nPOP\nJMP 2\nPOP\nHALT"
+            .parse()
+            .unwrap();
+        assert_eq!(program.max_stack_depth(), 4);
+        assert_eq!(
+            program.disassemble().lines().next().unwrap(),
+            "0000  PUSH 0"
+        );
+        assert!(
+            program
+                .disassemble()
+                .contains("0005  OVER\n0006  ADD\n0007  SWAP")
         );
     }
 }

@@ -54,6 +54,10 @@ pub enum Instruction {
     Dup,
     /// Discard the value at the top of the stack.
     Pop,
+    /// Swap the two values at the top of the stack.
+    Swap,
+    /// Copy the second value from the top onto the top of the stack.
+    Over,
     /// Pop two values and push 1 if they are equal, else 0.
     Eq,
     /// Pop two values and push 1 if the first is less than the second, else 0.
@@ -76,6 +80,8 @@ impl Instruction {
             Self::Div => "DIV",
             Self::Dup => "DUP",
             Self::Pop => "POP",
+            Self::Swap => "SWAP",
+            Self::Over => "OVER",
             Self::Eq => "EQ",
             Self::Lt => "LT",
             Self::Jmp(_) => "JMP",
@@ -263,6 +269,28 @@ impl Vm {
                     needed: 1,
                     available: 0,
                 })?;
+            }
+            Instruction::Swap => {
+                if self.stack.len() < 2 {
+                    return Err(VmError::StackUnderflow {
+                        operation: "swap",
+                        needed: 2,
+                        available: self.stack.len(),
+                    });
+                }
+                let len = self.stack.len();
+                self.stack.swap(len - 1, len - 2);
+            }
+            Instruction::Over => {
+                if self.stack.len() < 2 {
+                    return Err(VmError::StackUnderflow {
+                        operation: "over",
+                        needed: 2,
+                        available: self.stack.len(),
+                    });
+                }
+                let value = self.stack[self.stack.len() - 2];
+                self.stack.push(value);
             }
             Instruction::Eq => {
                 let (lhs, rhs) = self.pop_binary_operands("equal")?;
@@ -456,8 +484,9 @@ pub extern "C" fn debug_program_begin() {
 
 /// Append an instruction. Codes are `0 = PUSH`, `1 = ADD`, `2 = SUB`,
 /// `3 = MUL`, `4 = DIV`, `5 = HALT`, `6 = DUP`, `7 = POP`, `8 = EQ`,
-/// `9 = LT`, `10 = JMP`, and `11 = JZ`; PUSH uses `operand` as the value
-/// and JMP/JZ use it as the target instruction index.
+/// `9 = LT`, `10 = JMP`, `11 = JZ`, `12 = SWAP`, and `13 = OVER`;
+/// PUSH uses `operand` as the value and JMP/JZ use it as the target
+/// instruction index.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
@@ -484,6 +513,8 @@ pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
             };
             Instruction::Jz(target)
         }
+        12 => Instruction::Swap,
+        13 => Instruction::Over,
         _ => return -8,
     };
     PROGRAM_BUILDER.with(|builder| {
@@ -876,5 +907,79 @@ mod tests {
                 limit: MAX_VM_STEPS
             })
         );
+    }
+
+    #[test]
+    fn swaps_and_copies_second_stack_values() {
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(1),
+                Instruction::Push(2),
+                Instruction::Swap,
+                Instruction::Halt,
+            ]),
+            Ok(1)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(1),
+                Instruction::Push(2),
+                Instruction::Over,
+                Instruction::Halt,
+            ]),
+            Ok(1)
+        );
+        assert_eq!(
+            Vm::new().step(&[Instruction::Push(1), Instruction::Swap]),
+            Ok(StepResult::Executed {
+                instruction: Instruction::Push(1)
+            })
+        );
+        assert_eq!(
+            Vm::new().run(&[Instruction::Push(1), Instruction::Swap, Instruction::Halt]),
+            Err(VmError::StackUnderflow {
+                operation: "swap",
+                needed: 2,
+                available: 1,
+            })
+        );
+        assert_eq!(
+            Vm::new().run(&[Instruction::Push(1), Instruction::Over, Instruction::Halt]),
+            Err(VmError::StackUnderflow {
+                operation: "over",
+                needed: 2,
+                available: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn accumulates_the_sum_of_one_to_five() {
+        // acc=0, n=5; each pass adds n into acc and decrements n.
+        // 00 PUSH 0 | 01 PUSH 5 | 02 DUP | 03 JZ 14 | 04 SWAP | 05 OVER
+        // 06 ADD | 07 SWAP | 08 DUP | 09 PUSH 1 | 10 SUB | 11 SWAP
+        // 12 POP | 13 JMP 2 | 14 POP | 15 HALT
+        let program = [
+            Instruction::Push(0),
+            Instruction::Push(5),
+            Instruction::Dup,
+            Instruction::Jz(14),
+            Instruction::Swap,
+            Instruction::Over,
+            Instruction::Add,
+            Instruction::Swap,
+            Instruction::Dup,
+            Instruction::Push(1),
+            Instruction::Sub,
+            Instruction::Swap,
+            Instruction::Pop,
+            Instruction::Jmp(2),
+            Instruction::Pop,
+            Instruction::Halt,
+        ];
+
+        assert_eq!(Vm::new().run(&program), Ok(15));
     }
 }

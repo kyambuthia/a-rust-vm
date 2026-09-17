@@ -544,7 +544,7 @@ function debugErrorMessage(code) {
 }
 
 function loadAssembly(source, instance) {
-  const opcodeByName = { ADD: 1, SUB: 2, MUL: 3, DIV: 4, HALT: 5, DUP: 6, POP: 7, EQ: 8, LT: 9 };
+  const opcodeByName = { ADD: 1, SUB: 2, MUL: 3, DIV: 4, HALT: 5, DUP: 6, POP: 7, EQ: 8, LT: 9, SWAP: 12, OVER: 13 };
   const jumpOpcodes = { JMP: 10, JZ: 11 };
   const lines = source.split(/;|\n/).map(line => line.trim()).filter(Boolean);
   const instructions = [];
