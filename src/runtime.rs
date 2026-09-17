@@ -289,6 +289,12 @@ impl VirtualFileSystem {
             }
             None => 0,
         };
+        if old_size > self.byte_count {
+            return Err(RuntimeError::QuotaExceeded {
+                resource: "file bytes",
+                limit: self.byte_count,
+            });
+        }
         let new_bytes = self.byte_count - old_size + content.len();
         if new_bytes > self.limits.max_bytes {
             return Err(RuntimeError::QuotaExceeded {
