@@ -12,6 +12,8 @@ The VM, debugger, language, and LLVM work remain first-class features.
 
 - [x] Rust integer stack VM
 - [x] Arithmetic instructions and explicit execution errors
+- [x] Comparison, stack-manipulation, and control-flow instructions (EQ, LT,
+  DUP, POP, SWAP, OVER, JMP, JZ) with bounded execution and CFG validation
 - [x] `step`, `reset`, instruction-pointer, and stack inspection APIs
 - [x] Native CLI demo
 - [x] Browser terminal UI
@@ -88,21 +90,23 @@ The VM, debugger, language, and LLVM work remain first-class features.
 
 ### P2: A/RVM runtime and language
 
-- [ ] Program object with bytecode validation
-- [ ] Disassembler and stable instruction names
+- [x] Program object with bytecode validation
+- [x] Disassembler and stable instruction names
 - [x] Structured execution trace for agent-visible program runs
-- [ ] Constants, booleans, comparisons, and unary operations
+- [x] Constants, booleans, and comparisons (PUSH, 0/1 flags, EQ, LT)
+- [ ] Unary operations
 - [ ] Locals and variable storage
-- [ ] Conditional jumps and loops
+- [x] Conditional jumps and loops (JMP, JZ with join-depth validation)
 - [ ] Call frames, functions, and return values
-- [ ] Runtime limits for stack depth, program size, and execution steps
+- [x] Runtime limits for program size and execution steps
+- [ ] Runtime limit for stack depth
 - [x] Per-instance virtual filesystem with guest path containment and quotas
 - [x] Guest processes with deterministic round-robin scheduling
 - [x] Ownership-scoped in-memory VM manager API
 - [ ] VM manager with authenticated ownership and lifecycle controls
 - [ ] Host sandbox worker for native programs and external capabilities
 - [ ] Small source language with lexer, parser, AST, and compiler
-- [ ] Browser API for loading arbitrary validated programs
+- [x] Browser API for loading arbitrary validated programs
 - [ ] LLVM backend for optimized native and WebAssembly execution
 
 ### P2: Sessions and recovery
