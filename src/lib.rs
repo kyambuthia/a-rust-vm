@@ -145,6 +145,8 @@ pub enum VmError {
     EmptyStack,
     /// A jump targeted an instruction index outside the program.
     InvalidJump { target: usize },
+    /// The value stack grew past the bounded depth limit.
+    StackDepthExceeded { limit: usize },
     /// Execution exceeded the bounded step budget (loops must terminate).
     StepLimitExceeded { limit: usize },
     /// The VM was stepped after it had already halted.
@@ -157,6 +159,13 @@ pub enum VmError {
 /// fail closed instead of looping forever. Guest processes are bounded
 /// separately by the scheduler tick limits.
 pub const MAX_VM_STEPS: usize = 1_000_000;
+
+/// Upper bound on values held on the VM stack.
+///
+/// Validated programs are rejected when their statically computed depth
+/// exceeds this, and raw execution fails closed if growth passes it, so
+/// a long `PUSH` chain cannot grow memory without bound.
+pub const MAX_STACK_DEPTH: usize = 1_024;
 
 /// A simple integer stack virtual machine.
 #[derive(Debug, Default)]
@@ -241,7 +250,7 @@ impl Vm {
         self.instruction_pointer += 1;
 
         match instruction {
-            Instruction::Push(value) => self.stack.push(value),
+            Instruction::Push(value) => self.push_value(value)?,
             Instruction::Add => self.binary_operation("add", |lhs, rhs| lhs.checked_add(rhs))?,
             Instruction::Sub => {
                 self.binary_operation("subtract", |lhs, rhs| lhs.checked_sub(rhs))?
@@ -267,7 +276,7 @@ impl Vm {
                     needed: 1,
                     available: 0,
                 })?;
-                self.stack.push(value);
+                self.push_value(value)?;
             }
             Instruction::Pop => {
                 self.stack.pop().ok_or(VmError::StackUnderflow {
@@ -296,7 +305,7 @@ impl Vm {
                     });
                 }
                 let value = self.stack[self.stack.len() - 2];
-                self.stack.push(value);
+                self.push_value(value)?;
             }
             Instruction::Eq => {
                 let (lhs, rhs) = self.pop_binary_operands("equal")?;
@@ -396,6 +405,20 @@ impl Vm {
         let lhs = self.stack.pop().expect("length checked above");
         Ok((lhs, rhs))
     }
+
+    /// Push a value, failing closed when the stack is already at its bound.
+    ///
+    /// Only the growing instructions (PUSH, DUP, OVER) go through this
+    /// path; every other instruction pops at least as much as it pushes.
+    fn push_value(&mut self, value: i32) -> Result<(), VmError> {
+        if self.stack.len() >= MAX_STACK_DEPTH {
+            return Err(VmError::StackDepthExceeded {
+                limit: MAX_STACK_DEPTH,
+            });
+        }
+        self.stack.push(value);
+        Ok(())
+    }
 }
 
 /// Run the demo bytecode when this library is loaded as a WebAssembly module.
@@ -470,6 +493,7 @@ fn debug_error_code(error: VmError) -> i32 {
         VmError::AlreadyHalted => -7,
         VmError::InvalidJump { .. } => -10,
         VmError::StepLimitExceeded { .. } => -11,
+        VmError::StackDepthExceeded { .. } => -12,
     }
 }
 
@@ -653,7 +677,7 @@ pub extern "C" fn debug_stack_at(index: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, MAX_VM_STEPS, StepResult, Vm, VmError};
+    use super::{Instruction, MAX_STACK_DEPTH, MAX_VM_STEPS, StepResult, Vm, VmError};
 
     #[test]
     fn adds_two_values() {
@@ -1050,6 +1074,19 @@ mod tests {
                 operation: "not",
                 needed: 1,
                 available: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn fails_closed_when_the_stack_passes_its_depth_limit() {
+        let mut program = vec![Instruction::Push(1); MAX_STACK_DEPTH + 1];
+        program.push(Instruction::Halt);
+
+        assert_eq!(
+            Vm::new().run(&program),
+            Err(VmError::StackDepthExceeded {
+                limit: MAX_STACK_DEPTH
             })
         );
     }

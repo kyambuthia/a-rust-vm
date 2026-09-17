@@ -154,6 +154,15 @@ impl Program {
                 Instruction::Halt => {}
             }
         }
+        if max_stack_depth > crate::MAX_STACK_DEPTH {
+            return Err(ProgramError::new(
+                None,
+                format!(
+                    "program needs stack depth {max_stack_depth}; limit is {}",
+                    crate::MAX_STACK_DEPTH
+                ),
+            ));
+        }
 
         Ok(Self {
             instructions,
@@ -410,6 +419,19 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("does not accept operands")
+        );
+    }
+
+    #[test]
+    fn rejects_programs_needing_more_stack_than_the_limit() {
+        let mut instructions = vec![crate::Instruction::Push(1); crate::MAX_STACK_DEPTH + 1];
+        instructions.push(crate::Instruction::Halt);
+
+        assert!(
+            Program::new(instructions)
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
         );
     }
 }

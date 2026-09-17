@@ -538,6 +538,7 @@ function debugErrorMessage(code) {
     "-9": "program failed validation or exceeds the instruction limit",
     "-10": "jump target is outside the program",
     "-11": "execution exceeded the step limit (possible infinite loop)",
+    "-12": "value stack exceeded its depth limit",
   };
 
   return messages[code] ?? `VM error (${code})`;
