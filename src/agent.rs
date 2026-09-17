@@ -1247,7 +1247,7 @@ where
         let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
-            if self.cancel.load(Ordering::Relaxed) {
+            if self.cancel.load(Ordering::Acquire) {
                 events.push(AgentEvent::Cancelled);
                 events.push(AgentEvent::Done);
                 return Ok(events);
@@ -1359,7 +1359,7 @@ where
         let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
-            if self.cancel.load(Ordering::Relaxed) {
+            if self.cancel.load(Ordering::Acquire) {
                 emit(AgentEvent::Cancelled);
                 emit(AgentEvent::Done);
                 return Ok(());

@@ -200,7 +200,7 @@ impl ApprovalStore {
             .entry(id.to_owned())
             .or_insert(ApprovalState::Pending);
         loop {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Acquire) {
                 states.remove(id);
                 return crate::agent::PermissionDecision::Deny {
                     reason: "approval cancelled".to_owned(),
