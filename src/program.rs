@@ -87,7 +87,11 @@ impl Program {
             // Minimum stack depth required before this instruction.
             let required = match instruction {
                 Instruction::Push(_) | Instruction::Jmp(_) => 0,
-                Instruction::Dup | Instruction::Pop | Instruction::Jz(_) => 1,
+                Instruction::Dup
+                | Instruction::Pop
+                | Instruction::Jz(_)
+                | Instruction::Neg
+                | Instruction::Not => 1,
                 Instruction::Halt => 1,
                 Instruction::Swap | Instruction::Over => 2,
                 Instruction::Add
@@ -106,7 +110,11 @@ impl Program {
             // Depth after this instruction executes.
             let next_depth = match instruction {
                 Instruction::Push(_) | Instruction::Dup | Instruction::Over => depth + 1,
-                Instruction::Jmp(_) | Instruction::Halt | Instruction::Swap => depth,
+                Instruction::Jmp(_)
+                | Instruction::Halt
+                | Instruction::Swap
+                | Instruction::Neg
+                | Instruction::Not => depth,
                 Instruction::Pop
                 | Instruction::Jz(_)
                 | Instruction::Add
@@ -123,6 +131,8 @@ impl Program {
                 | Instruction::Pop
                 | Instruction::Swap
                 | Instruction::Over
+                | Instruction::Neg
+                | Instruction::Not
                 | Instruction::Add
                 | Instruction::Sub
                 | Instruction::Mul
@@ -197,8 +207,8 @@ impl FromStr for Program {
                         "PUSH requires exactly one operand",
                     ));
                 }
-                "ADD" | "SUB" | "MUL" | "DIV" | "DUP" | "POP" | "SWAP" | "OVER" | "EQ" | "LT"
-                | "HALT"
+                "ADD" | "SUB" | "MUL" | "DIV" | "DUP" | "POP" | "SWAP" | "OVER" | "NEG" | "NOT"
+                | "EQ" | "LT" | "HALT"
                     if fields.len() != 1 =>
                 {
                     return Err(ProgramError::new(
@@ -214,6 +224,8 @@ impl FromStr for Program {
                 "POP" => Instruction::Pop,
                 "SWAP" => Instruction::Swap,
                 "OVER" => Instruction::Over,
+                "NEG" => Instruction::Neg,
+                "NOT" => Instruction::Not,
                 "EQ" => Instruction::Eq,
                 "LT" => Instruction::Lt,
                 "HALT" => Instruction::Halt,
@@ -382,6 +394,22 @@ mod tests {
             program
                 .disassemble()
                 .contains("0005  OVER\n0006  ADD\n0007  SWAP")
+        );
+    }
+
+    #[test]
+    fn parses_unary_operations() {
+        let program: Program = "PUSH 5\nNEG\nNOT\nHALT".parse().unwrap();
+        assert_eq!(
+            program.disassemble(),
+            "0000  PUSH 5\n0001  NEG\n0002  NOT\n0003  HALT"
+        );
+        assert!(
+            "NEG 1"
+                .parse::<Program>()
+                .unwrap_err()
+                .to_string()
+                .contains("does not accept operands")
         );
     }
 }

@@ -62,6 +62,10 @@ pub enum Instruction {
     Eq,
     /// Pop two values and push 1 if the first is less than the second, else 0.
     Lt,
+    /// Pop one value and push its arithmetic negation.
+    Neg,
+    /// Pop one value and push 1 if it is zero, else 0.
+    Not,
     /// Jump unconditionally to the instruction at the given index.
     Jmp(usize),
     /// Pop a condition and jump to the given index if it is zero.
@@ -84,6 +88,8 @@ impl Instruction {
             Self::Over => "OVER",
             Self::Eq => "EQ",
             Self::Lt => "LT",
+            Self::Neg => "NEG",
+            Self::Not => "NOT",
             Self::Jmp(_) => "JMP",
             Self::Jz(_) => "JZ",
             Self::Halt => "HALT",
@@ -300,6 +306,25 @@ impl Vm {
                 let (lhs, rhs) = self.pop_binary_operands("less-than")?;
                 self.stack.push(i32::from(lhs < rhs));
             }
+            Instruction::Neg => {
+                let value = self.stack.pop().ok_or(VmError::StackUnderflow {
+                    operation: "negate",
+                    needed: 1,
+                    available: 0,
+                })?;
+                let result = value.checked_neg().ok_or(VmError::IntegerOverflow {
+                    operation: "negate",
+                })?;
+                self.stack.push(result);
+            }
+            Instruction::Not => {
+                let value = self.stack.pop().ok_or(VmError::StackUnderflow {
+                    operation: "not",
+                    needed: 1,
+                    available: 0,
+                })?;
+                self.stack.push(i32::from(value == 0));
+            }
             Instruction::Jmp(target) => {
                 if target >= program.len() {
                     return Err(VmError::InvalidJump { target });
@@ -484,9 +509,9 @@ pub extern "C" fn debug_program_begin() {
 
 /// Append an instruction. Codes are `0 = PUSH`, `1 = ADD`, `2 = SUB`,
 /// `3 = MUL`, `4 = DIV`, `5 = HALT`, `6 = DUP`, `7 = POP`, `8 = EQ`,
-/// `9 = LT`, `10 = JMP`, `11 = JZ`, `12 = SWAP`, and `13 = OVER`;
-/// PUSH uses `operand` as the value and JMP/JZ use it as the target
-/// instruction index.
+/// `9 = LT`, `10 = JMP`, `11 = JZ`, `12 = SWAP`, `13 = OVER`,
+/// `14 = NEG`, and `15 = NOT`; PUSH uses `operand` as the value and
+/// JMP/JZ use it as the target instruction index.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
@@ -515,6 +540,8 @@ pub extern "C" fn debug_program_push(opcode: i32, operand: i32) -> i32 {
         }
         12 => Instruction::Swap,
         13 => Instruction::Over,
+        14 => Instruction::Neg,
+        15 => Instruction::Not,
         _ => return -8,
     };
     PROGRAM_BUILDER.with(|builder| {
@@ -981,5 +1008,49 @@ mod tests {
         ];
 
         assert_eq!(Vm::new().run(&program), Ok(15));
+    }
+
+    #[test]
+    fn negates_and_logically_negates_values() {
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            vm.run(&[Instruction::Push(5), Instruction::Neg, Instruction::Halt]),
+            Ok(-5)
+        );
+        assert_eq!(
+            vm.run(&[
+                Instruction::Push(i32::MIN),
+                Instruction::Neg,
+                Instruction::Halt,
+            ]),
+            Err(VmError::IntegerOverflow {
+                operation: "negate"
+            })
+        );
+        assert_eq!(
+            vm.run(&[Instruction::Push(0), Instruction::Not, Instruction::Halt]),
+            Ok(1)
+        );
+        assert_eq!(
+            vm.run(&[Instruction::Push(42), Instruction::Not, Instruction::Halt]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm.run(&[Instruction::Neg, Instruction::Halt]),
+            Err(VmError::StackUnderflow {
+                operation: "negate",
+                needed: 1,
+                available: 0,
+            })
+        );
+        assert_eq!(
+            vm.run(&[Instruction::Not, Instruction::Halt]),
+            Err(VmError::StackUnderflow {
+                operation: "not",
+                needed: 1,
+                available: 0,
+            })
+        );
     }
 }
