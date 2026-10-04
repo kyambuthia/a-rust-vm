@@ -13,6 +13,12 @@ pub const MAX_MCP_PAGES: usize = 16;
 const MAX_MCP_TIMEOUT_SECS: u64 = 300;
 const MAX_MCP_STDERR_BYTES: usize = 16 * 1024;
 const MCP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Notifications or server requests tolerated before the awaited response.
+const MAX_MCP_INTERLEAVED_MESSAGES: usize = 256;
+/// Time a server gets to exit on stdin EOF once it has answered.
+const MCP_EXIT_GRACE: Duration = Duration::from_millis(500);
+/// Time to wait for a dead server's stderr when explaining a failure.
+const MCP_STDERR_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -175,10 +181,11 @@ impl McpClient {
             }
             let _ = stderr_tx.send(String::from_utf8_lossy(&captured).into_owned());
         });
-        let mut next_id = 1;
+        const INITIALIZE_ID: u64 = 1;
+        const REQUEST_ID: u64 = 2;
         let initialize = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": next_id,
+            "id": INITIALIZE_ID,
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
@@ -186,45 +193,63 @@ impl McpClient {
                 "clientInfo": {"name": "a-rust-vm", "version": env!("CARGO_PKG_VERSION")},
             },
         });
-        next_id += 1;
         write_line(&mut stdin, &initialize)?;
-        let first = receive_line(&line_rx, deadline, "initialize")?;
-        let first_value: serde_json::Value = serde_json::from_str(&first).map_err(|error| {
-            McpError::new(format!("mcp initialize response is invalid: {error}"))
-        })?;
-        require_result(&first_value, "initialize")?;
+        // If the server dies instead of answering, its stderr explains why.
+        let explain = |error: McpError| match stderr_rx.recv_timeout(MCP_STDERR_GRACE) {
+            Ok(stderr) if !stderr.trim().is_empty() => {
+                McpError::new(format!("{error}: {}", stderr.trim()))
+            }
+            _ => error,
+        };
+        let initialized =
+            receive_response(&line_rx, deadline, "initialize", INITIALIZE_ID).map_err(explain)?;
+        require_result(&initialized, "initialize")?;
         ensure_before_deadline(deadline, method)?;
+        write_line(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }),
+        )?;
         let request = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": next_id,
+            "id": REQUEST_ID,
             "method": method,
             "params": params,
         });
         write_line(&mut stdin, &request)?;
         drop(stdin);
-        let line = receive_line(&line_rx, deadline, method)?;
-        let value: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|error| McpError::new(format!("mcp {method} response is invalid: {error}")))?;
-        if let Some(error) = value.get("error") {
-            return Err(McpError::new(format!(
-                "mcp {method} failed: {}",
-                compact_json(error)
-            )));
-        }
-        let status = child.wait_until(deadline, method)?;
-        if !status.success() {
-            let stderr = stderr_rx.recv().unwrap_or_default();
-            let detail = stderr.trim();
-            if detail.is_empty() {
-                return Err(McpError::new(format!("mcp server exited with {status}")));
-            }
-            return Err(McpError::new(format!(
-                "mcp server exited with {status}: {detail}"
-            )));
-        }
+        let value = receive_response(&line_rx, deadline, method, REQUEST_ID).map_err(explain)?;
         require_result(&value, method)?;
+        // The response is authoritative. Give the server a moment to exit on
+        // EOF; the guard reaps it either way.
+        let _ = child.wait_until((Instant::now() + MCP_EXIT_GRACE).min(deadline), method);
         Ok(value)
     }
+}
+
+/// Wait for the response to request `id`, skipping the notifications and
+/// server-initiated requests that servers may interleave before it.
+fn receive_response(
+    receiver: &mpsc::Receiver<Result<String, McpError>>,
+    deadline: Instant,
+    method: &str,
+    id: u64,
+) -> Result<serde_json::Value, McpError> {
+    for _ in 0..=MAX_MCP_INTERLEAVED_MESSAGES {
+        let line = receive_line(receiver, deadline, method)?;
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| McpError::new(format!("mcp {method} response is invalid: {error}")))?;
+        let is_response = value.get("method").is_none()
+            && value.get("id").and_then(serde_json::Value::as_u64) == Some(id);
+        if is_response {
+            return Ok(value);
+        }
+    }
+    Err(McpError::new(format!(
+        "mcp {method} response did not arrive within {MAX_MCP_INTERLEAVED_MESSAGES} messages"
+    )))
 }
 
 #[derive(Debug, Clone)]
@@ -656,7 +681,7 @@ mod tests {
 
     #[test]
     fn lists_tools_from_a_stdio_server() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object"}}]}}'"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object"}}]}}'"#;
         let tools = client(script).list_tools().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
@@ -665,7 +690,7 @@ mod tests {
 
     #[test]
     fn follows_cursor_pagination_across_spawned_servers() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; case "$l2" in *cursor-1*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"second"}]}}';; *) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first"}],"nextCursor":"cursor-1"}}';; esac"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; case "$l2" in *cursor-1*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"second"}]}}';; *) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first"}],"nextCursor":"cursor-1"}}';; esac"#;
         let tools = client(script).list_tools().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "first");
@@ -673,8 +698,30 @@ mod tests {
     }
 
     #[test]
+    fn follows_the_handshake_and_skips_interleaved_messages() {
+        // Answers only after seeing notifications/initialized, interleaves a
+        // log notification and a server request, and never exits on EOF.
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read n; case "$n" in *notifications/initialized*) ;; *) exit 3;; esac; read l2; echo '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"working"}}'; echo '{"jsonrpc":"2.0","id":2,"method":"ping"}'; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}'; sleep 5"#;
+        let started = std::time::Instant::now();
+        let output = client(script)
+            .call_tool("echo", serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(output, "ok");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_stderr_when_the_server_dies_without_answering() {
+        let error = client("read l1; echo 'missing API token' >&2; exit 1")
+            .list_tools()
+            .unwrap_err();
+        assert!(error.to_string().contains("missing API token"), "{error}");
+    }
+
+    #[test]
     fn calls_a_tool_and_joins_text_content() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}}'"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}}'"#;
         let output = client(script)
             .call_tool("echo", serde_json::json!({"text": "hi"}))
             .unwrap();
@@ -683,7 +730,7 @@ mod tests {
 
     #[test]
     fn surfaces_tool_errors_and_rejects_empty_names() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad input"}],"isError":true}}'"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad input"}],"isError":true}}'"#;
         let client = client(script);
         assert!(client.call_tool("", serde_json::Value::Null).is_err());
         assert!(
@@ -697,8 +744,7 @@ mod tests {
 
     #[test]
     fn fails_closed_on_malformed_and_oversized_output() {
-        let malformed =
-            r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo 'not json'"#;
+        let malformed = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo 'not json'"#;
         assert!(
             client(malformed)
                 .list_tools()
@@ -715,7 +761,7 @@ mod tests {
         })
         .unwrap();
         assert!(missing.list_tools().is_err());
-        let huge = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; head -c 70000 /dev/zero | tr '\0' 'a'; echo"#;
+        let huge = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; head -c 70000 /dev/zero | tr '\0' 'a'; echo"#;
         assert!(
             client(huge)
                 .list_tools()
@@ -773,7 +819,7 @@ mod tests {
 
     #[test]
     fn adapter_converts_arguments_and_returns_remote_text() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; case "$l2" in *'"count":3'*'"flag":true'*'"items":[1,"two"]'*'"text":"hi"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}';; *) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad args"}],"isError":true}}';; esac"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; case "$l2" in *'"count":3'*'"flag":true'*'"items":[1,"two"]'*'"text":"hi"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}';; *) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad args"}],"isError":true}}';; esac"#;
         let mut adapter = adapter(script, &echo_tool());
         let mut arguments = ToolArguments::new();
         arguments.insert("text".to_owned(), ToolValue::Text("hi".to_owned()));
@@ -792,7 +838,7 @@ mod tests {
 
     #[test]
     fn adapter_surfaces_remote_errors_fail_closed() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad input"}],"isError":true}}'"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"bad input"}],"isError":true}}'"#;
         let mut adapter = adapter(script, &echo_tool());
         let error = adapter.execute(&ToolArguments::new()).unwrap_err();
         assert!(error.to_string().contains("failed"));
@@ -800,7 +846,7 @@ mod tests {
 
     #[test]
     fn registry_lists_and_registers_discovered_tools() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}'"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}'"#;
         let registry = mcp_tool_registry(&shell_config(script)).unwrap();
         assert_eq!(registry.specs().len(), 1);
         assert_eq!(registry.specs()[0].name, "mcp_echo");
@@ -810,7 +856,7 @@ mod tests {
 
     #[test]
     fn registry_rejects_conflicting_discovered_names() {
-        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"Echo"},{"name":"echo "}]}}'"#;
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"Echo"},{"name":"echo "}]}}'"#;
         assert!(mcp_tool_registry(&shell_config(script)).is_err());
     }
 }
