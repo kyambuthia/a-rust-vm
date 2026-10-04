@@ -42,6 +42,8 @@ const MAX_JOBS_PER_SESSION: usize = 64;
 const MAX_GLOBAL_SESSIONS: usize = 128;
 const AGENT_TTL_STEP_LIMIT: usize = 8;
 const SESSION_TTL: Duration = Duration::from_secs(1800);
+/// Minimum idle time before a live session may be evicted to admit a new one.
+const MIN_EVICTABLE_IDLE: Duration = Duration::from_secs(300);
 const MAX_GLOBAL_CONCURRENT_AGENTS: usize = 32;
 const MAX_ACTIVE_CONNECTIONS: usize = 256;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -270,6 +272,37 @@ impl ApprovalStore {
     }
 }
 
+/// Ensure the session map has room for one more session.
+///
+/// At capacity, only the least-recently-seen session that has been idle for
+/// [`MIN_EVICTABLE_IDLE`] and has no agent run in flight may be evicted.
+/// Otherwise creation fails closed, so a burst of cookieless requests cannot
+/// evict active users and discard their guest state.
+fn make_room_for_session(
+    map: &mut BTreeMap<String, Arc<SessionData>>,
+    now: Instant,
+) -> Result<(), String> {
+    if map.len() < MAX_GLOBAL_SESSIONS {
+        return Ok(());
+    }
+    let evictable = map
+        .iter()
+        .map(|(id, session)| (id, *lock_recover(&session.last_seen), session))
+        .filter(|(_, last_seen, session)| {
+            now.duration_since(*last_seen) >= MIN_EVICTABLE_IDLE
+                && !*lock_recover(&session.agent_active)
+        })
+        .min_by_key(|(_, last_seen, _)| *last_seen)
+        .map(|(id, _, _)| id.clone());
+    match evictable {
+        Some(id) => {
+            map.remove(&id);
+            Ok(())
+        }
+        None => Err("anonymous session capacity reached".to_owned()),
+    }
+}
+
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -354,15 +387,7 @@ impl AnonStore {
                         if current_timestamp.saturating_sub(stored.last_seen_at)
                             <= SESSION_TTL.as_secs() =>
                     {
-                        if map.len() >= MAX_GLOBAL_SESSIONS {
-                            if let Some(oldest) = map
-                                .iter()
-                                .min_by_key(|(_, s)| *s.last_seen.lock().unwrap())
-                                .map(|(k, _)| k.clone())
-                            {
-                                map.remove(&oldest);
-                            }
-                        }
+                        make_room_for_session(&mut map, now)?;
                         let restored = stored
                             .snapshot
                             .restore()
@@ -393,16 +418,7 @@ impl AnonStore {
                 }
             }
         }
-        #[allow(clippy::collapsible_if)]
-        if map.len() >= MAX_GLOBAL_SESSIONS {
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, s)| *s.last_seen.lock().unwrap())
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
-        }
+        make_room_for_session(&mut map, now)?;
         let id = generate_sid()
             .ok_or_else(|| "secure anonymous session generation unavailable".to_owned())?;
         let sess = Arc::new(SessionData {
@@ -1758,6 +1774,36 @@ mod tests {
                 .unwrap(),
             "secret-a"
         );
+    }
+
+    #[test]
+    fn session_capacity_does_not_evict_recently_active_sessions() {
+        let store = super::AnonStore::new();
+        let (first, first_cookie) = store.resolve(None, "anonymous").unwrap();
+        let first_cookie = first_cookie.unwrap();
+        for _ in 1..super::MAX_GLOBAL_SESSIONS {
+            store.resolve(None, "anonymous").unwrap();
+        }
+
+        // A flood of new visitors must not push out an active session.
+        assert!(store.resolve(None, "anonymous").is_err());
+        let (still_first, _) = store.resolve(Some(&first_cookie), "anonymous").unwrap();
+        assert_eq!(still_first.id, first.id);
+
+        // Once a session has been idle long enough it may make room...
+        let idle_since = std::time::Instant::now()
+            .checked_sub(super::MIN_EVICTABLE_IDLE + std::time::Duration::from_secs(1))
+            .unwrap();
+        *first.last_seen.lock().unwrap() = idle_since;
+        // ...unless an agent run is still in flight for it.
+        *first.agent_active.lock().unwrap() = true;
+        assert!(store.resolve(None, "anonymous").is_err());
+        *first.agent_active.lock().unwrap() = false;
+
+        let (newcomer, cookie) = store.resolve(None, "anonymous").unwrap();
+        assert!(cookie.is_some());
+        assert_ne!(newcomer.id, first.id);
+        assert!(!store.sessions.lock().unwrap().contains_key(&first.id));
     }
 
     #[test]
