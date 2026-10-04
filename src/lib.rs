@@ -446,55 +446,6 @@ impl Vm {
     }
 }
 
-/// Run the demo bytecode when this library is loaded as a WebAssembly module.
-///
-/// This intentionally exposes a small C-compatible boundary. Later we can
-/// replace it with an API for sending complete bytecode programs from
-/// JavaScript.
-#[cfg(target_arch = "wasm32")]
-#[unsafe(no_mangle)]
-pub extern "C" fn run_demo() -> i32 {
-    let program = [
-        Instruction::Push(2),
-        Instruction::Push(3),
-        Instruction::Push(4),
-        Instruction::Mul,
-        Instruction::Add,
-        Instruction::Halt,
-    ];
-
-    Vm::new()
-        .run(&program)
-        .expect("the demo bytecode should always execute successfully")
-}
-
-/// Execute one binary operation supplied by JavaScript.
-///
-/// Operation codes are `0 = add`, `1 = subtract`, `2 = multiply`, and
-/// `3 = divide`.
-#[cfg(target_arch = "wasm32")]
-#[unsafe(no_mangle)]
-pub extern "C" fn run_binary(lhs: i32, rhs: i32, operation: i32) -> i32 {
-    let instruction = match operation {
-        0 => Instruction::Add,
-        1 => Instruction::Sub,
-        2 => Instruction::Mul,
-        3 => Instruction::Div,
-        _ => panic!("unknown operation code: {operation}"),
-    };
-
-    let program = [
-        Instruction::Push(lhs),
-        Instruction::Push(rhs),
-        instruction,
-        Instruction::Halt,
-    ];
-
-    Vm::new()
-        .run(&program)
-        .expect("the browser should validate the operation inputs")
-}
-
 #[cfg(target_arch = "wasm32")]
 struct DebugSession {
     program: Vec<Instruction>,
