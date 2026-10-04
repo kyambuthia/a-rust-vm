@@ -75,8 +75,7 @@ impl Program {
                     return Err(ProgramError::new(
                         Some(index + 1),
                         format!(
-                            "ambiguous stack depth at instruction {}: joined paths disagree ({known} vs {depth})",
-                            index + 1
+                            "ambiguous stack depth at instruction index {index}: joined paths disagree ({known} vs {depth})"
                         ),
                     ));
                 }
@@ -193,6 +192,10 @@ impl FromStr for Program {
 
     fn from_str(source: &str) -> Result<Self, Self::Err> {
         let mut instructions = Vec::new();
+        // Source line of each instruction, so validation errors (which
+        // count instructions) point at the right line despite comments
+        // and blank lines.
+        let mut source_lines = Vec::new();
         for (line_index, raw_line) in source.lines().enumerate() {
             let source_line = line_index + 1;
             let line = raw_line
@@ -265,8 +268,14 @@ impl FromStr for Program {
                 }
             };
             instructions.push(instruction);
+            source_lines.push(source_line);
         }
-        Self::new(instructions)
+        Self::new(instructions).map_err(|mut error| {
+            error.line = error
+                .line
+                .and_then(|ordinal| source_lines.get(ordinal.checked_sub(1)?).copied());
+            error
+        })
     }
 }
 
@@ -284,6 +293,8 @@ impl fmt::Display for Program {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramError {
+    /// 1-based source line when parsed from assembly; for programs built
+    /// with [`Program::new`] this is the 1-based instruction ordinal.
     pub line: Option<usize>,
     pub message: String,
 }
@@ -420,6 +431,26 @@ mod tests {
                 .to_string()
                 .contains("does not accept operands")
         );
+    }
+
+    #[test]
+    fn reports_source_lines_despite_comments_and_blank_lines() {
+        let error = "# header\n\nPUSH 1\nADD\nHALT"
+            .parse::<Program>()
+            .unwrap_err();
+        assert_eq!(error.line, Some(4));
+
+        let error = "PUSH 1  # one\n\nHALT\n# tail\nPUSH 2"
+            .parse::<Program>()
+            .unwrap_err();
+        assert_eq!(error.line, Some(5));
+        assert!(error.message.contains("after HALT"));
+
+        let error = "PUSH 1\n# branch\nJZ 3\nPUSH 2\nHALT"
+            .parse::<Program>()
+            .unwrap_err();
+        assert_eq!(error.line, Some(5));
+        assert!(error.message.contains("instruction index 3"));
     }
 
     #[test]
