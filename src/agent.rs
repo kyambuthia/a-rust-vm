@@ -1230,96 +1230,14 @@ where
     pub fn run_with_approval<F>(
         &mut self,
         prompt: impl Into<String>,
-        mut approve: F,
+        approve: F,
     ) -> Result<Vec<AgentEvent>, AgentError>
     where
         F: FnMut(&PermissionRequest) -> PermissionDecision,
     {
-        let prompt = prompt.into();
-        let mut events = vec![AgentEvent::UserMessage {
-            content: prompt.clone(),
-        }];
-        let mut tool_results = Vec::new();
-        let mut last_call: Option<(String, String)> = None;
-        let mut executed: Vec<String> = Vec::new();
-        let mut tool_calls: usize = 0;
-        let deadline = Instant::now() + self.turn_timeout;
-        let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
-
-        for _ in 0..self.max_steps {
-            if self.cancel.load(Ordering::Acquire) {
-                events.push(AgentEvent::Cancelled);
-                events.push(AgentEvent::Done);
-                return Ok(events);
-            }
-            if Instant::now() >= deadline {
-                return Err(AgentError::TurnTimeoutExceeded);
-            }
-            let response = self
-                .model
-                .respond(&ModelRequest {
-                    prompt: prompt.clone(),
-                    tool_results: tool_results.clone(),
-                    tools: self.tools.specs(),
-                    system_prompt: self.system_prompt.clone(),
-                    conversation: self.bounded_context(),
-                    current_turn: turn_context.clone(),
-                    route: self.route_request.clone(),
-                })
-                .map_err(AgentError::Model)?;
-
-            match response {
-                ModelResponse::Text(content) => {
-                    turn_context.push(ConversationMessage::new("assistant", content.clone()));
-                    self.commit_turn(turn_context);
-                    events.push(AgentEvent::AssistantText { content });
-                    events.push(AgentEvent::Done);
-                    return Ok(events);
-                }
-                ModelResponse::ToolCall(call) => {
-                    if tool_calls >= self.max_tool_calls {
-                        return Err(AgentError::ToolCallLimitExceeded {
-                            limit: self.max_tool_calls,
-                        });
-                    }
-                    let canonical = canonical_arguments(&call.arguments);
-                    if let Some((last_name, last_args)) = last_call.as_ref()
-                        && last_name == &call.name
-                        && last_args == &canonical
-                    {
-                        events.push(AgentEvent::RepeatedToolCall {
-                            tool: call.name.clone(),
-                            count: 2,
-                        });
-                        events.push(AgentEvent::Done);
-                        return Ok(events);
-                    }
-                    events.push(AgentEvent::ToolCall(call.clone()));
-                    let result =
-                        self.execute_with_approval(&call, &mut approve, |event| events.push(event));
-                    tool_results.push(result.clone());
-                    turn_context.push(ConversationMessage::assistant_tool_call(&call));
-                    turn_context.push(ConversationMessage::tool_result(&result));
-                    events.push(AgentEvent::ToolResult(result));
-                    tool_calls += 1;
-                    let key = format!("{} {canonical}", call.name);
-                    executed.push(key);
-                    last_call = Some((call.name.clone(), canonical));
-                    for period in 2..=3 {
-                        let len = executed.len();
-                        if len >= period * 2
-                            && executed[len - period..] == executed[len - period * 2..len - period]
-                        {
-                            return Err(AgentError::PatternLoopDetected { period });
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(AgentError::StepLimitExceeded {
-            limit: self.max_steps,
-        })
+        let mut events = Vec::new();
+        self.run_turn(prompt.into(), approve, |event| events.push(event), false)?;
+        Ok(events)
     }
 
     /// Run one turn and emit model text as it arrives.
@@ -1340,14 +1258,29 @@ where
     pub fn run_streaming_with_approval<F, A>(
         &mut self,
         prompt: impl Into<String>,
-        mut approve: F,
-        mut emit: A,
+        approve: F,
+        emit: A,
     ) -> Result<(), AgentError>
     where
         F: FnMut(&PermissionRequest) -> PermissionDecision,
         A: FnMut(AgentEvent),
     {
-        let prompt = prompt.into();
+        self.run_turn(prompt.into(), approve, emit, true)
+    }
+
+    /// The shared turn loop. With `stream`, model text is emitted as
+    /// deltas while it arrives; otherwise the model answers in one piece.
+    fn run_turn<F, A>(
+        &mut self,
+        prompt: String,
+        mut approve: F,
+        mut emit: A,
+        stream: bool,
+    ) -> Result<(), AgentError>
+    where
+        F: FnMut(&PermissionRequest) -> PermissionDecision,
+        A: FnMut(AgentEvent),
+    {
         emit(AgentEvent::UserMessage {
             content: prompt.clone(),
         });
@@ -1368,32 +1301,35 @@ where
                 return Err(AgentError::TurnTimeoutExceeded);
             }
             let mut emitted_text = false;
-            let response = self
-                .model
-                .respond_stream(
-                    &ModelRequest {
-                        prompt: prompt.clone(),
-                        tool_results: tool_results.clone(),
-                        tools: self.tools.specs(),
-                        system_prompt: self.system_prompt.clone(),
-                        conversation: self.bounded_context(),
-                        current_turn: turn_context.clone(),
-                        route: self.route_request.clone(),
-                    },
-                    &mut |event| match event {
+            let request = ModelRequest {
+                prompt: prompt.clone(),
+                tool_results: tool_results.clone(),
+                tools: self.tools.specs(),
+                system_prompt: self.system_prompt.clone(),
+                conversation: self.bounded_context(),
+                current_turn: turn_context.clone(),
+                route: self.route_request.clone(),
+            };
+            let response = if stream {
+                self.model
+                    .respond_stream(&request, &mut |event| match event {
                         ModelStreamEvent::TextDelta { content } => {
                             emitted_text = true;
                             emit(AgentEvent::AssistantDelta { content });
                         }
-                    },
-                )
-                .map_err(AgentError::Model)?;
+                    })
+            } else {
+                self.model.respond(&request)
+            }
+            .map_err(AgentError::Model)?;
 
             match response {
                 ModelResponse::Text(content) => {
                     turn_context.push(ConversationMessage::new("assistant", content.clone()));
                     self.commit_turn(turn_context);
-                    if !emitted_text && !content.is_empty() {
+                    // Streamed text already went out as deltas; an empty
+                    // streamed answer is not repeated as a final message.
+                    if !emitted_text && (!stream || !content.is_empty()) {
                         emit(AgentEvent::AssistantText { content });
                     }
                     emit(AgentEvent::Done);
