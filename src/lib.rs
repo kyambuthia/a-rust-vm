@@ -239,16 +239,36 @@ impl Vm {
     }
 
     /// Execute exactly one instruction from the current instruction pointer.
+    ///
+    /// A step is transactional: when it returns an error the stack and
+    /// instruction pointer are left exactly as they were, so a faulted VM
+    /// cannot silently continue past the failing instruction and stepping
+    /// again reproduces the same error.
     pub fn step(&mut self, program: &[Instruction]) -> Result<StepResult, VmError> {
         if self.halted {
             return Err(VmError::AlreadyHalted);
         }
 
+        let instruction_pointer = self.instruction_pointer;
         let instruction = *program
-            .get(self.instruction_pointer)
+            .get(instruction_pointer)
             .ok_or(VmError::MissingHalt)?;
         self.instruction_pointer += 1;
 
+        let outcome = self.execute(instruction, program.len());
+        if outcome.is_err() {
+            self.instruction_pointer = instruction_pointer;
+        }
+        outcome
+    }
+
+    /// Apply one instruction. Every fallible check runs before the stack
+    /// is mutated so errors leave the stack untouched.
+    fn execute(
+        &mut self,
+        instruction: Instruction,
+        program_len: usize,
+    ) -> Result<StepResult, VmError> {
         match instruction {
             Instruction::Push(value) => self.push_value(value)?,
             Instruction::Add => self.binary_operation("add", |lhs, rhs| lhs.checked_add(rhs))?,
@@ -259,7 +279,7 @@ impl Vm {
                 self.binary_operation("multiply", |lhs, rhs| lhs.checked_mul(rhs))?
             }
             Instruction::Div => {
-                let (lhs, rhs) = self.pop_binary_operands("divide")?;
+                let (lhs, rhs) = self.peek_binary_operands("divide")?;
 
                 if rhs == 0 {
                     return Err(VmError::DivisionByZero);
@@ -268,7 +288,7 @@ impl Vm {
                 let result = lhs.checked_div(rhs).ok_or(VmError::IntegerOverflow {
                     operation: "divide",
                 })?;
-                self.stack.push(result);
+                self.replace_top(2, result);
             }
             Instruction::Dup => {
                 let value = self.stack.last().copied().ok_or(VmError::StackUnderflow {
@@ -308,15 +328,15 @@ impl Vm {
                 self.push_value(value)?;
             }
             Instruction::Eq => {
-                let (lhs, rhs) = self.pop_binary_operands("equal")?;
-                self.stack.push(i32::from(lhs == rhs));
+                let (lhs, rhs) = self.peek_binary_operands("equal")?;
+                self.replace_top(2, i32::from(lhs == rhs));
             }
             Instruction::Lt => {
-                let (lhs, rhs) = self.pop_binary_operands("less-than")?;
-                self.stack.push(i32::from(lhs < rhs));
+                let (lhs, rhs) = self.peek_binary_operands("less-than")?;
+                self.replace_top(2, i32::from(lhs < rhs));
             }
             Instruction::Neg => {
-                let value = self.stack.pop().ok_or(VmError::StackUnderflow {
+                let value = self.stack.last().copied().ok_or(VmError::StackUnderflow {
                     operation: "negate",
                     needed: 1,
                     available: 0,
@@ -324,7 +344,7 @@ impl Vm {
                 let result = value.checked_neg().ok_or(VmError::IntegerOverflow {
                     operation: "negate",
                 })?;
-                self.stack.push(result);
+                self.replace_top(1, result);
             }
             Instruction::Not => {
                 let value = self.stack.pop().ok_or(VmError::StackUnderflow {
@@ -335,13 +355,13 @@ impl Vm {
                 self.stack.push(i32::from(value == 0));
             }
             Instruction::Jmp(target) => {
-                if target >= program.len() {
+                if target >= program_len {
                     return Err(VmError::InvalidJump { target });
                 }
                 self.instruction_pointer = target;
             }
             Instruction::Jz(target) => {
-                if target >= program.len() {
+                if target >= program_len {
                     return Err(VmError::InvalidJump { target });
                 }
                 let condition = self.stack.pop().ok_or(VmError::StackUnderflow {
@@ -386,24 +406,29 @@ impl Vm {
     where
         F: FnOnce(i32, i32) -> Option<i32>,
     {
-        let (lhs, rhs) = self.pop_binary_operands(operation)?;
+        let (lhs, rhs) = self.peek_binary_operands(operation)?;
         let result = operation_fn(lhs, rhs).ok_or(VmError::IntegerOverflow { operation })?;
-        self.stack.push(result);
+        self.replace_top(2, result);
         Ok(())
     }
 
-    fn pop_binary_operands(&mut self, operation: &'static str) -> Result<(i32, i32), VmError> {
-        if self.stack.len() < 2 {
-            return Err(VmError::StackUnderflow {
+    /// Read the two topmost values without removing them.
+    fn peek_binary_operands(&self, operation: &'static str) -> Result<(i32, i32), VmError> {
+        match self.stack.as_slice() {
+            [.., lhs, rhs] => Ok((*lhs, *rhs)),
+            _ => Err(VmError::StackUnderflow {
                 operation,
                 needed: 2,
                 available: self.stack.len(),
-            });
+            }),
         }
+    }
 
-        let rhs = self.stack.pop().expect("length checked above");
-        let lhs = self.stack.pop().expect("length checked above");
-        Ok((lhs, rhs))
+    /// Replace the `count` topmost values with one result. Callers have
+    /// already checked that `count` values are present.
+    fn replace_top(&mut self, count: usize, value: i32) {
+        self.stack.truncate(self.stack.len() - count);
+        self.stack.push(value);
     }
 
     /// Push a value, failing closed when the stack is already at its bound.
@@ -1076,6 +1101,62 @@ mod tests {
                 available: 0,
             })
         );
+    }
+
+    #[test]
+    fn a_faulting_step_leaves_the_vm_unchanged() {
+        let cases = [
+            (
+                vec![
+                    Instruction::Push(10),
+                    Instruction::Push(0),
+                    Instruction::Div,
+                ],
+                VmError::DivisionByZero,
+            ),
+            (
+                vec![
+                    Instruction::Push(i32::MAX),
+                    Instruction::Push(1),
+                    Instruction::Add,
+                ],
+                VmError::IntegerOverflow { operation: "add" },
+            ),
+            (
+                vec![
+                    Instruction::Push(i32::MIN),
+                    Instruction::Push(-1),
+                    Instruction::Div,
+                ],
+                VmError::IntegerOverflow {
+                    operation: "divide",
+                },
+            ),
+            (
+                vec![Instruction::Push(i32::MIN), Instruction::Neg],
+                VmError::IntegerOverflow {
+                    operation: "negate",
+                },
+            ),
+        ];
+
+        for (mut program, expected) in cases {
+            program.push(Instruction::Halt);
+            let faulting = program.len() - 2;
+            let mut vm = Vm::new();
+            for _ in 0..faulting {
+                vm.step(&program).unwrap();
+            }
+            let stack = vm.stack().to_vec();
+
+            // Repeated steps reproduce the fault instead of skipping past it.
+            for _ in 0..2 {
+                assert_eq!(vm.step(&program), Err(expected.clone()));
+                assert_eq!(vm.instruction_pointer(), faulting);
+                assert_eq!(vm.stack(), stack.as_slice());
+                assert!(!vm.is_halted());
+            }
+        }
     }
 
     #[test]
