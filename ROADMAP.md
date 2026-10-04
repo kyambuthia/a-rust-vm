@@ -32,7 +32,7 @@ Status was verified against the code, not earlier checklists.
 | MCP | stdio client (handshake, paging, interleaved messages) and approval-gated tool adapter **library only, not reachable from `arvm`** |
 | Subagents | One-off and persistent subagents with depth guard and shared cancellation **library only, not reachable from `arvm`** |
 | ACP, replay, language, LLVM | Not started |
-| CI | None; checks run by hand per `AGENTS.md` |
+| CI | GitHub Actions runs the `AGENTS.md` checks on every push and pull request |
 
 ### Quality review, October 2026
 
@@ -61,12 +61,8 @@ test):
 
 ### Known debt and risks
 
-- **No CI.** Every guarantee above depends on someone running the checks.
 - **Large modules.** `agent.rs` (~3.9k lines) and `main.rs` (~2k lines) mix
   model routing, tools, subagents, CLI parsing, and REPL code.
-- **Failed turns lose context.** When a turn ends in an error (step limit,
-  timeout, loop guard), its user prompt and tool results are not committed to
-  the conversation, so the next turn starts without them.
 - **MCP spawns a server per call.** Stateful servers lose state between calls,
   and every call pays a full handshake.
 - **Hand-written HTTP/1.0 server.** No keep-alive, `Transfer-Encoding` is
@@ -86,10 +82,9 @@ do, checked by tests or a scripted demo.
 
 ### M0: Guard rails (next)
 
-1. GitHub Actions workflow running `cargo fmt --check`, `cargo clippy -D
-   warnings`, `cargo test`, the wasm32 build, and `node --check web/main.js`.
-2. Commit the failed-turn transcript (prompt, tool calls, and a terminal
-   error marker) so the next turn keeps its context.
+1. ~~GitHub Actions workflow running the `AGENTS.md` checks~~ (`40455c3`).
+2. ~~Commit turns that end without an answer, with a marker saying why, so
+   the next turn keeps its context~~.
 3. Split `agent.rs` into `agent/{model,router,tools,loop,subagent}.rs` and
    `main.rs` into `cli/` command modules, with no behaviour change.
 

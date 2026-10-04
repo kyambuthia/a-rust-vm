@@ -1063,6 +1063,14 @@ impl ToolRegistry {
 }
 
 /// Errors raised while coordinating one agent turn.
+/// How a turn that did not fail came to an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnEnd {
+    Answered,
+    Cancelled,
+    RepeatedToolCall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentError {
     Model(ModelError),
@@ -1284,25 +1292,63 @@ where
         emit(AgentEvent::UserMessage {
             content: prompt.clone(),
         });
+        let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
+        let outcome = self.drive_turn(&prompt, &mut turn_context, &mut approve, &mut emit, stream);
+        // A turn cancelled before any model or tool activity left no trace.
+        if matches!(outcome, Ok(TurnEnd::Cancelled)) && turn_context.len() == 1 {
+            return Ok(());
+        }
+        // Commit every other turn, not only answered ones, so the next turn
+        // still sees the prompt, the tool work already done, and why it
+        // stopped.
+        let stopped = match &outcome {
+            Ok(TurnEnd::Answered) => None,
+            Ok(TurnEnd::Cancelled) => Some("cancelled".to_owned()),
+            Ok(TurnEnd::RepeatedToolCall) => Some("repeated identical tool call".to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(reason) = stopped {
+            turn_context.push(ConversationMessage::new(
+                "assistant",
+                format!("[turn ended without an answer: {reason}]"),
+            ));
+        }
+        self.commit_turn(turn_context);
+        outcome.map(|_| ())
+    }
+
+    /// Drive the model/tool loop for one turn, recording the conversation
+    /// into `turn_context` as it goes.
+    fn drive_turn<F, A>(
+        &mut self,
+        prompt: &str,
+        turn_context: &mut Vec<ConversationMessage>,
+        approve: &mut F,
+        emit: &mut A,
+        stream: bool,
+    ) -> Result<TurnEnd, AgentError>
+    where
+        F: FnMut(&PermissionRequest) -> PermissionDecision,
+        A: FnMut(AgentEvent),
+    {
         let mut tool_results = Vec::new();
         let mut last_call: Option<(String, String)> = None;
         let mut executed: Vec<String> = Vec::new();
         let mut tool_calls: usize = 0;
         let deadline = Instant::now() + self.turn_timeout;
-        let mut turn_context = vec![ConversationMessage::new("user", prompt.clone())];
 
         for _ in 0..self.max_steps {
             if self.cancel.load(Ordering::Acquire) {
                 emit(AgentEvent::Cancelled);
                 emit(AgentEvent::Done);
-                return Ok(());
+                return Ok(TurnEnd::Cancelled);
             }
             if Instant::now() >= deadline {
                 return Err(AgentError::TurnTimeoutExceeded);
             }
             let mut emitted_text = false;
             let request = ModelRequest {
-                prompt: prompt.clone(),
+                prompt: prompt.to_owned(),
                 tool_results: tool_results.clone(),
                 tools: self.tools.specs(),
                 system_prompt: self.system_prompt.clone(),
@@ -1326,14 +1372,13 @@ where
             match response {
                 ModelResponse::Text(content) => {
                     turn_context.push(ConversationMessage::new("assistant", content.clone()));
-                    self.commit_turn(turn_context);
                     // Streamed text already went out as deltas; an empty
                     // streamed answer is not repeated as a final message.
                     if !emitted_text && (!stream || !content.is_empty()) {
                         emit(AgentEvent::AssistantText { content });
                     }
                     emit(AgentEvent::Done);
-                    return Ok(());
+                    return Ok(TurnEnd::Answered);
                 }
                 ModelResponse::ToolCall(call) => {
                     if tool_calls >= self.max_tool_calls {
@@ -1351,10 +1396,10 @@ where
                             count: 2,
                         });
                         emit(AgentEvent::Done);
-                        return Ok(());
+                        return Ok(TurnEnd::RepeatedToolCall);
                     }
                     emit(AgentEvent::ToolCall(call.clone()));
-                    let result = self.execute_with_approval(&call, &mut approve, &mut emit);
+                    let result = self.execute_with_approval(&call, approve, &mut *emit);
                     tool_results.push(result.clone());
                     turn_context.push(ConversationMessage::assistant_tool_call(&call));
                     turn_context.push(ConversationMessage::tool_result(&result));
@@ -3656,6 +3701,47 @@ mod tests {
         let rejected = session.send(ScriptedModel::default(), vm_tool_registry().unwrap(), "   ");
         assert_eq!(rejected.unwrap_err(), super::SubagentError::EmptyPrompt);
         assert!(session.history().is_empty());
+    }
+
+    #[test]
+    fn turns_that_end_without_an_answer_keep_their_context() {
+        let inspect =
+            || ModelResponse::ToolCall(ToolCall::new("call-1", "inspect_vm", ToolArguments::new()));
+
+        // Step limit: the prompt, the tool exchange, and the reason survive.
+        let mut agent = Agent::new(ScriptedModel::new([inspect()]), vm_tool_registry().unwrap())
+            .with_max_steps(1);
+        assert!(matches!(
+            agent.run("look at the vm"),
+            Err(super::AgentError::StepLimitExceeded { limit: 1 })
+        ));
+        let contents = agent
+            .conversation()
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents.first(), Some(&"look at the vm"));
+        assert!(
+            agent
+                .conversation()
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("call-1"))
+        );
+        assert!(
+            contents
+                .last()
+                .is_some_and(|last| last.contains("step limit exceeded"))
+        );
+
+        // A repeated-call stop is recorded the same way.
+        let mut agent = Agent::new(
+            ScriptedModel::new([inspect(), inspect()]),
+            vm_tool_registry().unwrap(),
+        );
+        agent.run("again").unwrap();
+        assert!(agent.conversation().last().is_some_and(|message| {
+            message.role == "assistant" && message.content.contains("repeated identical tool call")
+        }));
     }
 
     #[test]
