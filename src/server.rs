@@ -50,6 +50,8 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_AGENT_EVENT_BYTES: usize = 256 * 1024;
 const MAX_AGENT_STREAM_BYTES: usize = 2 * 1024 * 1024;
+const MAX_APPROVAL_ID_BYTES: usize = 512;
+const MAX_TRACKED_APPROVALS: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct AgentRequest {
@@ -145,6 +147,10 @@ enum ApprovalReply {
 enum ApprovalState {
     Pending,
     Resolved(ApprovalReply),
+    /// The request timed out, was cancelled, or was answered; a late
+    /// decision for it must not be stored and replayed against a later
+    /// request that reuses the same id.
+    Closed,
 }
 
 pub struct ApprovalStore {
@@ -198,12 +204,14 @@ impl ApprovalStore {
 
     fn wait_with_cancel(&self, id: &str, cancel: &AtomicBool) -> crate::agent::PermissionDecision {
         let mut states = self.states.lock().expect("approval poisoned");
-        states
-            .entry(id.to_owned())
-            .or_insert(ApprovalState::Pending);
+        // Keep a decision that raced ahead of registration; otherwise
+        // (re)open the request, including one closed earlier in the turn.
+        if !matches!(states.get(id), Some(ApprovalState::Resolved(_))) {
+            states.insert(id.to_owned(), ApprovalState::Pending);
+        }
         loop {
             if cancel.load(Ordering::Acquire) {
-                states.remove(id);
+                states.insert(id.to_owned(), ApprovalState::Closed);
                 return crate::agent::PermissionDecision::Deny {
                     reason: "approval cancelled".to_owned(),
                 };
@@ -215,14 +223,14 @@ impl ApprovalStore {
                     .expect("condvar");
                 states = next;
                 if timeout.timed_out() {
-                    states.remove(id);
+                    states.insert(id.to_owned(), ApprovalState::Closed);
                     return crate::agent::PermissionDecision::Deny {
                         reason: "approval timed out".to_owned(),
                     };
                 }
                 continue;
             }
-            match states.remove(id) {
+            match states.insert(id.to_owned(), ApprovalState::Closed) {
                 Some(ApprovalState::Resolved(ApprovalReply::Allow)) => {
                     return crate::agent::PermissionDecision::Allow;
                 }
@@ -236,7 +244,12 @@ impl ApprovalStore {
                         reason: "approval cancelled".to_owned(),
                     };
                 }
-                _ => unreachable!(),
+                // The request vanished or closed underneath us: fail closed.
+                _ => {
+                    return crate::agent::PermissionDecision::Deny {
+                        reason: "approval is no longer pending".to_owned(),
+                    };
+                }
             }
         }
     }
@@ -253,9 +266,17 @@ impl ApprovalStore {
         self.changed.notify_all();
     }
 
+    /// Forget every request and unclaimed decision from earlier turns.
+    fn begin_turn(&self) {
+        lock_recover(&self.states).clear();
+    }
+
     fn resolve(&self, id: String, reply: ApprovalReply) -> Result<(), String> {
         if id.trim().is_empty() {
             return Err("approval id is empty".to_owned());
+        }
+        if id.len() > MAX_APPROVAL_ID_BYTES {
+            return Err("approval id is too long".to_owned());
         }
         let mut states = self.states.lock().expect("approval poisoned");
         match states.get_mut(&id) {
@@ -263,7 +284,16 @@ impl ApprovalStore {
             Some(ApprovalState::Resolved(_)) => {
                 return Err("approval was already resolved".to_owned());
             }
+            Some(ApprovalState::Closed) => {
+                return Err("approval is no longer pending".to_owned());
+            }
             None => {
+                // A decision may race ahead of the agent registering its
+                // request, so hold it briefly, but bound how many unclaimed
+                // decisions a client can park.
+                if states.len() >= MAX_TRACKED_APPROVALS {
+                    return Err("too many unresolved approvals".to_owned());
+                }
                 states.insert(id, ApprovalState::Resolved(reply));
             }
         }
@@ -880,6 +910,7 @@ fn handle_agent(
     .with_cancel_token(session.agent_cancel.clone());
     write_stream_headers(stream, set_cookie);
     let approvals = session.approvals.clone();
+    approvals.begin_turn();
     let mut stream_bytes = 0;
     let result = agent.run_streaming_with_approval(
         request.prompt,
@@ -1603,6 +1634,54 @@ mod tests {
             PermissionDecision::Deny {
                 reason: "approval cancelled".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn approval_store_rejects_late_decisions_for_closed_requests() {
+        let store = ApprovalStore::default();
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            store.wait_with_cancel("call-1:write", &cancelled),
+            PermissionDecision::Deny { .. }
+        ));
+
+        // A click that arrives after the request closed must not be parked
+        // and silently applied to a later request reusing the same id.
+        assert!(
+            store
+                .resolve("call-1:write".to_owned(), ApprovalReply::Allow)
+                .is_err()
+        );
+
+        // A new turn starts from a clean slate.
+        store
+            .resolve("call-2:write".to_owned(), ApprovalReply::Allow)
+            .unwrap();
+        store.begin_turn();
+        assert!(store.states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn approval_store_bounds_unclaimed_decisions() {
+        let store = ApprovalStore::default();
+        for index in 0..super::MAX_TRACKED_APPROVALS {
+            store
+                .resolve(format!("early-{index}"), ApprovalReply::Deny)
+                .unwrap();
+        }
+        assert!(
+            store
+                .resolve("one-too-many".to_owned(), ApprovalReply::Deny)
+                .is_err()
+        );
+        assert!(
+            store
+                .resolve(
+                    "x".repeat(super::MAX_APPROVAL_ID_BYTES + 1),
+                    ApprovalReply::Deny
+                )
+                .is_err()
         );
     }
 
