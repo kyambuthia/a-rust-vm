@@ -161,6 +161,30 @@ secret or server process environment and must call the provider from the
 server side. OpenCode and Muse remain optional development orchestration
 tools and are not required by the hosted runtime.
 
+## Permission rules
+
+Guarded tools (`write_file`, `run_command`, MCP tools) ask for approval unless
+a rule decides first. Rules come from `--rule` or `arvm permission add` and
+take the form `<allow|ask|deny> <tool|*>[:<target-prefix>]`; the first
+matching rule wins.
+
+Rules are matched so that an unusual spelling of a target can only make the
+outcome more cautious:
+
+- Paths are normalized (`./src//main.rs` is `src/main.rs`). An `allow` prefix
+  covers whole components only (`src` does not cover `src_old.rs`); `deny` and
+  `ask` prefixes also match as plain string prefixes (`secrets` covers
+  `secrets.txt`) and match absolute paths at any component.
+- Commands are compared by whole words. An `allow` rule never approves a
+  command line containing `;`, `&`, `|`, `$`, backticks, parentheses, or
+  redirects. A `deny` or `ask` rule matches any command in such a line, so
+  `deny run_command:rm` also blocks `ls; /bin/rm -rf x`.
+- `deny` rules override approvals remembered earlier in the session.
+
+Command deny rules are a convenience, not a sandbox: a determined command can
+still disguise what it runs. The built-in dangerous-command refusal and
+workspace containment apply regardless of rules.
+
 ## Connect an external model process
 
 The native agent command can launch an external executable named by

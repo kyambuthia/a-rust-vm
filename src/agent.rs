@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::permissions::{PermissionEffect, PermissionPolicy, SessionApprovals};
+use crate::permissions::{PermissionEffect, PermissionPolicy, SessionApprovals, TargetKind};
 use crate::session::{Session, SessionStore};
 use crate::{Instruction, StepResult, Vm, VmError};
 
@@ -1459,19 +1459,23 @@ where
             return self.tools.execute(call);
         };
 
-        let target = rule_target(call);
-        if self.session_approvals.is_allowed(&call.name, &target)
-            || self.permission_policy.decide(&call.name, &target) == PermissionEffect::Allow
-        {
-            return self.tools.execute(call);
-        }
-        if self.permission_policy.decide(&call.name, &target) == PermissionEffect::Deny {
+        let (kind, target) = rule_target(call);
+        let effect = self
+            .permission_policy
+            .decide_target(&call.name, kind, &target);
+        // Deny rules win over anything remembered earlier in the session.
+        if effect == PermissionEffect::Deny {
             return ToolResult {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 content: format!("permission rule denies {} '{target}'", call.name),
                 is_error: true,
             };
+        }
+        if effect == PermissionEffect::Allow
+            || self.session_approvals.is_allowed(&call.name, &target)
+        {
+            return self.tools.execute(call);
         }
 
         emit(AgentEvent::PermissionRequested(request.clone()));
@@ -1520,13 +1524,17 @@ where
     }
 }
 
-fn rule_target(call: &ToolCall) -> String {
-    for name in ["path", "command", "program"] {
+fn rule_target(call: &ToolCall) -> (TargetKind, String) {
+    for (name, kind) in [
+        ("path", TargetKind::Path),
+        ("command", TargetKind::Command),
+        ("program", TargetKind::Other),
+    ] {
         if let Some(ToolValue::Text(value)) = call.arguments.get(name) {
-            return value.clone();
+            return (kind, value.clone());
         }
     }
-    String::new()
+    (TargetKind::Other, String::new())
 }
 
 fn canonical_arguments(arguments: &ToolArguments) -> String {
