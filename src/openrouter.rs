@@ -241,6 +241,9 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
         body["tool_choice"] = serde_json::json!("auto");
+        // The agent loop executes exactly one tool call per model turn and
+        // rejects responses carrying several, so ask for one at a time.
+        body["parallel_tool_calls"] = serde_json::json!(false);
     }
     body
 }
@@ -529,6 +532,7 @@ mod tests {
         );
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools[0]["function"]["name"], "guest_read_file");
+        assert_eq!(body["parallel_tool_calls"], false);
         assert!(messages.iter().all(|value| {
             matches!(
                 value["role"].as_str(),
