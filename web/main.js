@@ -1,6 +1,10 @@
 const wasmPath = "../api/wasm";
 const i32Min = -2147483648;
 const i32Max = 2147483647;
+// Matches the native VM's MAX_VM_STEPS so /run fails closed on infinite loops.
+const maxRunSteps = 1000000;
+// Trace lines printed by /run; longer runs are summarized.
+const maxTraceLines = 200;
 
 const terminalWindow = document.querySelector("#terminal-window");
 const terminalOutput = document.querySelector("#terminal-output");
@@ -644,22 +648,33 @@ function runLoadedProgram(instance) {
   let status = 0;
   let steps = 0;
 
-  while (status === 0 && steps < instructions.length) {
+  // Jumps make the step count independent of the program length, so run
+  // until HALT, an error, or the step budget, labelling each step by the
+  // instruction pointer it executed.
+  while (status === 0 && steps < maxRunSteps) {
+    const pointer = instance.exports.debug_instruction_pointer();
     status = instance.exports.debug_step();
-    const stack = formatStack(instance);
-    const instruction = instructions[steps] ?? "UNKNOWN";
 
     if (status < 0) {
-      writeLine(`[error] ${debugErrorMessage(status)}`, "error");
+      writeLine(`[error] ip ${pointer}: ${debugErrorMessage(status)}`, "error");
       return;
     }
 
-    writeLine(`  ${String(steps).padStart(2, "0")}  ${instruction.padEnd(8)} stack: ${stack}`);
+    if (steps < maxTraceLines) {
+      const instruction = instructions[pointer] ?? "UNKNOWN";
+      writeLine(`  ${String(pointer).padStart(2, "0")}  ${instruction.padEnd(8)} stack: ${formatStack(instance)}`);
+    }
     steps += 1;
+  }
+
+  if (steps > maxTraceLines) {
+    writeLine(`  … ${steps - maxTraceLines} more steps not shown`);
   }
 
   if (status === 1) {
     writeLine(`[result] ${formatStack(instance).replace(/[\[\]]/g, "")}`, "result");
+  } else {
+    writeLine(`[error] ${debugErrorMessage(-11)}`, "error");
   }
 }
 
