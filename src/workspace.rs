@@ -150,15 +150,24 @@ impl Workspace {
         {
             return Err(ToolError::new("workspace paths cannot contain '..'"));
         }
-        if requested_path.is_absolute() {
-            return self.resolve_absolute(requested, allow_missing);
-        }
+        let candidate = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.root.join(requested_path)
+        };
 
-        let candidate = self.root.join(requested_path);
         let resolved = if candidate.exists() {
             fs::canonicalize(&candidate)
                 .map_err(|error| ToolError::new(format!("cannot resolve '{requested}': {error}")))?
         } else if allow_missing {
+            // `exists` follows symlinks, so a dangling link also lands here.
+            // Writing through it would create its target, which may lie
+            // outside the workspace, so only genuinely absent names qualify.
+            if fs::symlink_metadata(&candidate).is_ok() {
+                return Err(ToolError::new(format!(
+                    "refusing to write through a dangling symlink: {requested}"
+                )));
+            }
             let parent = candidate
                 .parent()
                 .ok_or_else(|| ToolError::new("workspace path has no parent"))?;
@@ -174,34 +183,6 @@ impl Workspace {
             return Err(ToolError::new(format!("path does not exist: {requested}")));
         };
 
-        if !self.contains(&resolved) {
-            return Err(ToolError::new(format!(
-                "path escapes the workspace: {requested}"
-            )));
-        }
-        Ok(resolved)
-    }
-
-    fn resolve_absolute(&self, requested: &str, allow_missing: bool) -> Result<PathBuf, ToolError> {
-        let candidate = PathBuf::from(requested);
-        let resolved = if candidate.exists() {
-            fs::canonicalize(&candidate)
-                .map_err(|error| ToolError::new(format!("cannot resolve '{requested}': {error}")))?
-        } else if allow_missing {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| ToolError::new("workspace path has no parent"))?;
-            let parent = fs::canonicalize(parent).map_err(|error| {
-                ToolError::new(format!("cannot resolve parent of '{requested}': {error}"))
-            })?;
-            parent.join(
-                candidate.file_name().ok_or_else(|| {
-                    ToolError::new("workspace path must name a file or directory")
-                })?,
-            )
-        } else {
-            return Err(ToolError::new(format!("path does not exist: {requested}")));
-        };
         if !self.contains(&resolved) {
             return Err(ToolError::new(format!(
                 "path escapes the workspace: {requested}"
@@ -831,6 +812,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_dangling_symlinks_that_point_outside() {
+        let root = test_root("dangling-link");
+        let outside = test_root("dangling-link-outside");
+        let target = outside.join("escaped.txt");
+        std::os::unix::fs::symlink(&target, root.join("link.txt")).unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+
+        let write = registry.execute(&ToolCall::new(
+            "write-1",
+            "write_file",
+            [
+                ("path".to_owned(), ToolValue::Text("link.txt".to_owned())),
+                ("content".to_owned(), ToolValue::Text("pwned".to_owned())),
+            ]
+            .into_iter()
+            .collect::<ToolArguments>(),
+        ));
+
+        assert!(write.is_error, "{}", write.content);
+        assert!(!target.exists(), "write escaped the workspace");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
