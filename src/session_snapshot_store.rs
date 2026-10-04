@@ -234,8 +234,11 @@ fn ensure_size(bytes: u64) -> Result<(), SessionSnapshotStoreError> {
 }
 
 fn validate_component(value: &str, field: &'static str) -> Result<(), SessionSnapshotStoreError> {
+    // A leading '.' would admit "." and "..", which name the store
+    // directory or its parent, and could collide with temporary files.
     if value.is_empty()
         || value.len() > 128
+        || value.starts_with('.')
         || !value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
         })
@@ -334,5 +337,11 @@ mod tests {
             store.remove("alice", "../session-a"),
             Err(SessionSnapshotStoreError::InvalidIdentity { field: "id" })
         ));
+        for owner in [".", "..", ".hidden"] {
+            assert!(matches!(
+                store.load(owner, "session-a"),
+                Err(SessionSnapshotStoreError::InvalidIdentity { field: "owner" })
+            ));
+        }
     }
 }

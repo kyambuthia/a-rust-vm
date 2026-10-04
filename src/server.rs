@@ -731,8 +731,10 @@ fn authenticated_owner(
 }
 
 fn is_valid_authenticated_identity(identity: &str) -> bool {
+    // The identity names a snapshot directory, so "." and ".." are refused.
     !identity.is_empty()
         && identity.len() <= 128
+        && !identity.starts_with('.')
         && identity.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
         })
@@ -1784,11 +1786,13 @@ mod tests {
             super::authenticated_owner(&headers, true),
             Ok("user-a".to_owned())
         );
-        headers.insert("x-amzn-oidc-identity".to_owned(), "user a".to_owned());
-        assert_eq!(
-            super::authenticated_owner(&headers, true),
-            Err("authentication required".to_owned())
-        );
+        for invalid in ["user a", ".", ".."] {
+            headers.insert("x-amzn-oidc-identity".to_owned(), invalid.to_owned());
+            assert_eq!(
+                super::authenticated_owner(&headers, true),
+                Err("authentication required".to_owned())
+            );
+        }
         assert_eq!(
             super::authenticated_owner(&headers, false),
             Ok("anonymous".to_owned())
