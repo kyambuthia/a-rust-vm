@@ -52,13 +52,11 @@ tmux new-session -d -s arvm "cd ~/Projects/a-rust-vm && . ~/.profile && export O
 
 ## State at handover
 
-HEAD is a commit that wires MCP-discovered tools into the agent registry behind
-approvals (`feat: wire MCP-discovered tools into agent registry with approvals`).
-The local `main` branch is ahead of `origin/main` by a large number of commits
-that have NOT been pushed. Do not push unless the user explicitly asks.
+`ROADMAP.md` carries the verified status table, the October 2026 quality
+review, known debt, and the milestone plan (M0 onward); start there. `main` is
+in sync with `origin/main`. Push only when the user asks for it.
 
-Landed capabilities (all verified by `cargo test` at their commit; last known
-green count was 168 lib + 16 CLI tests):
+Landed capabilities (last known green count: 218 lib + 16 CLI tests):
 
 - VM core: stack execution, assembly runner/checker/disassembler/tracer, guest
   filesystem + processes, structured execution traces.
