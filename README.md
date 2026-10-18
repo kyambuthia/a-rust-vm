@@ -164,9 +164,16 @@ CLI.
 ## Permission rules
 
 Guarded tools (`write_file`, `run_command`, MCP tools) ask for approval unless
-a rule decides first. Rules come from `--rule` or `arvm permission add` and
-take the form `<allow|ask|deny> <tool|*>[:<target-prefix>]`; the first
-matching rule wins.
+a rule decides first. Rules take the form
+`<allow|ask|deny> <tool|*>[:<target-prefix>]`; the first matching rule wins,
+checked in this order:
+
+1. `--rule` flags on the command line.
+2. The workspace configuration, `.arvm/config.json`.
+3. The user configuration, `config.json` in the config directory
+   (`$A_RVM_CONFIG_DIR`, else `$XDG_CONFIG_HOME/a-rust-vm`, else
+   `~/.config/a-rust-vm`).
+4. Rules saved with `arvm permission add`.
 
 Rules are matched so that an unusual spelling of a target can only make the
 outcome more cautious:
@@ -180,6 +187,26 @@ outcome more cautious:
   redirects. A `deny` or `ask` rule matches any command in such a line, so
   `deny run_command:rm` also blocks `ls; /bin/rm -rf x`.
 - `deny` rules override approvals remembered earlier in the session.
+
+### Configuration files
+
+Both configuration files use the same format. Unknown fields and invalid
+entries are errors, so a typo never drops a rule silently.
+
+```json
+{
+  "rules": ["deny run_command:rm", "ask write_file"],
+  "mcpServers": {
+    "files": { "command": "mcp-files", "args": ["--root", "."] }
+  }
+}
+```
+
+A workspace configuration ships with the project, so it can only tighten
+permissions: an `allow` rule there is refused. Put `allow` rules in the user
+configuration or pass them with `--rule`. `arvm config show [--json]` prints
+both files and what they declare. MCP servers are parsed and validated but not
+yet started by `arvm agent` or `ask`.
 
 Command deny rules are a convenience, not a sandbox: a determined command can
 still disguise what it runs. The built-in dangerous-command refusal and

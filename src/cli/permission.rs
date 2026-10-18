@@ -64,11 +64,17 @@ fn save_stored_permission_rule(text: &str) -> Result<(), String> {
     save_stored_permission_rule_at(&path, text)
 }
 
+/// First match wins: `--rule` flags, then configuration rules (already in
+/// workspace-then-user order), then rules saved with `arvm permission add`.
 fn merged_permission_policy_at(
     path: &std::path::Path,
     arguments: &[String],
+    config_rules: Vec<a_rust_vm::permissions::PermissionRule>,
 ) -> Result<a_rust_vm::permissions::PermissionPolicy, String> {
     let mut policy = build_permission_policy(arguments)?;
+    for rule in config_rules {
+        policy.add_rule(rule);
+    }
     for rule in load_stored_permission_policy(path)?.rules().to_vec() {
         policy.add_rule(rule);
     }
@@ -77,8 +83,9 @@ fn merged_permission_policy_at(
 
 pub(crate) fn merged_permission_policy(
     arguments: &[String],
+    config_rules: Vec<a_rust_vm::permissions::PermissionRule>,
 ) -> Result<a_rust_vm::permissions::PermissionPolicy, String> {
-    merged_permission_policy_at(&permission_rules_path(), arguments)
+    merged_permission_policy_at(&permission_rules_path(), arguments, config_rules)
 }
 
 fn permission_usage() {
@@ -207,10 +214,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         super::save_stored_permission_rule_at(&path, "deny write_file:notes.txt").unwrap();
         let arguments = ["--rule".to_owned(), "allow write_file:notes.txt".to_owned()];
-        let policy = super::merged_permission_policy_at(&path, &arguments).unwrap();
+        let policy = super::merged_permission_policy_at(&path, &arguments, Vec::new()).unwrap();
         assert_eq!(
             policy.decide("write_file", "notes.txt"),
             a_rust_vm::permissions::PermissionEffect::Allow
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_rules_sit_between_flags_and_stored_rules() {
+        let path = std::env::temp_dir().join(format!(
+            "a-rvm-rules-{}-{}.json",
+            std::process::id(),
+            "config-order"
+        ));
+        let _ = std::fs::remove_file(&path);
+        super::save_stored_permission_rule_at(&path, "allow run_command").unwrap();
+        let config_rules =
+            vec![a_rust_vm::permissions::parse_permission_rule("deny run_command:cargo").unwrap()];
+        let policy = super::merged_permission_policy_at(&path, &[], config_rules.clone()).unwrap();
+        assert_eq!(
+            policy.decide("run_command", "cargo publish"),
+            a_rust_vm::permissions::PermissionEffect::Deny
+        );
+        assert_eq!(
+            policy.decide("run_command", "ls"),
+            a_rust_vm::permissions::PermissionEffect::Allow
+        );
+        let flags = ["--rule".to_owned(), "ask run_command:cargo".to_owned()];
+        let policy = super::merged_permission_policy_at(&path, &flags, config_rules).unwrap();
+        assert_eq!(
+            policy.decide("run_command", "cargo test"),
+            a_rust_vm::permissions::PermissionEffect::Ask
         );
         let _ = std::fs::remove_file(&path);
     }

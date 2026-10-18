@@ -95,9 +95,9 @@ Exit: every push is checked automatically; the largest module is under
 
 ### M1: Wire the extensibility that already exists (next)
 
-1. `arvm` configuration file (`.arvm/config.json` in the workspace, plus
+1. ~~`arvm` configuration file (`.arvm/config.json` in the workspace, plus
    user config) declaring MCP servers and default rules, with environment and
-   flag overrides.
+   flag overrides~~. Workspace files may only add `ask`/`deny` rules.
 2. Register MCP tools in `agent`/`ask` runs behind the existing approval
    flow; `arvm mcp list|tools` for inspection.
 3. Keep one MCP server process alive per session instead of per call, with

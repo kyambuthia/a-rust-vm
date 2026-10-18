@@ -12,6 +12,7 @@ use a_rust_vm::agent::{
 use a_rust_vm::session::{Session, SessionStore};
 use a_rust_vm::workspace::coding_tool_registry_with_directories;
 
+use super::config::load_config_or_exit;
 use super::paths::{session_directory, working_directory};
 use super::permission::merged_permission_policy;
 use super::skill::load_requested_skills;
@@ -39,6 +40,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             .unwrap_or_default()
     };
     let working_directory = working_directory();
+    let config = load_config_or_exit();
     let additional_directories = extract_workspace_directories(user_arguments);
     let model = ProcessModel::new(program)
         .with_arguments(arguments)
@@ -73,7 +75,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             requires_streaming: true,
             ..RouteRequest::default()
         });
-    let policy = match merged_permission_policy(user_arguments) {
+    let policy = match merged_permission_policy(user_arguments, config.permission_rules()) {
         Ok(policy) => policy,
         Err(error) => {
             eprintln!("[permission] {error}");

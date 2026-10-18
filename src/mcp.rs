@@ -21,6 +21,7 @@ const MCP_EXIT_GRACE: Duration = Duration::from_millis(500);
 const MCP_STDERR_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     pub command: String,
     #[serde(default)]
