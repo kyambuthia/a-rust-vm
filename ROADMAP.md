@@ -177,9 +177,12 @@ and context work can be measured.
    reusing the OpenRouter redaction code~~. `src/redact.rs` also hides
    private-key blocks, `UPPER_SECRET=value` lines, and the values of
    secret-named host variables.
-5. Mark untrusted content: wrap tool and MCP output in delimiters the system
+5. ~~Mark untrusted content: wrap tool and MCP output in delimiters the system
    prompt tells the model to treat as data, and show which project
-   instruction files were loaded in `/status`.
+   instruction files were loaded in `/status`~~. Tool output already travels
+   in the provider's `tool` role, so no extra delimiters; the system prompt
+   now names the injection rule, and `/status` lists instructions, skills,
+   config files, MCP servers, and rule count.
 6. `cargo audit` (or `cargo deny`) in CI.
 
 Exit: a scripted model that runs `env`, `cat ~/.local/state/a-rust-vm/...`

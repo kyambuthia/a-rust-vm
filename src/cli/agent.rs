@@ -16,7 +16,7 @@ use super::config::load_config_or_exit;
 use super::mcp::register_mcp_tools;
 use super::paths::{session_directory, working_directory};
 use super::permission::merged_permission_policy;
-use super::skill::load_requested_skills;
+use super::skill::{extract_skill_names, load_requested_skills};
 
 pub(crate) fn run_live_agent(user_arguments: &[String]) {
     let using_builtin_bridge = env::var_os("A_RVM_MODEL_PROGRAM").is_none();
@@ -69,7 +69,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         eprintln!("[workspace] {error}");
         std::process::exit(2);
     });
-    register_mcp_tools(&config, &mut registry);
+    let mcp_summary = register_mcp_tools(&config, &mut registry);
     let mut agent = Agent::new(router, registry)
         .with_system_prompt(workspace_system_prompt_with_skills(
             &working_directory,
@@ -86,6 +86,18 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             eprintln!("[permission] {error}");
             std::process::exit(2);
         }
+    };
+    let status = RunStatus {
+        instructions: working_directory.join("AGENTS.md").is_file(),
+        skills: extract_skill_names(user_arguments),
+        config_files: config
+            .sources()
+            .into_iter()
+            .filter(|source| source.config.is_some())
+            .map(|source| source.path.display().to_string())
+            .collect(),
+        mcp: mcp_summary,
+        rules: policy.rules().len(),
     };
     agent.set_permission_policy(policy);
     let mut route = agent.route_request().clone();
@@ -165,6 +177,9 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
                 "[status] {selected} tools={} streaming={}",
                 route.requires_tools, route.requires_streaming
             );
+            for line in status.lines() {
+                println!("[status] {line}");
+            }
             continue;
         }
         if let Some(model) = prompt.strip_prefix("/model ") {
@@ -250,6 +265,42 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     }
     if !session.messages.is_empty() {
         println!("\n[session] saved {}", session.id);
+    }
+}
+
+/// What a run loaded, for `/status`: everything that shapes the agent's
+/// instructions and permissions.
+struct RunStatus {
+    instructions: bool,
+    skills: Vec<String>,
+    config_files: Vec<String>,
+    mcp: Vec<String>,
+    rules: usize,
+}
+
+impl RunStatus {
+    fn lines(&self) -> Vec<String> {
+        let list = |items: &[String]| {
+            if items.is_empty() {
+                "none".to_owned()
+            } else {
+                items.join(", ")
+            }
+        };
+        vec![
+            format!(
+                "project instructions: {}",
+                if self.instructions {
+                    "AGENTS.md"
+                } else {
+                    "none"
+                }
+            ),
+            format!("skills: {}", list(&self.skills)),
+            format!("config: {}", list(&self.config_files)),
+            format!("mcp: {}", list(&self.mcp)),
+            format!("permission rules: {}", self.rules),
+        ]
     }
 }
 
@@ -440,6 +491,27 @@ mod tests {
                 "x".to_owned()
             ]),
             Some(("do x".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn status_lists_what_shapes_the_run() {
+        let status = RunStatus {
+            instructions: true,
+            skills: vec!["review".to_owned()],
+            config_files: Vec::new(),
+            mcp: vec!["files (3 tools)".to_owned()],
+            rules: 2,
+        };
+        assert_eq!(
+            status.lines(),
+            [
+                "project instructions: AGENTS.md",
+                "skills: review",
+                "config: none",
+                "mcp: files (3 tools)",
+                "permission rules: 2",
+            ]
         );
     }
 

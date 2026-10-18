@@ -55,8 +55,12 @@ fn server_plan(loaded: &LoadedConfig, records: &[TrustRecord], workspace: &Path)
 
 /// Start each enabled server and add its tools to `registry`. A server that
 /// fails to start is reported and skipped; untrusted workspace servers are
-/// reported and never started.
-pub(crate) fn register_mcp_tools(loaded: &LoadedConfig, registry: &mut ToolRegistry) {
+/// reported and never started. Returns one status line per server.
+pub(crate) fn register_mcp_tools(
+    loaded: &LoadedConfig,
+    registry: &mut ToolRegistry,
+) -> Vec<String> {
+    let mut summary = Vec::new();
     let workspace = workspace_key(&working_directory());
     let records = load_trust(&mcp_trust_path()).unwrap_or_else(|error| {
         eprintln!("[mcp] {error}; workspace servers stay disabled");
@@ -68,6 +72,7 @@ pub(crate) fn register_mcp_tools(loaded: &LoadedConfig, registry: &mut ToolRegis
             "[mcp] workspace server '{}' is not trusted; run `arvm mcp trust {}` to enable it",
             server.name, server.name
         );
+        summary.push(format!("{} (untrusted, not started)", server.name));
     }
     for server in &plan.enabled {
         let added =
@@ -81,10 +86,17 @@ pub(crate) fn register_mcp_tools(loaded: &LoadedConfig, registry: &mut ToolRegis
                         .map_err(|error| error.to_string())
                 });
         match added {
-            Ok(count) => eprintln!("[mcp] {}: {count} tools", server.name),
-            Err(error) => eprintln!("[mcp] server '{}' unavailable: {error}", server.name),
+            Ok(count) => {
+                eprintln!("[mcp] {}: {count} tools", server.name);
+                summary.push(format!("{} ({count} tools)", server.name));
+            }
+            Err(error) => {
+                eprintln!("[mcp] server '{}' unavailable: {error}", server.name);
+                summary.push(format!("{} (unavailable)", server.name));
+            }
         }
     }
+    summary
 }
 
 fn mcp_usage() {
