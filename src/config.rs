@@ -210,6 +210,77 @@ impl LoadedConfig {
     }
 }
 
+/// One MCP server declared in a configuration file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfiguredServer {
+    pub name: String,
+    pub scope: ConfigScope,
+    pub config: McpConfig,
+}
+
+/// Which configured MCP servers a run may start.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpServerPlan {
+    /// Servers to start, sorted by name.
+    pub enabled: Vec<ConfiguredServer>,
+    /// Workspace servers the user has not trusted; they are not started.
+    pub untrusted: Vec<ConfiguredServer>,
+}
+
+impl LoadedConfig {
+    /// Every declared server, workspace entries first.
+    pub fn declared_servers(&self) -> Vec<ConfiguredServer> {
+        self.sources()
+            .into_iter()
+            .filter_map(|source| source.config.as_ref().map(|config| (source.scope, config)))
+            .flat_map(|(scope, config)| {
+                config
+                    .mcp_servers
+                    .iter()
+                    .map(move |(name, server)| ConfiguredServer {
+                        name: name.clone(),
+                        scope,
+                        config: server.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// The server a name refers to: the workspace entry if there is one,
+    /// otherwise the user entry.
+    pub fn server(&self, name: &str) -> Option<ConfiguredServer> {
+        self.declared_servers()
+            .into_iter()
+            .find(|server| server.name == name)
+    }
+
+    /// User servers are enabled. A workspace server ships with the project,
+    /// so it is enabled only when `trusted` approves that exact entry; it
+    /// then replaces a user server of the same name.
+    pub fn mcp_server_plan(&self, trusted: impl Fn(&str, &McpConfig) -> bool) -> McpServerPlan {
+        let mut enabled = BTreeMap::new();
+        let mut untrusted = Vec::new();
+        let declared = self.declared_servers();
+        for server in declared.iter().filter(|s| s.scope == ConfigScope::User) {
+            enabled.insert(server.name.clone(), server.clone());
+        }
+        for server in declared
+            .into_iter()
+            .filter(|s| s.scope == ConfigScope::Workspace)
+        {
+            if trusted(&server.name, &server.config) {
+                enabled.insert(server.name.clone(), server);
+            } else {
+                untrusted.push(server);
+            }
+        }
+        McpServerPlan {
+            enabled: enabled.into_values().collect(),
+            untrusted,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +406,45 @@ mod tests {
             policy.decide("run_command", "cargo test"),
             PermissionEffect::Allow
         );
+        let _ = std::fs::remove_dir_all(&user);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn workspace_servers_need_trust_and_then_override_user_servers() {
+        let user = temporary_directory("plan-user");
+        let workspace = temporary_directory("plan-workspace");
+        std::fs::write(
+            user.join(CONFIG_FILE_NAME),
+            br#"{"mcpServers":{"files":{"command":"user-files"},"web":{"command":"web"}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(workspace.join(".arvm")).unwrap();
+        std::fs::write(
+            workspace_config_path(&workspace),
+            br#"{"mcpServers":{"files":{"command":"repo-files"},"db":{"command":"db"}}}"#,
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&user, &workspace).unwrap();
+        assert_eq!(loaded.server("files").unwrap().config.command, "repo-files");
+        assert_eq!(loaded.server("web").unwrap().scope, ConfigScope::User);
+        assert!(loaded.server("missing").is_none());
+
+        let names = |servers: &[ConfiguredServer]| {
+            servers
+                .iter()
+                .map(|server| format!("{}={}", server.name, server.config.command))
+                .collect::<Vec<_>>()
+        };
+        let plan = loaded.mcp_server_plan(|_, _| false);
+        assert_eq!(names(&plan.enabled), ["files=user-files", "web=web"]);
+        assert_eq!(names(&plan.untrusted), ["db=db", "files=repo-files"]);
+
+        let plan = loaded
+            .mcp_server_plan(|name, config| name == "files" && config.command == "repo-files");
+        assert_eq!(names(&plan.enabled), ["files=repo-files", "web=web"]);
+        assert_eq!(names(&plan.untrusted), ["db=db"]);
+
         let _ = std::fs::remove_dir_all(&user);
         let _ = std::fs::remove_dir_all(&workspace);
     }

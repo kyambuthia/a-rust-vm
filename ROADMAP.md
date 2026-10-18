@@ -29,7 +29,7 @@ Status was verified against the code, not earlier checklists.
 | Sessions | Save/list/show/export transcripts, resume via `--session`, private local state |
 | Browser host | Anonymous and ALB/Cognito-bound sessions, uploads, document/sheet/PDF/tabulation jobs, streamed agent events, approvals, durable snapshots, ECS/Fargate CDK stack |
 | Skills | `SKILL.md` discovery and prompt injection |
-| MCP | stdio client (handshake, paging, interleaved messages) and approval-gated tool adapter **library only, not reachable from `arvm`** |
+| MCP | stdio client (handshake, paging, interleaved messages); configured servers register approval-gated `mcp_<server>_<tool>` tools in `agent`/`ask`; workspace servers need `arvm mcp trust` |
 | Subagents | One-off and persistent subagents with depth guard and shared cancellation **library only, not reachable from `arvm`** |
 | ACP, replay, language, LLVM | Not started |
 | CI | GitHub Actions runs the `AGENTS.md` checks on every push and pull request |
@@ -98,8 +98,9 @@ Exit: every push is checked automatically; the largest module is under
 1. ~~`arvm` configuration file (`.arvm/config.json` in the workspace, plus
    user config) declaring MCP servers and default rules, with environment and
    flag overrides~~. Workspace files may only add `ask`/`deny` rules.
-2. Register MCP tools in `agent`/`ask` runs behind the existing approval
-   flow; `arvm mcp list|tools` for inspection.
+2. ~~Register MCP tools in `agent`/`ask` runs behind the existing approval
+   flow; `arvm mcp list|tools` for inspection~~. Workspace servers start only
+   after `arvm mcp trust`.
 3. Keep one MCP server process alive per session instead of per call, with
    supervision and restart limits.
 4. Expose `run_subagent` as a tool in CLI runs with bounded child budgets

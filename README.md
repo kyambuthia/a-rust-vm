@@ -205,8 +205,31 @@ entries are errors, so a typo never drops a rule silently.
 A workspace configuration ships with the project, so it can only tighten
 permissions: an `allow` rule there is refused. Put `allow` rules in the user
 configuration or pass them with `--rule`. `arvm config show [--json]` prints
-both files and what they declare. MCP servers are parsed and validated but not
-yet started by `arvm agent` or `ask`.
+both files and what they declare.
+
+### MCP servers
+
+`arvm agent` and `arvm ask` start the configured MCP servers and offer their
+tools as `mcp_<server>_<tool>`. Every MCP tool call is guarded: it asks for
+approval unless a rule such as `allow mcp_files_read` decides first, and
+one-shot `ask` denies it without `--auto`.
+
+Servers from the user configuration start automatically. A server declared
+in `.arvm/config.json` could run anything, so it starts only after you trust
+it for that workspace:
+
+```bash
+arvm mcp list            # servers, their scope, and whether they are enabled
+arvm mcp trust files     # approve the workspace server 'files' as written
+arvm mcp tools files     # start it and list its tools
+arvm mcp untrust files
+```
+
+Trust is pinned to the exact entry, so changing its command, arguments,
+environment, or timeout disables the server until you trust it again. A
+trusted workspace server replaces a user server of the same name. A server
+that fails to start is reported and skipped. Each tool call currently starts
+a fresh server process.
 
 Command deny rules are a convenience, not a sandbox: a determined command can
 still disguise what it runs. The built-in dangerous-command refusal and

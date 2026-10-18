@@ -18,6 +18,10 @@ pub(crate) fn permission_rules_path() -> PathBuf {
     state_directory().join("rules.json")
 }
 
+pub(crate) fn mcp_trust_path() -> PathBuf {
+    state_directory().join("mcp-trust.json")
+}
+
 pub(crate) fn user_config_root() -> PathBuf {
     config_directory_with(|name| env::var_os(name))
 }

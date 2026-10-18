@@ -5,6 +5,7 @@ pub(crate) mod bridge;
 pub(crate) mod config;
 pub(crate) mod demo;
 pub(crate) mod doctor;
+pub(crate) mod mcp;
 pub(crate) mod paths;
 pub(crate) mod permission;
 pub(crate) mod program;

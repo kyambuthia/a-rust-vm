@@ -13,6 +13,7 @@ use a_rust_vm::session::{Session, SessionStore};
 use a_rust_vm::workspace::coding_tool_registry_with_directories;
 
 use super::config::load_config_or_exit;
+use super::mcp::register_mcp_tools;
 use super::paths::{session_directory, working_directory};
 use super::permission::merged_permission_policy;
 use super::skill::load_requested_skills;
@@ -59,12 +60,13 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     router
         .set_strong(&model_name)
         .expect("strong model route should exist");
-    let registry =
+    let mut registry =
         coding_tool_registry_with_directories(&working_directory, &additional_directories)
             .unwrap_or_else(|error| {
                 eprintln!("[workspace] {error}");
                 std::process::exit(2);
             });
+    register_mcp_tools(&config, &mut registry);
     let mut agent = Agent::new(router, registry)
         .with_system_prompt(workspace_system_prompt_with_skills(
             &working_directory,

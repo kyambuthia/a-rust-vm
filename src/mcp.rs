@@ -258,20 +258,39 @@ pub struct McpToolAdapter {
     client: McpClient,
     remote_name: String,
     registry_name: String,
+    /// "MCP tool 'x'" or "MCP tool 'x' from server 'y'", for prompts.
+    origin: String,
     description: String,
     input_schema: String,
 }
 
 impl McpToolAdapter {
     pub fn new(client: McpClient, tool: &McpTool) -> Result<Self, McpError> {
+        Self::build(client, tool, None)
+    }
+
+    /// An adapter named `mcp_<server>_<tool>`, so tools from different
+    /// servers cannot collide in one registry.
+    pub fn for_server(server: &str, client: McpClient, tool: &McpTool) -> Result<Self, McpError> {
+        Self::build(client, tool, Some(server))
+    }
+
+    fn build(client: McpClient, tool: &McpTool, server: Option<&str>) -> Result<Self, McpError> {
         if tool.name.trim().is_empty() {
             return Err(McpError::new("mcp tool entry must have a non-empty name"));
         }
-        let registry_name = mcp_registry_name(&tool.name)?;
+        let registry_name = match server {
+            Some(server) => mcp_server_registry_name(server, &tool.name)?,
+            None => mcp_registry_name(&tool.name)?,
+        };
+        let origin = match server {
+            Some(server) => format!("MCP tool '{}' from server '{server}'", tool.name),
+            None => format!("MCP tool '{}'", tool.name),
+        };
         let description = if tool.description.trim().is_empty() {
-            format!("Call MCP tool '{}'.", tool.name)
+            format!("Call {origin}.")
         } else {
-            format!("Call MCP tool '{}': {}", tool.name, tool.description)
+            format!("Call {origin}: {}", tool.description)
         };
         let input_schema = match &tool.input_schema {
             serde_json::Value::Null => r#"{"type":"object"}"#.to_owned(),
@@ -281,6 +300,7 @@ impl McpToolAdapter {
             client,
             remote_name: tool.name.clone(),
             registry_name,
+            origin,
             description,
             input_schema,
         })
@@ -308,7 +328,7 @@ impl crate::agent::Tool for McpToolAdapter {
         Some(crate::agent::PermissionRequest {
             id: format!("mcp:{}", safe_name),
             tool: self.registry_name.clone(),
-            description: format!("call MCP tool '{}'", self.remote_name),
+            description: format!("call {}", self.origin),
         })
     }
 
@@ -328,9 +348,22 @@ impl crate::agent::Tool for McpToolAdapter {
 }
 
 pub fn mcp_registry_name(remote: &str) -> Result<String, McpError> {
-    let mut sanitized = String::with_capacity(remote.len());
+    Ok(format!("mcp_{}", sanitize_name(remote, "tool")?))
+}
+
+/// The registry name of tool `remote` on server `server`: `mcp_<server>_<tool>`.
+pub fn mcp_server_registry_name(server: &str, remote: &str) -> Result<String, McpError> {
+    Ok(format!(
+        "mcp_{}_{}",
+        sanitize_name(server, "server")?,
+        sanitize_name(remote, "tool")?
+    ))
+}
+
+fn sanitize_name(name: &str, what: &str) -> Result<String, McpError> {
+    let mut sanitized = String::with_capacity(name.len());
     let mut previous_underscore = false;
-    for part in remote.trim().to_lowercase().chars() {
+    for part in name.trim().to_lowercase().chars() {
         if part.is_ascii_alphanumeric() {
             sanitized.push(part);
             previous_underscore = false;
@@ -342,10 +375,10 @@ pub fn mcp_registry_name(remote: &str) -> Result<String, McpError> {
     let sanitized = sanitized.trim_matches('_').to_owned();
     if sanitized.is_empty() {
         return Err(McpError::new(format!(
-            "mcp tool name '{remote}' has no usable characters"
+            "mcp {what} name '{name}' has no usable characters"
         )));
     }
-    Ok(format!("mcp_{sanitized}"))
+    Ok(sanitized)
 }
 
 fn tool_value_to_json(value: &crate::agent::ToolValue) -> serde_json::Value {
@@ -360,10 +393,25 @@ fn tool_value_to_json(value: &crate::agent::ToolValue) -> serde_json::Value {
 }
 
 pub fn mcp_tool_registry(config: &McpConfig) -> Result<crate::agent::ToolRegistry, McpError> {
+    tool_registry(config, None)
+}
+
+/// Discover a named server's tools and register them as `mcp_<server>_<tool>`.
+pub fn mcp_server_tool_registry(
+    server: &str,
+    config: &McpConfig,
+) -> Result<crate::agent::ToolRegistry, McpError> {
+    tool_registry(config, Some(server))
+}
+
+fn tool_registry(
+    config: &McpConfig,
+    server: Option<&str>,
+) -> Result<crate::agent::ToolRegistry, McpError> {
     let client = McpClient::new(config.clone())?;
     let mut registry = crate::agent::ToolRegistry::default();
     for tool in client.list_tools()? {
-        let adapter = McpToolAdapter::new(client.clone(), &tool)?;
+        let adapter = McpToolAdapter::build(client.clone(), &tool, server)?;
         registry.register(adapter).map_err(|error| {
             McpError::new(format!(
                 "mcp tool '{}' conflicts with an existing tool: {error}",
@@ -625,7 +673,8 @@ fn compact_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        McpClient, McpConfig, McpTool, McpToolAdapter, mcp_registry_name, mcp_tool_registry,
+        McpClient, McpConfig, McpTool, McpToolAdapter, mcp_registry_name, mcp_server_registry_name,
+        mcp_server_tool_registry, mcp_tool_registry,
     };
     use crate::agent::{Tool, ToolArguments, ToolCall, ToolValue};
 
@@ -853,6 +902,25 @@ mod tests {
         assert_eq!(registry.specs()[0].name, "mcp_echo");
         let call = ToolCall::new("call-1", "mcp_echo", ToolArguments::new());
         assert!(registry.permission_request(&call).is_some());
+    }
+
+    #[test]
+    fn server_registry_names_carry_the_server() {
+        assert_eq!(
+            mcp_server_registry_name("my-files", "Read File").unwrap(),
+            "mcp_my_files_read_file"
+        );
+        assert!(mcp_server_registry_name("--", "read").is_err());
+        let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo"}]}}'"#;
+        let registry = mcp_server_tool_registry("files", &shell_config(script)).unwrap();
+        let spec = &registry.specs()[0];
+        assert_eq!(spec.name, "mcp_files_echo");
+        assert!(spec.description.contains("from server 'files'"));
+        let call = ToolCall::new("call-1", "mcp_files_echo", ToolArguments::new());
+        assert_eq!(
+            registry.permission_request(&call).unwrap().description,
+            "call MCP tool 'echo' from server 'files'"
+        );
     }
 
     #[test]
