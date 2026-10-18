@@ -125,7 +125,8 @@ impl ToolRegistry {
     }
 }
 
-pub(super) fn required_text<'a>(
+/// Reads a required, non-blank text argument.
+pub(crate) fn required_text<'a>(
     arguments: &'a ToolArguments,
     name: &str,
 ) -> Result<&'a str, ToolError> {
@@ -138,7 +139,28 @@ pub(super) fn required_text<'a>(
     }
 }
 
-pub(super) fn ensure_arguments(
+/// Reads a required text argument that may be empty.
+pub(crate) fn required_text_allow_empty<'a>(
+    arguments: &'a ToolArguments,
+    name: &str,
+) -> Result<&'a str, ToolError> {
+    match arguments.get(name) {
+        Some(ToolValue::Text(value)) => Ok(value),
+        Some(_) => Err(ToolError::new(format!("argument '{name}' must be text"))),
+        None => Err(ToolError::new(format!("missing required argument: {name}"))),
+    }
+}
+
+/// Reads an optional text argument, treating blank text as absent.
+pub(crate) fn optional_text<'a>(arguments: &'a ToolArguments, name: &str) -> Option<&'a str> {
+    match arguments.get(name) {
+        Some(ToolValue::Text(value)) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// Rejects arguments outside `allowed` so typos fail instead of being ignored.
+pub(crate) fn ensure_arguments(
     arguments: &ToolArguments,
     allowed: &[&str],
 ) -> Result<(), ToolError> {

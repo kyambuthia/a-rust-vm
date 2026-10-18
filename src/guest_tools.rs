@@ -6,7 +6,10 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::agent::{Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ToolValue};
+use crate::agent::{
+    Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ToolValue, ensure_arguments,
+    optional_text, required_text, required_text_allow_empty,
+};
 use crate::runtime::{
     DirectoryEntry, EntryKind, ProcessEvent, ProcessInfo, ProcessState, RuntimeError, VmInstance,
     WaitStatus,
@@ -454,34 +457,6 @@ fn format_wait_status(status: &WaitStatus) -> String {
     }
 }
 
-fn required_text<'a>(arguments: &'a ToolArguments, name: &str) -> Result<&'a str, ToolError> {
-    match arguments.get(name) {
-        Some(ToolValue::Text(value)) if !value.trim().is_empty() => Ok(value),
-        Some(_) => Err(ToolError::new(format!(
-            "argument '{name}' must be non-empty text"
-        ))),
-        None => Err(ToolError::new(format!("missing required argument: {name}"))),
-    }
-}
-
-fn required_text_allow_empty<'a>(
-    arguments: &'a ToolArguments,
-    name: &str,
-) -> Result<&'a str, ToolError> {
-    match arguments.get(name) {
-        Some(ToolValue::Text(value)) => Ok(value),
-        Some(_) => Err(ToolError::new(format!("argument '{name}' must be text"))),
-        None => Err(ToolError::new(format!("missing required argument: {name}"))),
-    }
-}
-
-fn optional_text<'a>(arguments: &'a ToolArguments, name: &str) -> Option<&'a str> {
-    match arguments.get(name) {
-        Some(ToolValue::Text(value)) if !value.trim().is_empty() => Some(value),
-        _ => None,
-    }
-}
-
 fn optional_bool(arguments: &ToolArguments, name: &str) -> Option<bool> {
     match arguments.get(name) {
         Some(ToolValue::Boolean(value)) => Some(*value),
@@ -530,16 +505,6 @@ fn optional_string_list(arguments: &ToolArguments, name: &str) -> Result<Vec<Str
             ))),
         })
         .collect()
-}
-
-fn ensure_arguments(arguments: &ToolArguments, allowed: &[&str]) -> Result<(), ToolError> {
-    if let Some(name) = arguments
-        .keys()
-        .find(|name| !allowed.iter().any(|allowed_name| allowed_name == name))
-    {
-        return Err(ToolError::new(format!("unexpected argument: {name}")));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

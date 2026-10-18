@@ -14,7 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::agent::{
-    PermissionRequest, Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ToolValue,
+    PermissionRequest, Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ensure_arguments,
+    optional_text, required_text, required_text_allow_empty,
 };
 
 fn sanitize_permission_component(value: &str) -> String {
@@ -698,44 +699,6 @@ fn search_directory(
                 }
             }
         }
-    }
-    Ok(())
-}
-
-fn required_text<'a>(arguments: &'a ToolArguments, name: &str) -> Result<&'a str, ToolError> {
-    match arguments.get(name) {
-        Some(ToolValue::Text(value)) if !value.trim().is_empty() => Ok(value),
-        Some(_) => Err(ToolError::new(format!(
-            "argument '{name}' must be non-empty text"
-        ))),
-        None => Err(ToolError::new(format!("missing required argument: {name}"))),
-    }
-}
-
-fn required_text_allow_empty<'a>(
-    arguments: &'a ToolArguments,
-    name: &str,
-) -> Result<&'a str, ToolError> {
-    match arguments.get(name) {
-        Some(ToolValue::Text(value)) => Ok(value),
-        Some(_) => Err(ToolError::new(format!("argument '{name}' must be text"))),
-        None => Err(ToolError::new(format!("missing required argument: {name}"))),
-    }
-}
-
-fn optional_text<'a>(arguments: &'a ToolArguments, name: &str) -> Option<&'a str> {
-    match arguments.get(name) {
-        Some(ToolValue::Text(value)) if !value.trim().is_empty() => Some(value),
-        _ => None,
-    }
-}
-
-fn ensure_arguments(arguments: &ToolArguments, allowed: &[&str]) -> Result<(), ToolError> {
-    if let Some(name) = arguments
-        .keys()
-        .find(|name| !allowed.iter().any(|allowed_name| allowed_name == name))
-    {
-        return Err(ToolError::new(format!("unexpected argument: {name}")));
     }
     Ok(())
 }
