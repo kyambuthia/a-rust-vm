@@ -64,11 +64,18 @@ fn describe_source(source: &ConfigSource) -> String {
         return text;
     };
     text.push('\n');
-    if config.rules.is_empty() && config.mcp_servers.is_empty() {
+    if config.rules.is_empty() && config.mcp_servers.is_empty() && config.env_passthrough.is_empty()
+    {
         text.push_str("  (empty)\n");
     }
     for rule in &config.rules {
         text.push_str(&format!("  rule {rule}\n"));
+    }
+    if !config.env_passthrough.is_empty() {
+        text.push_str(&format!(
+            "  env passthrough {}\n",
+            config.env_passthrough.join(" ")
+        ));
     }
     for (name, server) in &config.mcp_servers {
         let mut command = server.command.clone();

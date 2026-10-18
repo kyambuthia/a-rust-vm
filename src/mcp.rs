@@ -67,12 +67,23 @@ impl std::error::Error for McpError {}
 #[derive(Debug, Clone)]
 pub struct McpClient {
     config: McpConfig,
+    env_passthrough: Vec<String>,
 }
 
 impl McpClient {
     pub fn new(config: McpConfig) -> Result<Self, McpError> {
         validate_config(&config)?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            env_passthrough: Vec::new(),
+        })
+    }
+
+    /// Extra host variables the server receives beside the default allow
+    /// list (see [`crate::command_env`]) and its own `env` entries.
+    pub fn with_env_passthrough(mut self, names: &[String]) -> Self {
+        self.env_passthrough = names.to_vec();
+        self
     }
 
     pub fn config(&self) -> &McpConfig {
@@ -128,7 +139,7 @@ impl McpClient {
         method: &str,
         params: BTreeMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value, McpError> {
-        let child = spawn_server(&self.config)?;
+        let child = spawn_server(&self.config, &self.env_passthrough)?;
         let mut child = McpChildGuard::new(child);
         let stdout = child
             .child
@@ -393,22 +404,25 @@ fn tool_value_to_json(value: &crate::agent::ToolValue) -> serde_json::Value {
 }
 
 pub fn mcp_tool_registry(config: &McpConfig) -> Result<crate::agent::ToolRegistry, McpError> {
-    tool_registry(config, None)
+    tool_registry(config, None, &[])
 }
 
 /// Discover a named server's tools and register them as `mcp_<server>_<tool>`.
+/// `env_passthrough` names extra host variables the server may see.
 pub fn mcp_server_tool_registry(
     server: &str,
     config: &McpConfig,
+    env_passthrough: &[String],
 ) -> Result<crate::agent::ToolRegistry, McpError> {
-    tool_registry(config, Some(server))
+    tool_registry(config, Some(server), env_passthrough)
 }
 
 fn tool_registry(
     config: &McpConfig,
     server: Option<&str>,
+    env_passthrough: &[String],
 ) -> Result<crate::agent::ToolRegistry, McpError> {
-    let client = McpClient::new(config.clone())?;
+    let client = McpClient::new(config.clone())?.with_env_passthrough(env_passthrough);
     let mut registry = crate::agent::ToolRegistry::default();
     for tool in client.list_tools()? {
         let adapter = McpToolAdapter::build(client.clone(), &tool, server)?;
@@ -444,8 +458,13 @@ fn validate_config(config: &McpConfig) -> Result<(), McpError> {
     Ok(())
 }
 
-fn spawn_server(config: &McpConfig) -> Result<std::process::Child, McpError> {
+fn spawn_server(
+    config: &McpConfig,
+    env_passthrough: &[String],
+) -> Result<std::process::Child, McpError> {
     let mut command = Command::new(&config.command);
+    crate::command_env::apply_scrubbed_environment(&mut command, env_passthrough);
+    crate::command_env::start_new_process_group(&mut command);
     command
         .args(&config.args)
         .stdin(Stdio::piped())
@@ -540,6 +559,8 @@ impl McpChildGuard {
 
 impl Drop for McpChildGuard {
     fn drop(&mut self) {
+        // End anything the server started, even after it exited itself.
+        crate::command_env::kill_process_group(self.child.id());
         if !self.waited {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -912,7 +933,7 @@ mod tests {
         );
         assert!(mcp_server_registry_name("--", "read").is_err());
         let script = r#"read l1; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; read initialized; read l2; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo"}]}}'"#;
-        let registry = mcp_server_tool_registry("files", &shell_config(script)).unwrap();
+        let registry = mcp_server_tool_registry("files", &shell_config(script), &[]).unwrap();
         let spec = &registry.specs()[0];
         assert_eq!(spec.name, "mcp_files_echo");
         assert!(spec.description.contains("from server 'files'"));

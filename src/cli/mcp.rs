@@ -70,15 +70,16 @@ pub(crate) fn register_mcp_tools(loaded: &LoadedConfig, registry: &mut ToolRegis
         );
     }
     for server in &plan.enabled {
-        let added = mcp_server_tool_registry(&server.name, &server.config)
-            .map_err(|error| error.to_string())
-            .and_then(|tools| {
-                let count = tools.specs().len();
-                registry
-                    .merge(tools)
-                    .map(|()| count)
-                    .map_err(|error| error.to_string())
-            });
+        let added =
+            mcp_server_tool_registry(&server.name, &server.config, &loaded.env_passthrough())
+                .map_err(|error| error.to_string())
+                .and_then(|tools| {
+                    let count = tools.specs().len();
+                    registry
+                        .merge(tools)
+                        .map(|()| count)
+                        .map_err(|error| error.to_string())
+                });
         match added {
             Ok(count) => eprintln!("[mcp] {}: {count} tools", server.name),
             Err(error) => eprintln!("[mcp] server '{}' unavailable: {error}", server.name),
@@ -205,8 +206,9 @@ fn list_tools(name: &str) -> Result<(), String> {
             None => format!("no MCP server named '{name}'"),
         });
     };
-    let registry = mcp_server_tool_registry(&server.name, &server.config)
-        .map_err(|error| format!("server '{name}': {error}"))?;
+    let registry =
+        mcp_server_tool_registry(&server.name, &server.config, &loaded.env_passthrough())
+            .map_err(|error| format!("server '{name}': {error}"))?;
     let specs = registry.specs();
     if specs.is_empty() {
         println!("(no tools)");

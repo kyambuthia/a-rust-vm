@@ -46,6 +46,10 @@ pub struct ArvmConfig {
     /// MCP servers by name.
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpConfig>,
+    /// Extra host environment variables that commands and MCP servers may
+    /// see, beyond the default allow list. User configuration only.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +101,21 @@ impl ArvmConfig {
                      put allow rules in the user configuration or pass --rule"
                 )));
             }
+        }
+        if scope == ConfigScope::Workspace && !self.env_passthrough.is_empty() {
+            return Err(ConfigError::new(
+                "envPassthrough is only allowed in the user configuration, \
+                 so a project cannot read your environment",
+            ));
+        }
+        if let Some(name) = self
+            .env_passthrough
+            .iter()
+            .find(|name| !crate::command_env::valid_env_name(name))
+        {
+            return Err(ConfigError::new(format!(
+                "invalid envPassthrough name '{name}'"
+            )));
         }
         for (name, server) in &self.mcp_servers {
             if !valid_server_name(name) {
@@ -194,6 +213,15 @@ impl LoadedConfig {
     /// tighten a user's allow rule but never loosen it.
     pub fn sources(&self) -> [&ConfigSource; 2] {
         [&self.workspace, &self.user]
+    }
+
+    /// Extra environment variable names from the user configuration.
+    pub fn env_passthrough(&self) -> Vec<String> {
+        self.user
+            .config
+            .as_ref()
+            .map(|config| config.env_passthrough.clone())
+            .unwrap_or_default()
     }
 
     /// Rules from both scopes in precedence order.
@@ -340,6 +368,22 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[test]
+    fn env_passthrough_is_user_only_and_validated() {
+        let bytes = br#"{"envPassthrough":["GITHUB_TOKEN"]}"#;
+        let user = ArvmConfig::parse(bytes, ConfigScope::User).unwrap();
+        assert_eq!(user.env_passthrough, ["GITHUB_TOKEN"]);
+        let error = ArvmConfig::parse(bytes, ConfigScope::Workspace).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("only allowed in the user configuration")
+        );
+        let error =
+            ArvmConfig::parse(br#"{"envPassthrough":["A-B"]}"#, ConfigScope::User).unwrap_err();
+        assert!(error.message.contains("invalid envPassthrough name 'A-B'"));
     }
 
     #[test]

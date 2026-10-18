@@ -74,8 +74,8 @@ or read from the code.
 | Steps per turn | 8 (CLI and browser) | Too few to read, edit, test, and fix in one turn |
 | Context kept | 24 messages or 32 KB of text | Far below current model windows; the agent forgets files it just read |
 | Edit tool | None; `write_file` rewrites whole files up to 128 KB | Slow, expensive, and error-prone for small changes |
-| `run_command` environment | Inherits the full parent environment | A model can print `OPENROUTER_API_KEY`, AWS credentials, or tokens |
-| Command timeout | Kills `sh`, not its process group | Background children survive cancellation and timeouts |
+| `run_command` environment | Inherits the full parent environment (fixed in S1.2) | A model could print `OPENROUTER_API_KEY`, AWS credentials, or tokens |
+| Command timeout | Kills `sh`, not its process group (fixed in S1.3) | Background children survived timeouts and held the tool open |
 | State files | `0664`, directories `0775` (fixed in S1.1) | Transcripts, rules, and trust records were readable by other local users |
 | CLI error handling | 62 `process::exit` calls across `src/cli/` | Hard to test, and cleanup steps get skipped |
 
@@ -163,13 +163,15 @@ and context work can be measured.
 1. ~~Private state: create the state and config directories `0700` and every
    session, rule, trust, and snapshot file `0600`, writing atomically~~.
    New directories are `0700`; existing ones keep their mode.
-2. Scrubbed environment for `run_command` and MCP servers: pass an allow list
+2. ~~Scrubbed environment for `run_command` and MCP servers: pass an allow list
    (`PATH`, `HOME`, `USER`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `SHELL`) plus
    names listed in config `env.passthrough`; never pass `*_API_KEY`,
-   `*_TOKEN`, `*_SECRET`, `AWS_*`, or `OPENROUTER_*`.
-3. Run each command in its own process group and kill the whole group on
+   `*_TOKEN`, `*_SECRET`, `AWS_*`, or `OPENROUTER_*`~~. The key is
+   `envPassthrough`, user configuration only.
+3. ~~Run each command in its own process group and kill the whole group on
    timeout and cancellation (`std::os::unix::process::CommandExt::process_group`,
-   no new dependency).
+   no new dependency)~~. The group is also killed when the command exits,
+   so `cmd &` cannot hang the tool or outlive it.
 4. Redact secret-looking values (provider keys, AWS keys, bearer tokens) from
    tool output before it reaches the model, the screen, or a transcript,
    reusing the OpenRouter redaction code.

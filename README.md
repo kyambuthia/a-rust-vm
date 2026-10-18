@@ -202,8 +202,21 @@ entries are errors, so a typo never drops a rule silently.
 }
 ```
 
+Commands the agent runs, and MCP servers, see only a short allow list of
+environment variables (`PATH`, `HOME`, `USER`, `LANG`, `LC_*`, `TERM`,
+`TMPDIR`, toolchain homes such as `CARGO_HOME`), never provider keys, cloud
+credentials, or tokens. To pass more, list the names in the user
+configuration:
+
+```json
+{ "envPassthrough": ["GITHUB_TOKEN"] }
+```
+
+A command runs in its own process group: when it finishes or hits the 30 s
+limit, anything it started in the background is ended too.
+
 A workspace configuration ships with the project, so it can only tighten
-permissions: an `allow` rule there is refused. Put `allow` rules in the user
+permissions (and cannot set `envPassthrough`): an `allow` rule there is refused. Put `allow` rules in the user
 configuration or pass them with `--rule`. `arvm config show [--json]` prints
 both files and what they declare.
 

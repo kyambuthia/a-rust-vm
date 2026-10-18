@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod apps;
 pub mod artifacts;
+pub mod command_env;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]

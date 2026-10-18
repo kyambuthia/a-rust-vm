@@ -10,7 +10,7 @@ use a_rust_vm::agent::{
     system_prompt_with_skills,
 };
 use a_rust_vm::session::{Session, SessionStore};
-use a_rust_vm::workspace::coding_tool_registry_with_directories;
+use a_rust_vm::workspace::coding_tool_registry_with_options;
 
 use super::config::load_config_or_exit;
 use super::mcp::register_mcp_tools;
@@ -60,12 +60,15 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     router
         .set_strong(&model_name)
         .expect("strong model route should exist");
-    let mut registry =
-        coding_tool_registry_with_directories(&working_directory, &additional_directories)
-            .unwrap_or_else(|error| {
-                eprintln!("[workspace] {error}");
-                std::process::exit(2);
-            });
+    let mut registry = coding_tool_registry_with_options(
+        &working_directory,
+        &additional_directories,
+        &config.env_passthrough(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("[workspace] {error}");
+        std::process::exit(2);
+    });
     register_mcp_tools(&config, &mut registry);
     let mut agent = Agent::new(router, registry)
         .with_system_prompt(workspace_system_prompt_with_skills(

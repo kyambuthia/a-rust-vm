@@ -212,6 +212,16 @@ pub fn workspace_tool_registry_with_directories(
     root: impl Into<PathBuf>,
     additional: &[PathBuf],
 ) -> Result<ToolRegistry, ToolError> {
+    workspace_tool_registry_with_options(root, additional, &[])
+}
+
+/// Register workspace tools with additional directories and extra
+/// environment variable names that `run_command` passes through.
+pub fn workspace_tool_registry_with_options(
+    root: impl Into<PathBuf>,
+    additional: &[PathBuf],
+    env_passthrough: &[String],
+) -> Result<ToolRegistry, ToolError> {
     let workspace = Workspace::with_additional_directories(root, additional)
         .map_err(|error| ToolError::new(error.to_string()))?;
     let workspace = Rc::new(RefCell::new(workspace));
@@ -221,7 +231,7 @@ pub fn workspace_tool_registry_with_directories(
     registry.register(ReadFileTool::new(workspace.clone()))?;
     registry.register(SearchFilesTool::new(workspace.clone()))?;
     registry.register(WriteFileTool::new(workspace.clone()))?;
-    registry.register(RunCommandTool::new(workspace))?;
+    registry.register(RunCommandTool::new(workspace, env_passthrough.to_vec()))?;
     Ok(registry)
 }
 
@@ -237,8 +247,22 @@ pub fn coding_tool_registry_with_directories(
     root: impl Into<PathBuf>,
     additional: &[PathBuf],
 ) -> Result<ToolRegistry, ToolError> {
+    coding_tool_registry_with_options(root, additional, &[])
+}
+
+/// Register VM and workspace tools with additional directories and extra
+/// environment variable names for `run_command`.
+pub fn coding_tool_registry_with_options(
+    root: impl Into<PathBuf>,
+    additional: &[PathBuf],
+    env_passthrough: &[String],
+) -> Result<ToolRegistry, ToolError> {
     let mut registry = crate::agent::vm_tool_registry()?;
-    registry.merge(workspace_tool_registry_with_directories(root, additional)?)?;
+    registry.merge(workspace_tool_registry_with_options(
+        root,
+        additional,
+        env_passthrough,
+    )?)?;
     Ok(registry)
 }
 
@@ -430,11 +454,15 @@ impl Tool for WriteFileTool {
 
 struct RunCommandTool {
     workspace: SharedWorkspace,
+    env_passthrough: Vec<String>,
 }
 
 impl RunCommandTool {
-    fn new(workspace: SharedWorkspace) -> Self {
-        Self { workspace }
+    fn new(workspace: SharedWorkspace, env_passthrough: Vec<String>) -> Self {
+        Self {
+            workspace,
+            env_passthrough,
+        }
     }
 }
 
@@ -461,20 +489,25 @@ impl Tool for RunCommandTool {
         let command = required_text(arguments, "command")?;
         reject_dangerous_command(command)?;
         let workspace = self.workspace.borrow();
-        let output = shell_command(command, workspace.root())?;
+        let output = shell_command(command, workspace.root(), &self.env_passthrough)?;
         Ok(format_command_output(&output))
     }
 }
 
 #[cfg(any(unix, windows))]
-fn shell_command(command: &str, directory: &Path) -> Result<std::process::Output, ToolError> {
-    shell_command_with_timeout(command, directory, MAX_COMMAND_RUNTIME)
+fn shell_command(
+    command: &str,
+    directory: &Path,
+    env_passthrough: &[String],
+) -> Result<std::process::Output, ToolError> {
+    shell_command_with_timeout(command, directory, env_passthrough, MAX_COMMAND_RUNTIME)
 }
 
 #[cfg(any(unix, windows))]
 fn shell_command_with_timeout(
     command: &str,
     directory: &Path,
+    env_passthrough: &[String],
     timeout: Duration,
 ) -> Result<std::process::Output, ToolError> {
     #[cfg(unix)]
@@ -486,6 +519,8 @@ fn shell_command_with_timeout(
     #[cfg(windows)]
     process.args(["/C", command]);
     process.current_dir(directory);
+    crate::command_env::apply_scrubbed_environment(&mut process, env_passthrough);
+    crate::command_env::start_new_process_group(&mut process);
     process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -505,22 +540,31 @@ fn shell_command_with_timeout(
     let stdout_reader = thread::spawn(|| bounded_pipe_output(stdout));
     let stderr_reader = thread::spawn(|| bounded_pipe_output(stderr));
     let deadline = Instant::now() + timeout;
+    let group = child.id();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(COMMAND_POLL_INTERVAL),
             Ok(None) => {
+                crate::command_env::kill_process_group(group);
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(ToolError::new("command exceeded the 30 second limit"));
+                return Err(ToolError::new(format!(
+                    "command exceeded the {} second limit",
+                    timeout.as_secs()
+                )));
             }
             Err(error) => {
+                crate::command_env::kill_process_group(group);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ToolError::new(format!("failed to finish command: {error}")));
             }
         }
     };
+    // Background children (`cmd &`) would otherwise hold the output pipes
+    // open and outlive the command; end them with it.
+    crate::command_env::kill_process_group(group);
 
     let stdout = stdout_reader
         .join()
@@ -555,7 +599,11 @@ fn bounded_pipe_output(mut pipe: impl Read) -> Vec<u8> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn shell_command(_command: &str, _directory: &Path) -> Result<std::process::Output, ToolError> {
+fn shell_command(
+    _command: &str,
+    _directory: &Path,
+    _env_passthrough: &[String],
+) -> Result<std::process::Output, ToolError> {
     Err(ToolError::new(
         "command execution is unavailable on this target",
     ))
@@ -859,11 +907,67 @@ mod tests {
         let error = super::shell_command_with_timeout(
             "sleep 5",
             &root,
+            &[],
             std::time::Duration::from_millis(100),
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("exceeded"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_tool_ends_background_children_with_the_command() {
+        let root = test_root("command-background");
+        let started = std::time::Instant::now();
+        let output = super::shell_command_with_timeout(
+            "sleep 30 & echo started",
+            &root,
+            &[],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("started"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let started = std::time::Instant::now();
+        let error = super::shell_command_with_timeout(
+            "sleep 30 & sleep 30",
+            &root,
+            &[],
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_tool_hides_host_secrets() {
+        let root = test_root("command-env");
+        // SAFETY: tests in this crate do not read this variable concurrently.
+        unsafe { std::env::set_var("A_RVM_TEST_SECRET_TOKEN", "hunter2") };
+        let output = super::shell_command_with_timeout(
+            "env",
+            &root,
+            &[],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(!printed.contains("hunter2"));
+        assert!(printed.contains("PATH="));
+        let output = super::shell_command_with_timeout(
+            "env",
+            &root,
+            &["A_RVM_TEST_SECRET_TOKEN".to_owned()],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hunter2"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
