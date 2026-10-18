@@ -172,9 +172,11 @@ and context work can be measured.
    timeout and cancellation (`std::os::unix::process::CommandExt::process_group`,
    no new dependency)~~. The group is also killed when the command exits,
    so `cmd &` cannot hang the tool or outlive it.
-4. Redact secret-looking values (provider keys, AWS keys, bearer tokens) from
+4. ~~Redact secret-looking values (provider keys, AWS keys, bearer tokens) from
    tool output before it reaches the model, the screen, or a transcript,
-   reusing the OpenRouter redaction code.
+   reusing the OpenRouter redaction code~~. `src/redact.rs` also hides
+   private-key blocks, `UPPER_SECRET=value` lines, and the values of
+   secret-named host variables.
 5. Mark untrusted content: wrap tool and MCP output in delimiters the system
    prompt tells the model to treat as data, and show which project
    instruction files were loaded in `/status`.

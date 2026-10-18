@@ -28,6 +28,7 @@ pub mod persistent_model;
 pub mod private_fs;
 pub mod program;
 pub mod protocol;
+pub mod redact;
 pub mod runtime;
 pub mod session;
 pub mod session_snapshot;

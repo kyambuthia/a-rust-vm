@@ -554,3 +554,45 @@ fn host_deny_is_never_remembered() {
     assert_eq!(prompts, 2);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn tool_output_secrets_are_redacted_before_events_and_context() {
+    let root = std::env::temp_dir().join(format!("a-rvm-redact-turn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join(".env"),
+        "DB_PASSWORD=hunter2hunter\nKEY=sk-or-v1-0123456789abcdef0123\n",
+    )
+    .unwrap();
+    let model = ScriptedModel::new([
+        ModelResponse::ToolCall(ToolCall::new(
+            "read-1",
+            "read_file",
+            [("path".to_owned(), ToolValue::Text(".env".to_owned()))]
+                .into_iter()
+                .collect(),
+        )),
+        ModelResponse::Text("done".to_owned()),
+    ]);
+    let mut agent = Agent::new(
+        model,
+        crate::workspace::workspace_tool_registry(&root).unwrap(),
+    );
+
+    let events = agent.run("read the env file").unwrap();
+
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(result.contains("DB_PASSWORD=[redacted]"), "{result}");
+    assert!(!result.contains("hunter2hunter"));
+    assert!(!result.contains("0123456789abcdef0123"));
+    let context = format!("{:?}", agent.conversation());
+    assert!(!context.contains("hunter2hunter"));
+    std::fs::remove_dir_all(root).unwrap();
+}

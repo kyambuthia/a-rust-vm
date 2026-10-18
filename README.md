@@ -212,6 +212,13 @@ configuration:
 { "envPassthrough": ["GITHUB_TOKEN"] }
 ```
 
+Tool output is also scanned before it reaches the model, the screen, or a
+saved transcript: known token formats (`sk-...`, GitHub, GitLab, Slack, AWS
+key IDs, Google API keys), `Bearer` tokens, private-key blocks,
+`UPPER_CASE_SECRET=value` lines, and the values of secret-named variables
+in your environment are replaced with `[redacted]`. This is a safety net,
+not a guarantee; unknown secret formats still get through.
+
 A command runs in its own process group: when it finishes or hits the 30 s
 limit, anything it started in the background is ended too.
 

@@ -71,6 +71,7 @@ pub struct Agent<M> {
     max_context_chars: usize,
     permission_policy: PermissionPolicy,
     session_approvals: SessionApprovals,
+    redactor: crate::redact::Redactor,
 }
 
 impl<M> Agent<M>
@@ -92,7 +93,15 @@ where
             max_context_chars: DEFAULT_CONTEXT_CHARS,
             permission_policy: PermissionPolicy::new(),
             session_approvals: SessionApprovals::new(),
+            redactor: crate::redact::Redactor::from_environment(),
         }
+    }
+
+    /// Replace the redactor applied to every tool result before it reaches
+    /// the model, the event stream, or a transcript.
+    pub fn with_redactor(mut self, redactor: crate::redact::Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
@@ -352,7 +361,11 @@ where
                         return Ok(TurnEnd::RepeatedToolCall);
                     }
                     emit(AgentEvent::ToolCall(call.clone()));
-                    let result = self.execute_with_approval(&call, approve, &mut *emit);
+                    let mut result = self.execute_with_approval(&call, approve, &mut *emit);
+                    if let std::borrow::Cow::Owned(redacted) = self.redactor.redact(&result.content)
+                    {
+                        result.content = redacted;
+                    }
                     tool_results.push(result.clone());
                     turn_context.push(ConversationMessage::assistant_tool_call(&call));
                     turn_context.push(ConversationMessage::tool_result(&result));
