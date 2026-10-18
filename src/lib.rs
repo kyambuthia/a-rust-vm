@@ -24,6 +24,7 @@ pub mod openrouter;
 pub mod permissions;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod persistent_model;
+pub mod private_fs;
 pub mod program;
 pub mod protocol;
 pub mod runtime;

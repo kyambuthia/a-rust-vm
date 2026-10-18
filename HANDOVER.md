@@ -53,8 +53,7 @@ Landed capabilities (last known green count: 218 lib + 16 CLI tests):
 - Terminal: `arvm agent | ask` REPL, one-shot `ask`, `--json` NDJSON output,
   `--auto`/`--deny`, `--rule`, `--workspace-dir`, `--skill`.
 - Sessions: save/list/show/export transcripts, resume via `--session`,
-  local state under `~/.local/state/a-rust-vm/sessions` (not yet private;
-  see ROADMAP S1.1).
+  owner-only local state under `~/.local/state/a-rust-vm/sessions`.
 - Permissions: rule effects (allow/ask/deny), target-prefix scoping, durable
   rule storage (`arvm permission list|add|clear`), dangerous-command deny-list,
   workspace additional directories.

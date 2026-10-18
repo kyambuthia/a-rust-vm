@@ -27,12 +27,6 @@ fn load_stored_permission_policy(
 }
 
 fn save_stored_permission_rule_at(path: &std::path::Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create permission directory: {error}"))?;
-    }
     let trimmed = text.trim().to_owned();
     a_rust_vm::permissions::parse_permission_rule(&trimmed)
         .map_err(|error| format!("invalid rule '{trimmed}': {error}"))?;
@@ -50,13 +44,8 @@ fn save_stored_permission_rule_at(path: &std::path::Path, text: &str) -> Result<
     stored.push(trimmed);
     let content = serde_json::to_vec_pretty(&stored)
         .map_err(|error| format!("cannot encode permission rules: {error}"))?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, content)
-        .map_err(|error| format!("cannot write permission rules: {error}"))?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("cannot save permission rules: {error}")
-    })
+    a_rust_vm::private_fs::write_private(path, &content)
+        .map_err(|error| format!("cannot save permission rules: {error}"))
 }
 
 fn save_stored_permission_rule(text: &str) -> Result<(), String> {

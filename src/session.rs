@@ -2,10 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 use serde::{Deserialize, Serialize};
 
@@ -107,27 +104,10 @@ impl SessionStore {
 
     pub fn save(&self, session: &Session) -> Result<(), SessionError> {
         validate_id(&session.id)?;
-        fs::create_dir_all(&self.directory).map_err(|error| {
-            SessionError::new(format!(
-                "cannot create session directory '{}': {error}",
-                self.directory.display()
-            ))
-        })?;
         let content = serde_json::to_vec_pretty(session)
             .map_err(|error| SessionError::new(format!("cannot encode session: {error}")))?;
-        let target = self.path_for(&session.id);
-        let temporary = self.directory.join(format!(
-            ".{}.{}.{}.tmp",
-            session.id,
-            std::process::id(),
-            NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(&temporary, content).map_err(|error| {
-            SessionError::new(format!("cannot write temporary session: {error}"))
-        })?;
-        fs::rename(&temporary, &target).map_err(|error| {
-            let _ = fs::remove_file(&temporary);
-            SessionError::new(format!("cannot commit session '{}': {error}", session.id))
+        crate::private_fs::write_private(&self.path_for(&session.id), &content).map_err(|error| {
+            SessionError::new(format!("cannot save session '{}': {error}", session.id))
         })
     }
 

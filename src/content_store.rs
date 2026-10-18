@@ -7,13 +7,11 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
 const REFERENCE_PREFIX: &str = "sha256:";
 const DIGEST_HEX_LEN: usize = 64;
-static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ContentStore {
@@ -42,10 +40,12 @@ impl ContentStore {
         let parent = path
             .parent()
             .expect("content paths always have a sha256 directory");
-        fs::create_dir_all(parent).map_err(|error| ContentStoreError::Io {
-            operation: "create content directory",
-            path: parent.to_path_buf(),
-            message: error.to_string(),
+        crate::private_fs::create_private_dir_all(parent).map_err(|error| {
+            ContentStoreError::Io {
+                operation: "create content directory",
+                path: parent.to_path_buf(),
+                message: error.to_string(),
+            }
         })?;
 
         if path.exists() {
@@ -60,25 +60,11 @@ impl ContentStore {
             });
         }
 
-        let temporary_id = NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{digest}.{}.{}.tmp",
-            std::process::id(),
-            temporary_id
-        ));
-        fs::write(&temporary, bytes).map_err(|error| ContentStoreError::Io {
+        crate::private_fs::write_private(&path, bytes).map_err(|error| ContentStoreError::Io {
             operation: "write content",
-            path: temporary.clone(),
+            path: path.clone(),
             message: error.to_string(),
         })?;
-        if let Err(error) = fs::rename(&temporary, &path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(ContentStoreError::Io {
-                operation: "commit content",
-                path,
-                message: error.to_string(),
-            });
-        }
 
         Ok(StoredContent {
             reference: format!("{REFERENCE_PREFIX}{digest}"),

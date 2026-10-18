@@ -2,13 +2,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_store::ContentStore;
 use crate::control_plane::{ControlPlane, ControlPlaneError, ControlPlaneSnapshot};
 use crate::runtime::ResourceLimits;
-
-static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneStore {
@@ -63,32 +60,12 @@ impl ControlPlaneStore {
     }
 
     pub fn save(&self, plane: &ControlPlane) -> Result<(), StoreError> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| StoreError::new("control-plane path has no parent"))?;
-        fs::create_dir_all(parent).map_err(|error| {
-            StoreError::new(format!("cannot create '{}': {error}", parent.display()))
-        })?;
         let bytes = serde_json::to_vec_pretty(&plane.snapshot()).map_err(|error| {
             StoreError::new(format!("cannot encode control-plane state: {error}"))
         })?;
-        let temporary = parent.join(format!(
-            ".control-plane.{}.{}.tmp",
-            std::process::id(),
-            NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(&temporary, bytes).map_err(|error| {
-            StoreError::new(format!("cannot write '{}': {error}", temporary.display()))
-        })?;
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(StoreError::new(format!(
-                "cannot commit '{}': {error}",
-                self.path.display()
-            )));
-        }
-        Ok(())
+        crate::private_fs::write_private(&self.path, &bytes).map_err(|error| {
+            StoreError::new(format!("cannot save '{}': {error}", self.path.display()))
+        })
     }
 }
 

@@ -26,7 +26,7 @@ Status was verified against the code, not earlier checklists.
 | CLI | `run/check/disassemble/trace`, `agent` REPL, one-shot `ask` with `--json`, `--auto/--deny`, `--rule`, `--skill`, `--workspace-dir`, `--session`; `session`, `skill`, `permission`, `workspace`, `doctor`, `version` |
 | Workspace tools | list/read/search/write/run with containment, dangling-symlink refusal, dangerous-command refusal, bounded output, 30 s command timeout |
 | Permissions | allow/ask/deny rules (typed path and command matching), durable rule store, session approvals |
-| Sessions | Save/list/show/export transcripts, resume via `--session`; state files are created with the default umask (world-readable), not private |
+| Sessions | Save/list/show/export transcripts, resume via `--session`; state files are owner-only (`0600`) and written atomically |
 | Browser host | Anonymous and ALB/Cognito-bound sessions, uploads, document/sheet/PDF/tabulation jobs, streamed agent events, approvals, durable snapshots, ECS/Fargate CDK stack |
 | Skills | `SKILL.md` discovery and prompt injection |
 | MCP | stdio client (handshake, paging, interleaved messages); configured servers register approval-gated `mcp_<server>_<tool>` tools in `agent`/`ask`; workspace servers need `arvm mcp trust` |
@@ -76,7 +76,7 @@ or read from the code.
 | Edit tool | None; `write_file` rewrites whole files up to 128 KB | Slow, expensive, and error-prone for small changes |
 | `run_command` environment | Inherits the full parent environment | A model can print `OPENROUTER_API_KEY`, AWS credentials, or tokens |
 | Command timeout | Kills `sh`, not its process group | Background children survive cancellation and timeouts |
-| State files | `0664`, directories `0775` | Transcripts, rules, and trust records are readable by other local users |
+| State files | `0664`, directories `0775` (fixed in S1.1) | Transcripts, rules, and trust records were readable by other local users |
 | CLI error handling | 62 `process::exit` calls across `src/cli/` | Hard to test, and cleanup steps get skipped |
 
 ### Known debt and risks
@@ -160,8 +160,9 @@ and context work can be measured.
 
 ### S1: Close the leaks (next; small slices)
 
-1. Private state: create the state and config directories `0700` and every
-   session, rule, trust, and snapshot file `0600`, writing atomically.
+1. ~~Private state: create the state and config directories `0700` and every
+   session, rule, trust, and snapshot file `0600`, writing atomically~~.
+   New directories are `0700`; existing ones keep their mode.
 2. Scrubbed environment for `run_command` and MCP servers: pass an allow list
    (`PATH`, `HOME`, `USER`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `SHELL`) plus
    names listed in config `env.passthrough`; never pass `*_API_KEY`,

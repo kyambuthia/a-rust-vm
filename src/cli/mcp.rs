@@ -31,21 +31,10 @@ fn load_trust(path: &Path) -> Result<Vec<TrustRecord>, String> {
 }
 
 fn save_trust(path: &Path, records: &[TrustRecord]) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create state directory: {error}"))?;
-    }
     let content = serde_json::to_vec_pretty(records)
         .map_err(|error| format!("cannot encode MCP trust records: {error}"))?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, content)
-        .map_err(|error| format!("cannot write MCP trust records: {error}"))?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("cannot save MCP trust records: {error}")
-    })
+    a_rust_vm::private_fs::write_private(path, &content)
+        .map_err(|error| format!("cannot save MCP trust records: {error}"))
 }
 
 fn is_trusted(records: &[TrustRecord], workspace: &Path, name: &str, config: &McpConfig) -> bool {
