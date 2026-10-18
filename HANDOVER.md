@@ -18,36 +18,23 @@ roadmap in small, verified slices.
   5. `docs/agent-loop-hardening.md` and the `docs/adr/` set for design context
 - Work only inside this repository. Never touch unrelated projects.
 
-## How to run work on this machine
+## How work runs on this machine
 
-A/RVM runs on the ukandi computer. You are expected to drive the Meta Muse
-contributor model through OpenRouter there via the opencode CLI. From a shell
-with access to ukandi:
+The repository lives on the ukandi computer (`192.168.100.14`). You work on it
+directly: read, edit, build, test, and commit in this checkout yourself. Do not
+delegate implementation to another model or agent CLI.
 
-```
-ssh -o BatchMode=yes mbuthi@192.168.100.14 'cd ~/Projects/a-rust-vm && opencode run -m openrouter/meta/muse-spark-1.3-contributor --dangerously-skip-permissions "<task prompt>"'
-```
+Implement one small slice at a time (see below), then verify and commit it.
 
-Usage notes that have proven reliable on this machine:
-
-- A plain quoted prompt as the final positional argument works.
-- When attaching files use `-f <file> -- "<prompt>"`.
-- The model can be slow: several minutes before the first write is normal.
-  If a run shows no file activity for ~15 minutes, interrupt it and retry a
-  smaller task rather than waiting indefinitely.
-- Each run should implement ONE small slice (see below), then verify and commit.
-- A stale, orphaned `opencode run` may exist. Check `ps -eo pid,etime,cmd | grep "opencode run"`
-  before starting work and kill processes that are clearly leftovers (their
-  intended commit already exists in `git log`).
-
-The browser server runs persistently in tmux session `arvm` on ukandi
-(`http://192.168.100.14:8080/web/`) with `OPENROUTER_MODEL=meta/muse-spark-1.3-contributor`.
-After any change to `src/`, rebuild and restart it:
+The browser server can run in tmux session `arvm`
+(`http://192.168.100.14:8080/web/`). It uses the default OpenRouter model
+unless `OPENROUTER_MODEL` is set. After any change to `src/`, rebuild and
+restart it if it is running:
 
 ```
 . ~/.profile && cd ~/Projects/a-rust-vm && cargo build
 tmux kill-session -t arvm 2>/dev/null; sleep 1
-tmux new-session -d -s arvm "cd ~/Projects/a-rust-vm && . ~/.profile && export OPENROUTER_MODEL=meta/muse-spark-1.3-contributor && export A_RVM_BIND_ADDRESS=0.0.0.0 && export A_RVM_ALLOWED_ORIGIN=http://192.168.100.14:8080 && exec ./target/debug/arvm serve"
+tmux new-session -d -s arvm "cd ~/Projects/a-rust-vm && . ~/.profile && export A_RVM_BIND_ADDRESS=0.0.0.0 && export A_RVM_ALLOWED_ORIGIN=http://192.168.100.14:8080 && exec ./target/debug/arvm serve"
 ```
 
 ## State at handover
@@ -79,7 +66,7 @@ Landed capabilities (last known green count: 218 lib + 16 CLI tests):
   tools/call, bounded lines), approval-gated `McpToolAdapter` and
   `mcp_tool_registry`.
 
-## Working method (one slice per run)
+## Working method (one slice at a time)
 
 1. `git status --short` and `git log --oneline -8` first.
 2. Read the smallest relevant slice of `ROADMAP.md`, `ARCHITECTURE.md`, and the
@@ -107,7 +94,8 @@ Landed capabilities (last known green count: 218 lib + 16 CLI tests):
 7. `git diff --check`, stage only named files, inspect the staged diff, and
    create one conventional commit (`feat:`, `fix:`, `refactor:`, `docs:`,
    `test:`, `build:`, `chore:`), imperative subject <= 72 chars.
-8. Rebuild/restart the tmux `arvm` server if `src/` changed, then report:
+8. Rebuild/restart the tmux `arvm` server if it is running and `src/`
+   changed, then report:
    decision, commit hash(es), checks, and known limitation.
 
 ## Quality bar

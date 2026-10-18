@@ -158,8 +158,8 @@ cargo run -- agent
 
 The hosted browser service must load its OpenRouter key from an AWS-managed
 secret or server process environment and must call the provider from the
-server side. OpenCode and Muse remain optional development orchestration
-tools and are not required by the hosted runtime.
+server side. The hosted runtime does not need OpenCode or any other agent
+CLI.
 
 ## Permission rules
 
