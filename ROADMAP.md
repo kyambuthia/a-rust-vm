@@ -197,7 +197,11 @@ no process behind.
    an explicit `A_RVM_MODEL_PROGRAM` option~~. Measured: 8.0 s native vs
    43.9 s through the bridge for the same two-step task. The adapter's 4 KB
    prompt and message caps and 4k-token output cap were raised too.
-2. SSE streaming for text and tool-call deltas.
+2. ~~SSE streaming for text and tool-call deltas~~. Measuring it showed the
+   first token waited on silent reasoning and on slow providers, so
+   `OPENROUTER_REASONING` (default `low`) and `OPENROUTER_PROVIDER_SORT`
+   (default `throughput`) were added. Typical one-step answers went from
+   8 s to 3-5 s.
 3. Usage events: input, output, and cached tokens, cost, and latency per step;
    `/usage` in the REPL and a summary line after `ask`.
 4. Cache-friendly prompts: a fixed order (system prompt, tools, history,

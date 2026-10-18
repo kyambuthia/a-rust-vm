@@ -156,6 +156,17 @@ export OPENROUTER_MODEL=deepseek/deepseek-v4-flash   # optional
 cargo run -- agent
 ```
 
+Responses stream token by token. Two settings trade speed against cost and
+depth; the defaults favour a quick interactive loop:
+
+- `OPENROUTER_REASONING` (`none`, `minimal`, `low`, `medium`, `high`,
+  `default`; default `low`). Reasoning tokens are generated before the first
+  visible token, so higher effort means a longer wait.
+- `OPENROUTER_PROVIDER_SORT` (`throughput`, `latency`, `price`, `default`;
+  default `throughput`). OpenRouter's own default favours price; in our
+  measurements throughput routing finished turns about twice as fast for a
+  few hundredths of a cent more.
+
 Optional limits: `OPENROUTER_MAX_TOKENS` (128-32768, default 8192) and
 `OPENROUTER_TIMEOUT_SECS` (1-600, default 120).
 

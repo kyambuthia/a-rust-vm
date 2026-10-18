@@ -1,12 +1,14 @@
 use std::env;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::agent::{ConversationMessage, Model, ModelError, ModelRequest, ModelResponse, ToolCall};
+use crate::agent::{
+    ConversationMessage, Model, ModelError, ModelRequest, ModelResponse, ModelStreamEvent, ToolCall,
+};
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL: &str = "~openai/gpt-latest";
@@ -33,6 +35,61 @@ pub struct OpenRouterConfig {
     pub timeout: Duration,
     pub max_response_bytes: usize,
     pub max_tokens: u32,
+    /// Reasoning effort sent to the provider; `None` leaves the provider's
+    /// default. Silent reasoning delays the first visible token, so the
+    /// default is `low`.
+    pub reasoning: Option<ReasoningEffort>,
+    /// How OpenRouter orders the providers serving the model: `price`,
+    /// `throughput`, or `latency`. `None` uses OpenRouter's default.
+    pub provider_sort: Option<String>,
+}
+
+/// Parse `OPENROUTER_PROVIDER_SORT`; `default` sends no preference.
+pub fn parse_provider_sort(value: &str) -> Result<Option<String>, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Ok(None),
+        sort @ ("price" | "throughput" | "latency") => Ok(Some(sort.to_owned())),
+        other => Err(format!(
+            "OPENROUTER_PROVIDER_SORT must be price, throughput, latency, or default, not '{other}'"
+        )),
+    }
+}
+
+/// OpenRouter's unified `reasoning` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Disabled,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// Parse `OPENROUTER_REASONING`: `default` means "send nothing".
+    pub fn parse(value: &str) -> Result<Option<Self>, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(None),
+            "none" | "off" => Ok(Some(Self::Disabled)),
+            "minimal" => Ok(Some(Self::Minimal)),
+            "low" => Ok(Some(Self::Low)),
+            "medium" => Ok(Some(Self::Medium)),
+            "high" => Ok(Some(Self::High)),
+            other => Err(format!(
+                "OPENROUTER_REASONING must be none, minimal, low, medium, high, or default, not '{other}'"
+            )),
+        }
+    }
+
+    fn request_value(self) -> serde_json::Value {
+        match self {
+            Self::Disabled => serde_json::json!({"enabled": false}),
+            Self::Minimal => serde_json::json!({"effort": "minimal"}),
+            Self::Low => serde_json::json!({"effort": "low"}),
+            Self::Medium => serde_json::json!({"effort": "medium"}),
+            Self::High => serde_json::json!({"effort": "high"}),
+        }
+    }
 }
 
 impl OpenRouterConfig {
@@ -64,6 +121,16 @@ impl OpenRouterConfig {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| (128..=MAX_MAX_TOKENS).contains(value))
             .unwrap_or(DEFAULT_MAX_TOKENS);
+        let reasoning = match env::var("OPENROUTER_REASONING") {
+            Ok(value) if !value.trim().is_empty() => ReasoningEffort::parse(&value)?,
+            _ => Some(ReasoningEffort::Low),
+        };
+        // OpenRouter's default favours price; for interactive use, measured
+        // throughput routing finished turns about twice as fast.
+        let provider_sort = match env::var("OPENROUTER_PROVIDER_SORT") {
+            Ok(value) if !value.trim().is_empty() => parse_provider_sort(&value)?,
+            _ => Some("throughput".to_owned()),
+        };
         Ok(Self {
             api_key,
             model,
@@ -72,6 +139,8 @@ impl OpenRouterConfig {
             timeout,
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_tokens,
+            reasoning,
+            provider_sort,
         })
     }
 
@@ -84,6 +153,8 @@ impl OpenRouterConfig {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_tokens: DEFAULT_MAX_TOKENS,
+            reasoning: Some(ReasoningEffort::Low),
+            provider_sort: None,
         }
     }
 }
@@ -133,9 +204,10 @@ fn is_transient_status(status: u16) -> bool {
     matches!(status, 408 | 429) || (500..=599).contains(&status)
 }
 
-impl Model for OpenRouterModel {
-    fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
-        let body = self.build_request_body(request);
+impl OpenRouterModel {
+    /// POST `body`, retrying transient failures, and return the first
+    /// successful response. Error bodies are read, redacted, and returned.
+    fn send(&self, body: &serde_json::Value) -> Result<reqwest::blocking::Response, ModelError> {
         let mut last_error: Option<ModelError> = None;
         for attempt in 0..=MAX_RETRIES {
             let mut http_request = self
@@ -153,7 +225,7 @@ impl Model for OpenRouterModel {
             if let Some(title) = &self.inner.config.site_title {
                 http_request = http_request.header("X-OpenRouter-Title", title.as_str());
             }
-            let response = match http_request.json(&body).send() {
+            let response = match http_request.json(body).send() {
                 Ok(response) => response,
                 Err(error) => {
                     let err = ModelError::new(sanitize_error(&format!(
@@ -168,17 +240,12 @@ impl Model for OpenRouterModel {
                 }
             };
             let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
             let bytes = read_response_body(response, self.inner.config.max_response_bytes)
                 .map_err(ModelError::new)?;
-            if bytes.len() > self.inner.config.max_response_bytes {
-                return Err(ModelError::new("provider response is too large".to_owned()));
-            }
-            let text = String::from_utf8(bytes)
-                .map_err(|_| ModelError::new("provider response was not UTF-8".to_owned()))?;
-            let text = redact_secret(&text, &self.inner.config.api_key);
-            if status.is_success() {
-                return parse_chat_response(&text).map_err(ModelError::new);
-            }
+            let text = redact_secret(&String::from_utf8_lossy(&bytes), &self.inner.config.api_key);
             let error = ModelError::new(sanitize_provider_error(status.as_u16(), &text));
             if is_transient_status(status.as_u16()) && attempt < MAX_RETRIES {
                 last_error = Some(error);
@@ -189,6 +256,186 @@ impl Model for OpenRouterModel {
         }
         Err(last_error.unwrap_or_else(|| ModelError::new("provider request failed".to_owned())))
     }
+}
+
+impl Model for OpenRouterModel {
+    fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        let body = self.build_request_body(request);
+        let response = self.send(&body)?;
+        let bytes = read_response_body(response, self.inner.config.max_response_bytes)
+            .map_err(ModelError::new)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ModelError::new("provider response was not UTF-8".to_owned()))?;
+        let text = redact_secret(&text, &self.inner.config.api_key);
+        parse_chat_response(&text).map_err(ModelError::new)
+    }
+
+    fn respond_stream(
+        &mut self,
+        request: &ModelRequest,
+        emit: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelResponse, ModelError> {
+        let mut body = self.build_request_body(request);
+        body["stream"] = serde_json::json!(true);
+        let response = self.send(&body)?;
+        let api_key = self.inner.config.api_key.clone();
+        parse_sse_stream(
+            std::io::BufReader::new(response),
+            MAX_STREAM_BYTES,
+            &mut |event| match event {
+                ModelStreamEvent::TextDelta { content } => emit(ModelStreamEvent::TextDelta {
+                    content: redact_secret(&content, &api_key),
+                }),
+            },
+        )
+        .map_err(ModelError::new)
+    }
+}
+
+/// Upper bound on one streamed response, including SSE framing.
+const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+/// Read an OpenAI-style server-sent event stream, emitting text deltas as
+/// they arrive and assembling tool calls from their fragments.
+fn parse_sse_stream(
+    mut reader: impl BufRead,
+    max_bytes: usize,
+    emit: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<ModelResponse, String> {
+    let mut text = String::new();
+    let mut calls: std::collections::BTreeMap<u64, PartialToolCall> = Default::default();
+    let mut total = 0usize;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_STREAM_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| sanitize_error(&format!("failed to read provider stream: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        if line.len() > MAX_STREAM_LINE_BYTES {
+            return Err("provider stream line is too large".to_owned());
+        }
+        total += read;
+        if total > max_bytes {
+            return Err("provider response is too large".to_owned());
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| "provider stream was not UTF-8".to_owned())?
+            .trim();
+        // Blank lines end events; lines starting with ':' are keep-alive comments.
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(data)
+            .map_err(|error| sanitize_error(&format!("invalid provider stream chunk: {error}")))?;
+        if let Some(error) = chunk.get("error") {
+            let message = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("provider stream error");
+            return Err(sanitize_provider_error(400, message));
+        }
+        let Some(delta) = chunk.pointer("/choices/0/delta") else {
+            continue;
+        };
+        if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+        {
+            text.push_str(content);
+            emit(ModelStreamEvent::TextDelta {
+                content: content.to_owned(),
+            });
+        }
+        for fragment in delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let index = fragment
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let call = calls.entry(index).or_default();
+            if let Some(id) = fragment.get("id").and_then(serde_json::Value::as_str)
+                && !id.is_empty()
+            {
+                call.id = Some(id.to_owned());
+            }
+            if let Some(name) = fragment
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+            {
+                call.name.push_str(name);
+            }
+            if let Some(arguments) = fragment
+                .pointer("/function/arguments")
+                .and_then(serde_json::Value::as_str)
+            {
+                if call.arguments.len() + arguments.len() > MAX_TOOL_ARGS_BYTES {
+                    return Err("provider tool arguments are too large".to_owned());
+                }
+                call.arguments.push_str(arguments);
+            }
+        }
+    }
+    if !calls.is_empty() {
+        if calls.len() > 1 {
+            return Err(
+                "provider returned multiple tool calls; one call per turn is required".to_owned(),
+            );
+        }
+        let call = calls.into_values().next().expect("one call is present");
+        return tool_call_response(call.id, Some(call.name), Some(call.arguments));
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("provider returned an empty response".to_owned());
+    }
+    Ok(ModelResponse::Text(trimmed.to_owned()))
+}
+
+/// Validate one tool call's parts into a response.
+fn tool_call_response(
+    id: Option<String>,
+    name: Option<String>,
+    raw_args: Option<String>,
+) -> Result<ModelResponse, String> {
+    let id = id.unwrap_or_else(|| "call-1".to_owned());
+    let name = name.ok_or_else(|| "provider tool call has no name".to_owned())?;
+    if name.trim().is_empty() {
+        return Err("provider tool call has no name".to_owned());
+    }
+    let raw_args = raw_args.unwrap_or_else(|| "{}".to_owned());
+    if raw_args.len() > MAX_TOOL_ARGS_BYTES {
+        return Err("provider tool arguments are too large".to_owned());
+    }
+    let value: serde_json::Value = if raw_args.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&raw_args)
+            .map_err(|error| format!("invalid tool arguments: {error}"))?
+    };
+    if !value.is_object() {
+        return Err("tool arguments must be a JSON object".to_owned());
+    }
+    let arguments = serde_json::from_value(value)
+        .map_err(|error| format!("invalid tool arguments: {error}"))?;
+    Ok(ModelResponse::ToolCall(ToolCall::new(id, name, arguments)))
 }
 
 fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serde_json::Value {
@@ -246,6 +493,12 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
         "messages": messages,
         "max_tokens": config.max_tokens
     });
+    if let Some(reasoning) = config.reasoning {
+        body["reasoning"] = reasoning.request_value();
+    }
+    if let Some(sort) = &config.provider_sort {
+        body["provider"] = serde_json::json!({"sort": sort});
+    }
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
         body["tool_choice"] = serde_json::json!("auto");
@@ -372,32 +625,10 @@ fn parse_chat_response(text: &str) -> Result<ModelResponse, String> {
         let Some(entry) = calls.into_iter().next() else {
             return Err("provider returned an empty tool call list".to_owned());
         };
-        let id = entry.id.unwrap_or_else(|| "call-1".to_owned());
         let function = entry
             .function
             .ok_or_else(|| "provider tool call has no function".to_owned())?;
-        let name = function
-            .name
-            .ok_or_else(|| "provider tool call has no name".to_owned())?;
-        if name.trim().is_empty() {
-            return Err("provider tool call has no name".to_owned());
-        }
-        let raw_args = function.arguments.unwrap_or_else(|| "{}".to_owned());
-        if raw_args.len() > MAX_TOOL_ARGS_BYTES {
-            return Err("provider tool arguments are too large".to_owned());
-        }
-        let value: serde_json::Value = if raw_args.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&raw_args)
-                .map_err(|error| format!("invalid tool arguments: {error}"))?
-        };
-        if !value.is_object() {
-            return Err("tool arguments must be a JSON object".to_owned());
-        }
-        let arguments = serde_json::from_value(value)
-            .map_err(|error| format!("invalid tool arguments: {error}"))?;
-        return Ok(ModelResponse::ToolCall(ToolCall::new(id, name, arguments)));
+        return tool_call_response(entry.id, function.name, function.arguments);
     }
     let content = match message.content {
         Some(serde_json::Value::String(text)) => text,
@@ -702,6 +933,131 @@ mod tests {
         assert!(!is_transient_status(422));
     }
 
+    fn stream(chunks: &[&str]) -> (Result<ModelResponse, String>, Vec<String>) {
+        let body = chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect::<String>();
+        let mut deltas = Vec::new();
+        let result = parse_sse_stream(
+            std::io::Cursor::new(format!(": OPENROUTER PROCESSING\n\n{body}data: [DONE]\n\n")),
+            MAX_STREAM_BYTES,
+            &mut |event| match event {
+                ModelStreamEvent::TextDelta { content } => deltas.push(content),
+            },
+        );
+        (result, deltas)
+    }
+
+    #[test]
+    fn stream_emits_text_deltas_as_they_arrive() {
+        let (result, deltas) = stream(&[
+            r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hello"}}]}"#,
+            r#"{"choices":[{"delta":{"content":", world"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        assert_eq!(deltas, ["Hello", ", world"]);
+        assert_eq!(
+            result.unwrap(),
+            ModelResponse::Text("Hello, world".to_owned())
+        );
+    }
+
+    #[test]
+    fn stream_assembles_tool_call_fragments() {
+        let (result, deltas) = stream(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.txt\"}"}}]}}]}"#,
+        ]);
+        assert!(deltas.is_empty());
+        let ModelResponse::ToolCall(call) = result.unwrap() else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(call.id, "call_7");
+        assert_eq!(call.name, "read_file");
+        assert_eq!(
+            call.arguments.get("path"),
+            Some(&crate::agent::ToolValue::Text("a.txt".to_owned()))
+        );
+    }
+
+    #[test]
+    fn stream_fails_closed_on_errors_and_limits() {
+        let (result, _) = stream(&[r#"{"error":{"message":"rate limited"}}"#]);
+        assert!(result.unwrap_err().contains("rate limited"));
+        let (result, _) = stream(&[r#"{"choices":[{"delta":{}}]}"#]);
+        assert_eq!(result.unwrap_err(), "provider returned an empty response");
+        let (result, _) = stream(&["not json"]);
+        assert!(
+            result
+                .unwrap_err()
+                .contains("invalid provider stream chunk")
+        );
+        let (result, _) = stream(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"a"}},{"index":1,"function":{"name":"b"}}]}}]}"#,
+        ]);
+        assert!(result.unwrap_err().contains("multiple tool calls"));
+        let big = format!(
+            r#"{{"choices":[{{"delta":{{"content":"{}"}}}}]}}"#,
+            "a".repeat(64)
+        );
+        let result = parse_sse_stream(
+            std::io::Cursor::new(format!("data: {big}\n\n")),
+            32,
+            &mut |_| {},
+        );
+        assert_eq!(result.unwrap_err(), "provider response is too large");
+    }
+
+    #[test]
+    fn reasoning_setting_parses_and_reaches_the_body() {
+        assert_eq!(ReasoningEffort::parse("default").unwrap(), None);
+        assert_eq!(
+            ReasoningEffort::parse(" None ").unwrap(),
+            Some(ReasoningEffort::Disabled)
+        );
+        assert!(ReasoningEffort::parse("max").is_err());
+        let mut config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "m");
+        let request = ModelRequest {
+            system_prompt: String::new(),
+            prompt: "hi".to_owned(),
+            tool_results: Vec::new(),
+            tools: Vec::new(),
+            conversation: Vec::new(),
+            current_turn: Vec::new(),
+            route: Default::default(),
+        };
+        assert_eq!(
+            build_request_body(&config, &request)["reasoning"],
+            serde_json::json!({"effort": "low"})
+        );
+        config.reasoning = Some(ReasoningEffort::Disabled);
+        assert_eq!(
+            build_request_body(&config, &request)["reasoning"],
+            serde_json::json!({"enabled": false})
+        );
+        config.reasoning = None;
+        assert!(
+            build_request_body(&config, &request)
+                .get("reasoning")
+                .is_none()
+        );
+        assert!(
+            build_request_body(&config, &request)
+                .get("provider")
+                .is_none()
+        );
+        config.provider_sort = parse_provider_sort("Throughput").unwrap();
+        assert_eq!(
+            build_request_body(&config, &request)["provider"],
+            serde_json::json!({"sort": "throughput"})
+        );
+        assert_eq!(parse_provider_sort("default").unwrap(), None);
+        assert!(parse_provider_sort("fastest").is_err());
+    }
+
     #[test]
     fn timeout_is_bounded() {
         let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "openai/gpt-4o-mini");
@@ -718,6 +1074,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_tokens: DEFAULT_MAX_TOKENS,
+            reasoning: None,
+            provider_sort: None,
         };
         assert!(OpenRouterModel::from_config(config).is_err());
     }
