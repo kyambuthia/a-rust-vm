@@ -209,7 +209,9 @@ fn bounded_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<Vec<u8>>>, String> 
         let file = archive
             .by_index(index)
             .map_err(|error| format!("invalid ZIP entry: {error}"))?;
-        let name = file.name();
+        let name = file
+            .name()
+            .map_err(|error| format!("invalid ZIP entry name: {error}"))?;
         if name.starts_with('/') || name.contains('\\') || name.split('/').any(|part| part == "..")
         {
             return Err("archive contains an unsafe entry path".to_owned());
