@@ -158,7 +158,7 @@ and context work can be measured.
   (`61601b1`); configured MCP servers in `agent`/`ask`, with workspace servers
   gated by `arvm mcp trust` (`30b55d4`).
 
-### S1: Close the leaks (next; small slices)
+### S1: Close the leaks (done)
 
 1. ~~Private state: create the state and config directories `0700` and every
    session, rule, trust, and snapshot file `0600`, writing atomically~~.
@@ -183,7 +183,8 @@ and context work can be measured.
    in the provider's `tool` role, so no extra delimiters; the system prompt
    now names the injection rule, and `/status` lists instructions, skills,
    config files, MCP servers, and rule count.
-6. `cargo audit` (or `cargo deny`) in CI.
+6. ~~`cargo audit` (or `cargo deny`) in CI~~. The first audit found ten
+   advisories (rustls, quinn-proto, zip), fixed by updating them.
 
 Exit: a scripted model that runs `env`, `cat ~/.local/state/a-rust-vm/...`
 as another user, and `sleep 100 &` learns no secret, reads no file, and leaves
