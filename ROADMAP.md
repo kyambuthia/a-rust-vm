@@ -190,11 +190,13 @@ Exit: a scripted model that runs `env`, `cat ~/.local/state/a-rust-vm/...`
 as another user, and `sleep 100 &` learns no secret, reads no file, and leaves
 no process behind.
 
-### U1: Native fast model path
+### U1: Native fast model path (in progress)
 
-1. Run the OpenRouter adapter in process for `arvm agent|ask` whenever a key
+1. ~~Run the OpenRouter adapter in process for `arvm agent|ask` whenever a key
    is configured, with one reused HTTP client; keep the process bridge only as
-   an explicit `A_RVM_MODEL_PROGRAM` option.
+   an explicit `A_RVM_MODEL_PROGRAM` option~~. Measured: 8.0 s native vs
+   43.9 s through the bridge for the same two-step task. The adapter's 4 KB
+   prompt and message caps and 4k-token output cap were raised too.
 2. SSE streaming for text and tool-call deltas.
 3. Usage events: input, output, and cached tokens, cost, and latency per step;
    `/usage` in the REPL and a summary line after `ask`.

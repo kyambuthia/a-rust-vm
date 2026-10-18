@@ -13,8 +13,16 @@ const DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RETRIES: u32 = 2;
 const MAX_TOOL_ARGS_BYTES: usize = 32 * 1024;
-const DEFAULT_MAX_TOKENS: u32 = 2048;
-const MAX_MAX_TOKENS: u32 = 4096;
+/// Enough output for a model to write a medium-sized file in one call.
+const DEFAULT_MAX_TOKENS: u32 = 8192;
+const MAX_MAX_TOKENS: u32 = 32_768;
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 600;
+/// Safety caps on what one request carries. The agent bounds its context;
+/// these only stop a runaway value, so they sit well above normal use.
+const MAX_SYSTEM_CHARS: usize = 64 * 1024;
+const MAX_MESSAGE_CHARS: usize = 32 * 1024;
+const MAX_TOOL_DESCRIPTION_CHARS: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OpenRouterConfig {
@@ -48,9 +56,9 @@ impl OpenRouterConfig {
         let timeout = env::var("OPENROUTER_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| (1..=120).contains(value))
+            .filter(|value| (1..=MAX_TIMEOUT_SECS).contains(value))
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30));
+            .unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         let max_tokens = env::var("OPENROUTER_MAX_TOKENS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -73,7 +81,7 @@ impl OpenRouterConfig {
             model: model.into(),
             site_url: Some("https://asiliano.online".to_owned()),
             site_title: Some("A/RVM".to_owned()),
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_tokens: DEFAULT_MAX_TOKENS,
         }
@@ -185,7 +193,7 @@ impl Model for OpenRouterModel {
 
 fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serde_json::Value {
     let mut messages = Vec::new();
-    let system = bounded_text(&request.system_prompt, 4096);
+    let system = bounded_text(&request.system_prompt, MAX_SYSTEM_CHARS);
     if !system.trim().is_empty() {
         messages.push(serde_json::json!({"role":"system","content":system}));
     }
@@ -195,7 +203,7 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
     if request.current_turn.is_empty() {
         messages.push(serde_json::json!({
             "role":"user",
-            "content": bounded_text(&request.prompt, 8192)
+            "content": bounded_text(&request.prompt, MAX_MESSAGE_CHARS)
         }));
     }
     if request.current_turn.is_empty() && !request.tool_results.is_empty() {
@@ -208,7 +216,7 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
                     "id={} name={} status={status}\n{}",
                     result.id,
                     result.name,
-                    bounded_text(&result.content, 4096)
+                    bounded_text(&result.content, MAX_MESSAGE_CHARS)
                 )
             })
             .collect::<Vec<_>>()
@@ -227,7 +235,7 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
                 "type": "function",
                 "function": {
                     "name": tool.name,
-                    "description": bounded_text(&tool.description, 1024),
+                    "description": bounded_text(&tool.description, MAX_TOOL_DESCRIPTION_CHARS),
                     "parameters": parameters
                 }
             })
@@ -253,7 +261,7 @@ fn conversation_message(entry: &ConversationMessage) -> serde_json::Value {
         let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
         return serde_json::json!({
             "role": "assistant",
-            "content": bounded_text(&entry.content, 4096),
+            "content": bounded_text(&entry.content, MAX_MESSAGE_CHARS),
             "tool_calls": [{
                 "id": call.id,
                 "type": "function",
@@ -268,12 +276,12 @@ fn conversation_message(entry: &ConversationMessage) -> serde_json::Value {
         return serde_json::json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "content": bounded_text(&entry.content, 4096)
+            "content": bounded_text(&entry.content, MAX_MESSAGE_CHARS)
         });
     }
     serde_json::json!({
         "role": normalize_role(&entry.role),
-        "content": bounded_text(&entry.content, 4096)
+        "content": bounded_text(&entry.content, MAX_MESSAGE_CHARS)
     })
 }
 
@@ -697,7 +705,7 @@ mod tests {
     #[test]
     fn timeout_is_bounded() {
         let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "openai/gpt-4o-mini");
-        assert!(config.timeout.as_secs() >= 1 && config.timeout.as_secs() <= 120);
+        assert!(config.timeout.as_secs() >= 1 && config.timeout.as_secs() <= MAX_TIMEOUT_SECS);
     }
 
     #[test]

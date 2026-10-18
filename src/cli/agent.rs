@@ -18,35 +18,75 @@ use super::paths::{session_directory, working_directory};
 use super::permission::merged_permission_policy;
 use super::skill::{extract_skill_names, load_requested_skills};
 
-pub(crate) fn run_live_agent(user_arguments: &[String]) {
-    let using_builtin_bridge = env::var_os("A_RVM_MODEL_PROGRAM").is_none();
-    let program = env::var_os("A_RVM_MODEL_PROGRAM").unwrap_or_else(|| {
-        env::current_exe()
+/// Which model implementation a run uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelBackend {
+    /// `A_RVM_MODEL_PROGRAM`: an external process speaking the JSON protocol.
+    Program,
+    /// `OPENROUTER_API_KEY`: the provider API, called in process.
+    OpenRouter,
+    /// Neither: the `opencode` bridge, slower and kept as a fallback.
+    OpencodeBridge,
+}
+
+fn select_model_backend(has_program: bool, has_openrouter_key: bool) -> ModelBackend {
+    if has_program {
+        ModelBackend::Program
+    } else if has_openrouter_key {
+        ModelBackend::OpenRouter
+    } else {
+        ModelBackend::OpencodeBridge
+    }
+}
+
+/// Build the model for this run and the name it is routed under.
+fn build_model(
+    backend: ModelBackend,
+    working_directory: &std::path::Path,
+) -> (String, Box<dyn a_rust_vm::agent::Model>) {
+    if backend == ModelBackend::OpenRouter {
+        let model = a_rust_vm::openrouter::OpenRouterModel::from_env().unwrap_or_else(|error| {
+            eprintln!("[model] {error}");
+            std::process::exit(2);
+        });
+        return (model.model_name().to_owned(), Box::new(model));
+    }
+    let program = match backend {
+        ModelBackend::Program => env::var_os("A_RVM_MODEL_PROGRAM").unwrap_or_default(),
+        _ => env::current_exe()
             .unwrap_or_else(|error| {
                 eprintln!("failed to resolve the built-in model bridge: {error}");
                 std::process::exit(2);
             })
-            .into()
-    });
-    let arguments = if using_builtin_bridge {
-        vec!["model-bridge".to_owned()]
-    } else {
-        env::var("A_RVM_MODEL_ARGS")
+            .into(),
+    };
+    let arguments = match backend {
+        ModelBackend::Program => env::var("A_RVM_MODEL_ARGS")
             .map(|value| {
                 value
                     .split_whitespace()
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        _ => vec!["model-bridge".to_owned()],
     };
+    let model = ProcessModel::new(program)
+        .with_arguments(arguments)
+        .with_working_directory(working_directory);
+    let name = env::var("A_RVM_MODEL_NAME").unwrap_or_else(|_| "configured".to_owned());
+    (name, Box::new(model))
+}
+
+pub(crate) fn run_live_agent(user_arguments: &[String]) {
+    let backend = select_model_backend(
+        env::var_os("A_RVM_MODEL_PROGRAM").is_some_and(|value| !value.is_empty()),
+        env::var("OPENROUTER_API_KEY").is_ok_and(|value| !value.trim().is_empty()),
+    );
     let working_directory = working_directory();
     let config = load_config_or_exit();
     let additional_directories = extract_workspace_directories(user_arguments);
-    let model = ProcessModel::new(program)
-        .with_arguments(arguments)
-        .with_working_directory(&working_directory);
-    let model_name = env::var("A_RVM_MODEL_NAME").unwrap_or_else(|_| "configured".to_owned());
+    let (model_name, model) = build_model(backend, &working_directory);
     let mut router = ModelRouter::new();
     router
         .register_model(&model_name, ModelCapabilities::STREAMING_TOOLS, model)
@@ -146,8 +186,12 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
 
     println!("A/RVM agent. Type /exit to quit.");
     println!("Routes: /model <name>, /fast, /strong, /default, /status");
-    if using_builtin_bridge {
-        println!("Model bridge: local runner");
+    match backend {
+        ModelBackend::OpenRouter => println!("Model: {model_name} (OpenRouter)"),
+        ModelBackend::Program => println!("Model: {model_name} (external program)"),
+        ModelBackend::OpencodeBridge => {
+            println!("Model bridge: opencode (set OPENROUTER_API_KEY for the faster native path)")
+        }
     }
     loop {
         print!("\n> ");
@@ -491,6 +535,16 @@ mod tests {
                 "x".to_owned()
             ]),
             Some(("do x".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn model_backend_prefers_program_then_native_then_bridge() {
+        assert_eq!(select_model_backend(true, true), ModelBackend::Program);
+        assert_eq!(select_model_backend(false, true), ModelBackend::OpenRouter);
+        assert_eq!(
+            select_model_backend(false, false),
+            ModelBackend::OpencodeBridge
         );
     }
 

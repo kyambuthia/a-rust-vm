@@ -137,24 +137,27 @@ durability and managed session storage are future deployment work.
 
 ## Run the interactive terminal agent
 
-With the local model runner installed and authenticated, the interactive agent
-starts without extra bridge configuration:
+`arvm agent` and `arvm ask` pick a model in this order:
 
-```bash
-cargo run -- agent
-```
+1. `A_RVM_MODEL_PROGRAM`: an external process (see below).
+2. `OPENROUTER_API_KEY`: the OpenRouter API, called directly from `arvm`.
+   This is the fast path. `OPENROUTER_MODEL` picks the model.
+3. Otherwise the `opencode` bridge, which starts `opencode run` for every
+   model step (`openrouter/deepseek/deepseek-v4-flash`). It needs no key in
+   `arvm`, but it is much slower: the same two-step task took 44 s through
+   the bridge and 8 s natively.
 
-The built-in bridge uses `openrouter/deepseek/deepseek-v4-flash` as its fixed
-model. It only forwards requests and structured responses; credentials remain
-in the runner's protected configuration.
-
-For a local OpenRouter-backed run, provide the key through the environment;
-never place it in browser code, Git, command arguments, or committed files:
+Provide the key through the environment; never place it in browser code,
+Git, command arguments, or committed files:
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-v1-...
+export OPENROUTER_MODEL=deepseek/deepseek-v4-flash   # optional
 cargo run -- agent
 ```
+
+Optional limits: `OPENROUTER_MAX_TOKENS` (128-32768, default 8192) and
+`OPENROUTER_TIMEOUT_SECS` (1-600, default 120).
 
 The hosted browser service must load its OpenRouter key from an AWS-managed
 secret or server process environment and must call the provider from the
