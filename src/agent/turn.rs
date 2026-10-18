@@ -452,34 +452,77 @@ where
     }
 
     fn bounded_context(&self) -> Vec<ConversationMessage> {
-        if self.max_context_messages == 0 || self.max_context_chars == 0 {
-            return Vec::new();
-        }
-
-        let mut selected = Vec::new();
-        let mut chars = 0;
-        for message in self
-            .conversation
-            .iter()
-            .rev()
-            .take(self.max_context_messages)
-        {
-            let message_chars = message.role.len() + message.content.len();
-            if chars + message_chars > self.max_context_chars {
-                break;
-            }
-            chars += message_chars;
-            selected.push(message.clone());
-        }
-        selected.reverse();
-        selected
+        newest_within(
+            &self.conversation,
+            self.max_context_messages,
+            self.max_context_chars,
+        )
     }
 
+    /// Keep the conversation within its budget. When it overflows, trim to
+    /// half the budget rather than just under it: the retained history then
+    /// starts with the same message for several turns, so providers can
+    /// reuse their prompt cache instead of reprocessing a shifted prefix.
     fn commit_turn(&mut self, messages: Vec<ConversationMessage>) {
         self.conversation.extend(messages);
-        let bounded = self.bounded_context();
-        self.conversation = bounded;
+        let fits = self.conversation.len() <= self.max_context_messages
+            && self.conversation.iter().map(message_chars).sum::<usize>() <= self.max_context_chars;
+        if fits {
+            return;
+        }
+        let trimmed = newest_within(
+            &self.conversation,
+            (self.max_context_messages / 2).max(1),
+            self.max_context_chars / 2,
+        );
+        self.conversation = if trimmed.is_empty() {
+            self.bounded_context()
+        } else {
+            trimmed
+        };
     }
+}
+
+/// Size of a message as sent: its text plus any tool-call arguments, which
+/// can carry whole files.
+fn message_chars(message: &ConversationMessage) -> usize {
+    message.role.len()
+        + message.content.len()
+        + message
+            .tool_call
+            .as_ref()
+            .map(|call| canonical_arguments(&call.arguments).len() + call.name.len())
+            .unwrap_or(0)
+}
+
+/// The newest messages that fit both limits, starting at a user message so
+/// the history never opens with a tool result whose call was trimmed away.
+pub(super) fn newest_within(
+    conversation: &[ConversationMessage],
+    max_messages: usize,
+    max_chars: usize,
+) -> Vec<ConversationMessage> {
+    if max_messages == 0 || max_chars == 0 {
+        return Vec::new();
+    }
+    let mut start = conversation.len();
+    let mut chars = 0;
+    for (index, message) in conversation.iter().enumerate().rev() {
+        let size = message_chars(message);
+        if conversation.len() - index > max_messages || chars + size > max_chars {
+            break;
+        }
+        chars += size;
+        start = index;
+    }
+    while start < conversation.len() {
+        let message = &conversation[start];
+        if message.role == "user" && message.tool_call_id.is_none() {
+            break;
+        }
+        start += 1;
+    }
+    conversation[start..].to_vec()
 }
 
 fn rule_target(call: &ToolCall) -> (TargetKind, String) {

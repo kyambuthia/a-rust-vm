@@ -205,8 +205,12 @@ no process behind.
 3. ~~Usage events: input, output, and cached tokens, cost, and latency per step;
    `/usage` in the REPL and a summary line after `ask`~~. Events also carry
    the provider and first-token time.
-4. Cache-friendly prompts: a fixed order (system prompt, tools, history,
-   new turn) and provider cache markers where supported.
+4. ~~Cache-friendly prompts: a fixed order (system prompt, tools, history,
+   new turn) and provider cache markers where supported~~. History now trims
+   to half its budget when full, so the prompt start stays stable for several
+   turns; Anthropic models get `cache_control` markers. Measured with Haiku
+   4.5 and an 8k-token prompt: step 2 read 8,065 tokens from cache, cost
+   9x less, and answered in 0.9 s instead of 4.3 s.
 5. Model settings in `config.json`: default and fast model, OpenAI-compatible
    base URL (so local servers work), and request timeout.
 

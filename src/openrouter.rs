@@ -530,6 +530,9 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
         "messages": messages,
         "max_tokens": config.max_tokens
     });
+    if uses_explicit_cache_markers(&config.model) {
+        mark_cache_breakpoints(&mut body);
+    }
     if let Some(reasoning) = config.reasoning {
         body["reasoning"] = reasoning.request_value();
     }
@@ -544,6 +547,35 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
         body["parallel_tool_calls"] = serde_json::json!(false);
     }
     body
+}
+
+/// Anthropic models cache only up to explicit `cache_control` markers; most
+/// other providers cache automatically.
+fn uses_explicit_cache_markers(model: &str) -> bool {
+    model.starts_with("anthropic/") || model.starts_with("~anthropic/")
+}
+
+/// Mark the system prompt and the newest message as cache breakpoints, so
+/// the next step of the turn reuses everything before its new messages.
+fn mark_cache_breakpoints(body: &mut serde_json::Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    let last = messages.len().saturating_sub(1);
+    for index in [0, last] {
+        let Some(message) = messages.get_mut(index) else {
+            continue;
+        };
+        if let Some(text) = message["content"].as_str().map(str::to_owned)
+            && !text.is_empty()
+        {
+            message["content"] = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"}
+            }]);
+        }
+    }
 }
 
 fn conversation_message(entry: &ConversationMessage) -> serde_json::Value {
@@ -1119,6 +1151,36 @@ mod tests {
         );
         assert_eq!(parse_provider_sort("default").unwrap(), None);
         assert!(parse_provider_sort("fastest").is_err());
+    }
+
+    #[test]
+    fn anthropic_requests_mark_cache_breakpoints() {
+        let request = ModelRequest {
+            system_prompt: "system rules".to_owned(),
+            prompt: "hello".to_owned(),
+            tool_results: Vec::new(),
+            tools: Vec::new(),
+            conversation: vec![ConversationMessage::new("user", "earlier")],
+            current_turn: Vec::new(),
+            route: Default::default(),
+        };
+        let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "anthropic/claude-x");
+        let body = build_request_body(&config, &request);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"][0]["text"], "system rules");
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(messages[1]["content"], "earlier");
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "deepseek/x");
+        let body = build_request_body(&config, &request);
+        assert_eq!(body["messages"][0]["content"], "system rules");
     }
 
     #[test]

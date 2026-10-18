@@ -620,3 +620,46 @@ fn usage_accumulates_and_summarises() {
     );
     assert_eq!(Usage::default().summary(), "0 in · 0 out · 0.0 s");
 }
+
+#[test]
+fn trimmed_history_keeps_a_stable_start_and_never_opens_with_a_tool_result() {
+    let replies = (0..12).map(|turn| ModelResponse::Text(format!("answer {turn}")));
+    let mut agent = Agent::new(ScriptedModel::new(replies), vm_tool_registry().unwrap())
+        .with_context_limits(8, 100_000);
+    let mut starts = Vec::new();
+    for turn in 0..12 {
+        agent.run(format!("question {turn}")).unwrap();
+        let conversation = agent.conversation();
+        assert!(conversation.len() <= 8);
+        assert_eq!(conversation[0].role, "user");
+        starts.push(conversation[0].content.clone());
+    }
+    // Each trim drops to half the budget, so the first message changes only
+    // every few turns instead of every turn once the budget is full.
+    let changes = starts.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    assert!(
+        changes <= 4,
+        "first message changed {changes} times: {starts:?}"
+    );
+
+    let call = ToolCall::new("c1", "read_file", ToolArguments::new());
+    let history = vec![
+        ConversationMessage::new("user", "q"),
+        ConversationMessage::assistant_tool_call(&call),
+        ConversationMessage::tool_result(&ToolResult {
+            id: "c1".to_owned(),
+            name: "read_file".to_owned(),
+            content: "x".repeat(10),
+            is_error: false,
+        }),
+        ConversationMessage::new("assistant", "done"),
+        ConversationMessage::new("user", "next"),
+        ConversationMessage::new("assistant", "ok"),
+    ];
+    let kept = crate::agent::turn::newest_within(&history, 4, 100_000);
+    assert_eq!(
+        kept[0].content, "next",
+        "a leading tool result must be dropped"
+    );
+    assert_eq!(kept.len(), 2);
+}
