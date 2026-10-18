@@ -22,15 +22,16 @@ Status was verified against the code, not earlier checklists.
 | VM core | Integer stack VM: arithmetic, comparisons, `DUP/POP/SWAP/OVER`, `NEG/NOT`, `JMP/JZ`; static CFG + stack-depth validation; step and stack-depth limits; transactional steps; assembler, disassembler, tracer; Wasm debugger ABI |
 | Guest runtime | Per-instance virtual filesystem with quotas, round-robin guest processes, syscalls, versioned snapshots, owner-scoped VM manager |
 | Agent loop | Provider-neutral model trait, deterministic router with fallback, one shared turn loop (streaming and batch), step/tool-call caps, turn deadline, cancellation, repeat and pattern-loop guards |
-| Model adapters | OpenRouter (server-side key, bounded retries, redaction), external process bridge |
+| Model adapters | OpenRouter (browser server only; no streaming, no usage accounting), external process bridge; the CLI default shells out to `opencode run` on every model step |
 | CLI | `run/check/disassemble/trace`, `agent` REPL, one-shot `ask` with `--json`, `--auto/--deny`, `--rule`, `--skill`, `--workspace-dir`, `--session`; `session`, `skill`, `permission`, `workspace`, `doctor`, `version` |
 | Workspace tools | list/read/search/write/run with containment, dangling-symlink refusal, dangerous-command refusal, bounded output, 30 s command timeout |
 | Permissions | allow/ask/deny rules (typed path and command matching), durable rule store, session approvals |
-| Sessions | Save/list/show/export transcripts, resume via `--session`, private local state |
+| Sessions | Save/list/show/export transcripts, resume via `--session`; state files are created with the default umask (world-readable), not private |
 | Browser host | Anonymous and ALB/Cognito-bound sessions, uploads, document/sheet/PDF/tabulation jobs, streamed agent events, approvals, durable snapshots, ECS/Fargate CDK stack |
 | Skills | `SKILL.md` discovery and prompt injection |
 | MCP | stdio client (handshake, paging, interleaved messages); configured servers register approval-gated `mcp_<server>_<tool>` tools in `agent`/`ask`; workspace servers need `arvm mcp trust` |
 | Subagents | One-off and persistent subagents with depth guard and shared cancellation **library only, not reachable from `arvm`** |
+| Config | User and workspace `config.json` (rules, MCP servers); workspace files cannot grant `allow` |
 | ACP, replay, language, LLVM | Not started |
 | CI | GitHub Actions runs the `AGENTS.md` checks on every push and pull request |
 
@@ -59,11 +60,29 @@ test):
 - Removed panicking Wasm exports and deduplicated the turn loop
   (`53d6fad`, `b352ee2`).
 
+### Measured baseline (19 October 2026)
+
+These numbers drive the order below. They were measured on the ukandi machine
+or read from the code.
+
+| Measure | Value | Why it matters |
+| --- | --- | --- |
+| `arvm` cold start (release) | 4 ms, 8.5 MB binary | The Rust side is already fast |
+| `opencode --version` start | 1.3 s | Paid on **every** CLI model step before any model work |
+| CLI model path | `arvm model-bridge` -> `opencode run` -> provider, request pasted into a prompt as JSON | Two extra processes, no streaming, a nested agent that can reply in the wrong shape |
+| OpenRouter adapter | Blocking, no SSE streaming, no token or cost accounting, no prompt caching, one tool call per step | Slow first token, no cost visibility, repeated full-price prompts |
+| Steps per turn | 8 (CLI and browser) | Too few to read, edit, test, and fix in one turn |
+| Context kept | 24 messages or 32 KB of text | Far below current model windows; the agent forgets files it just read |
+| Edit tool | None; `write_file` rewrites whole files up to 128 KB | Slow, expensive, and error-prone for small changes |
+| `run_command` environment | Inherits the full parent environment | A model can print `OPENROUTER_API_KEY`, AWS credentials, or tokens |
+| Command timeout | Kills `sh`, not its process group | Background children survive cancellation and timeouts |
+| State files | `0664`, directories `0775` | Transcripts, rules, and trust records are readable by other local users |
+| CLI error handling | 62 `process::exit` calls across `src/cli/` | Hard to test, and cleanup steps get skipped |
+
 ### Known debt and risks
 
-- **Large modules.** The agent and CLI splits are done, but `server.rs`
-  (~2k lines, ~1.6k without tests) still mixes HTTP parsing, routing, and
-  session handling.
+- **`server.rs` is ~2k lines** (~1.6k without tests) and mixes HTTP parsing,
+  routing, and session handling.
 - **MCP spawns a server per call.** Stateful servers lose state between calls,
   and every call pays a full handshake.
 - **Hand-written HTTP/1.0 server.** No keep-alive, `Transfer-Encoding` is
@@ -73,102 +92,210 @@ test):
 - **Browser approvals use `window.confirm`.** No exact-scope display,
   no keyboard-first flow, no audit trail.
 - **Command deny rules are best-effort.** `sh -c`, aliases, and interpreters
-  can disguise a command; the real boundary has to be a sandboxed runner.
+  can disguise a command; the real boundary has to be a sandbox.
+- **Prompt injection.** Tool output, project instructions, and MCP results
+  reach the model with the same standing as the user's words.
+
+## How the agent becomes quick, useful, and efficient
+
+A coding agent turn is a loop: build a prompt, wait for the model, run tools,
+repeat. Each goal maps to one part of that loop.
+
+- **Quick means wall-clock time per finished task.** The model call dominates
+  it, so the first lever is overhead around the call: no extra processes,
+  one reused HTTP connection, streamed tokens, and a cached prompt prefix so
+  the provider does not reprocess the same history every step. The second
+  lever is fewer steps: an edit tool instead of whole-file rewrites, and
+  independent reads run in parallel within one step. Rust-side overhead is
+  already small (4 ms start) and should stay that way.
+- **Useful means the share of real tasks finished without help.** That
+  depends on the tools (precise edits, line-numbered reads, bounded search,
+  long-running commands), on enough budget to read, edit, test, and fix in
+  one turn, and on context that keeps what the agent just learned. Fewer,
+  better approval prompts also matter: prompts that ask about harmless reads
+  train people to press `y` blindly.
+- **Efficient means tokens and money per finished task.** Everything that
+  enters the context costs tokens on every later step. Long tool output is
+  truncated in context and kept for retrieval on request; old turns are
+  compacted when the window fills; the stable prefix (system prompt, tool
+  list, history) is ordered for caching; cheap work such as summaries goes to
+  a cheaper model.
+- **Secure by construction.** Deny lists cannot win against `sh -c`. The
+  boundary is what a command can reach: a scrubbed environment, private
+  state, a killed process group, and then a real sandbox. Once commands run
+  in a sandbox, routine commands can run without prompts. Security then also
+  makes the agent faster to use.
+- **Measured, not guessed.** Each slice below states the number it should
+  move. A benchmark harness (Q1) runs fixed tasks against a scripted model in
+  CI and against a real model on demand, and records steps, tokens, cache
+  hits, wall time, and success. A change that makes the numbers worse needs a
+  reason in its commit body.
+
+### Budgets
+
+| Budget | Target |
+| --- | --- |
+| Overhead per model step, excluding provider time | <= 50 ms |
+| Time to first streamed token | provider latency + <= 100 ms |
+| Read-only tool (read, search on a 10k-file repository) | <= 50 ms typical, hard output cap |
+| Prompt cache hits on steps 2+ of a turn (caching providers) | >= 70% of input tokens |
+| `arvm` cold start | <= 20 ms |
+| Approval prompts for read-only work | 0 |
 
 ## Milestones
 
 Each milestone is a sequence of small slices; each slice is one focused,
-verified commit as described in `AGENTS.md`. Exit criteria are what a user can
-do, checked by tests or a scripted demo.
+verified commit as described in `AGENTS.md`. The order puts cheap, high-value
+fixes first, then the biggest speed lever, then the harness, so later tool
+and context work can be measured.
 
-### M0: Guard rails (done)
+### Done
 
-1. ~~GitHub Actions workflow running the `AGENTS.md` checks~~ (`40455c3`).
-2. ~~Commit turns that end without an answer, with a marker saying why, so
-   the next turn keeps its context~~.
-3. ~~Split `agent.rs` into `agent/{model,router,tools,loop,subagent}.rs` and
-   `main.rs` into `cli/` command modules, with no behaviour change~~
-   (`311a27b`, `fbad5b8`).
+- **M0 Guard rails:** CI on every push (`40455c3`), turns that end without an
+  answer keep their context, `agent.rs` and `main.rs` split into modules
+  (`311a27b`, `fbad5b8`).
+- **M1.1-M1.2 Configuration and MCP:** user and workspace `config.json`
+  (`61601b1`); configured MCP servers in `agent`/`ask`, with workspace servers
+  gated by `arvm mcp trust` (`30b55d4`).
 
-Exit: every push is checked automatically; the largest module is under
-1,500 lines.
+### S1: Close the leaks (next; small slices)
 
-### M1: Wire the extensibility that already exists (next)
+1. Private state: create the state and config directories `0700` and every
+   session, rule, trust, and snapshot file `0600`, writing atomically.
+2. Scrubbed environment for `run_command` and MCP servers: pass an allow list
+   (`PATH`, `HOME`, `USER`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `SHELL`) plus
+   names listed in config `env.passthrough`; never pass `*_API_KEY`,
+   `*_TOKEN`, `*_SECRET`, `AWS_*`, or `OPENROUTER_*`.
+3. Run each command in its own process group and kill the whole group on
+   timeout and cancellation (`std::os::unix::process::CommandExt::process_group`,
+   no new dependency).
+4. Redact secret-looking values (provider keys, AWS keys, bearer tokens) from
+   tool output before it reaches the model, the screen, or a transcript,
+   reusing the OpenRouter redaction code.
+5. Mark untrusted content: wrap tool and MCP output in delimiters the system
+   prompt tells the model to treat as data, and show which project
+   instruction files were loaded in `/status`.
+6. `cargo audit` (or `cargo deny`) in CI.
 
-1. ~~`arvm` configuration file (`.arvm/config.json` in the workspace, plus
-   user config) declaring MCP servers and default rules, with environment and
-   flag overrides~~. Workspace files may only add `ask`/`deny` rules.
-2. ~~Register MCP tools in `agent`/`ask` runs behind the existing approval
-   flow; `arvm mcp list|tools` for inspection~~. Workspace servers start only
-   after `arvm mcp trust`.
-3. Keep one MCP server process alive per session instead of per call, with
-   supervision and restart limits.
-4. Expose `run_subagent` as a tool in CLI runs with bounded child budgets
-   and a reduced tool set.
+Exit: a scripted model that runs `env`, `cat ~/.local/state/a-rust-vm/...`
+as another user, and `sleep 100 &` learns no secret, reads no file, and leaves
+no process behind.
 
-Exit: a user configures an MCP server and a subagent budget in one file and
-uses both from `arvm ask`.
+### U1: Native fast model path
 
-### M2: Terminal parity
+1. Run the OpenRouter adapter in process for `arvm agent|ask` whenever a key
+   is configured, with one reused HTTP client; keep the process bridge only as
+   an explicit `A_RVM_MODEL_PROGRAM` option.
+2. SSE streaming for text and tool-call deltas.
+3. Usage events: input, output, and cached tokens, cost, and latency per step;
+   `/usage` in the REPL and a summary line after `ask`.
+4. Cache-friendly prompts: a fixed order (system prompt, tools, history,
+   new turn) and provider cache markers where supported.
+5. Model settings in `config.json`: default and fast model, OpenAI-compatible
+   base URL (so local servers work), and request timeout.
 
-1. Line editing, prompt history persisted per workspace, multiline input,
-   Esc/Ctrl-C to interrupt the running turn.
-2. Slash-command menu with categories; `/status`, `/usage`, `/clear`.
-3. Background commands with logs and lifecycle (`start`, `status`, `stop`)
-   instead of only the 30 s foreground tool.
-4. Retained tool results: truncate in context, inspect in full on request.
+Exit: on the same task, steps cost provider latency plus <= 50 ms, the first
+token streams, and `/usage` shows tokens, cache hits, and cost.
 
-Exit: a full coding session (edit, test, iterate, interrupt, resume) runs in
+### Q1: Benchmark harness and recording contract
+
+1. Recording contract: every model request summary, response, tool call, and
+   tool result in a turn is written to the session with a schema version.
+   This is also the base for replay (M3).
+2. `tests/` integration suite that drives the real `arvm` binary with a
+   scripted model and scripted MCP server, like the manual checks used for
+   M1.1-M1.2.
+3. `scripts/bench`: ten fixed coding tasks in throwaway repositories (fix a
+   failing test, rename across files, add a CLI flag, ...) run against a real
+   model on demand, reporting success, steps, tokens, cache hits, and time.
+
+Exit: CI runs the scripted suite, and every U2/U3 commit body can quote
+before-and-after benchmark numbers.
+
+### U2: Tools that finish tasks
+
+1. `edit_file`: replace one exact, unique string (or a list of them) and
+   return a short diff; same approval and path rules as `write_file`.
+2. `read_file` with line ranges and line numbers; a `glob` tool; `search`
+   that skips `.gitignore`d and binary files and caps results.
+3. Parallel tool calls: accept several calls per step; run read-only tools
+   concurrently and guarded tools in order.
+4. Budgets instead of a step count: default about 50 steps per turn with a
+   token and wall-clock budget, set in config.
+5. Token-aware context: estimate tokens, use the model's window, and compact
+   older turns into a summary (fast model) when near the limit.
+6. Retained tool results: long output is truncated in context with an id;
+   `read_tool_result <id> [range]` fetches the rest.
+7. Read-only commands without prompts: a built-in allow set (`git status`,
+   `git diff`, `git log`, `ls`, `cat`, `rg`) that still passes the dangerous-
+   command and metacharacter checks.
+
+Exit: the benchmark's success rate rises and tokens per task fall against the
+Q1 baseline; read-only exploration triggers no approval prompts.
+
+### U3: Terminal that stays out of the way
+
+1. Ctrl-C cancels the running turn and keeps the session; a second Ctrl-C
+   exits.
+2. Line editing, multiline input, and history per workspace. The standard
+   library cannot do raw terminal input, so this is the one place a small,
+   audited dependency (or a minimal `termios` binding) is justified; record
+   the decision in an ADR.
+3. Approval prompt with `y` / `n` / `a` (always for this session) / `p`
+   (save as a rule), showing the exact command or the diff of an edit.
+4. Edits shown as coloured diffs; long tool output collapsed.
+5. Slash commands `/status`, `/usage`, `/clear`, `/compact`, `/model`.
+6. Background commands with logs and lifecycle (`start`, `status`, `stop`).
+
+Exit: a full session (edit, test, iterate, interrupt, resume) runs in
 `arvm agent` without restarting.
 
-### M3: Deterministic replay and recovery
+### S2: Sandboxed commands
 
-1. Recording contract: every model response and tool result in a turn is
-   written to the session with a schema version.
-2. `arvm session replay <id>` re-runs a turn against recorded model output,
-   re-executing VM tools and comparing results; host tools use recorded
-   results.
-3. Corrupt-session recovery and `--no-save`.
+1. Runner contract from `ARCHITECTURE.md` for `run_command`.
+2. Linux sandbox: `bwrap` when installed, otherwise Landlock, with the
+   workspace writable, the rest read-only, and no network unless config or an
+   approval allows it.
+3. In a sandbox, routine commands run without prompts; outside one, current
+   behaviour stays.
+4. Browser approval panel with exact scope, keyboard flow, and audit log.
 
-Exit: a recorded session replays to identical VM results on another machine.
+Exit: a scripted model cannot write outside the workspace or reach the
+network through `sh -c`, `python -c`, or aliases, and a normal
+build-and-test loop needs no approvals.
 
-### M4: The A/RVM language
+### Q2: Codebase quality (alongside, one small commit at a time)
 
-1. Locals (`LOAD n`, `STORE n`) with validated slot counts.
-2. Call frames: `CALL`, `RET`, bounded frame depth, static validation.
-3. Small source language: lexer, parser, AST, compiler to validated bytecode,
-   with source-mapped errors.
-4. Agent tools: `compile_source`, source-level `trace`, and program history
-   in the terminal and browser.
+1. One error type per CLI command returning `Result` to `main`, replacing
+   the scattered `process::exit` calls so failures are testable.
+2. Split `server.rs` into HTTP parsing, routes, and session handling with no
+   behaviour change.
+3. Property and fuzz-style tests (deterministic generators, no new
+   dependency) for the assembler, permission-rule parser, MCP framing, and
+   HTTP request parser.
+4. Public API docs for the library modules the CLI and server share; keep
+   clippy at `-D warnings`.
+5. Keep CI under 5 minutes; cache builds and keep the test suite free of
+   network calls and sleeps.
 
-Exit: the agent writes a recursive function in the source language,
-compiles, traces, and explains it from real VM results.
+Exit: no module over 1,500 lines, no `process::exit` outside `main`, and
+every parser has a generated-input test.
 
-### M5: Protocol and embedding
+### Later: extensibility, replay, language, protocol
 
-1. ACP JSON-RPC 2.0 server over stdio: session create/load/prompt/cancel,
-   streamed assistant, tool, and permission events.
-2. Versioned HTTP API shared by browser and ACP event shapes.
-3. Browser approval panel with exact scope, keyboard flow, and audit log.
-4. JavaScript SDK for the headless agent and the terminal widget.
+These keep their earlier scope and move behind the work above, because they
+add reach rather than making the core loop faster or safer.
 
-Exit: an ACP-capable editor drives `arvm` end to end, and the browser uses
-the same event schema.
-
-### M6: Execution and operations
-
-1. Runner contract from `ARCHITECTURE.md`; move format readers and the VM
-   behind it.
-2. Sandboxed native runner (namespaces/seccomp or a WASI runtime) so command
-   policy no longer relies on deny lists.
-3. Shared session store and HTTP edge hardening, then lift the single-task
-   limit.
-4. LLVM backend for the bytecode (native and Wasm), benchmarked against the
-   interpreter.
-5. Release artifacts, version channels, and performance budgets.
-
-Exit: a signed release runs untrusted commands in a sandbox and scales past
-one task.
+- **M1.3-M1.4:** one MCP process per session with supervision; `run_subagent`
+  as a CLI tool with bounded child budgets.
+- **M3 Replay:** `arvm session replay <id>` on top of the Q1 recording
+  contract; corrupt-session recovery and `--no-save`.
+- **M4 Language:** locals, call frames, a small source language compiled to
+  validated bytecode, `compile_source` and source-level trace tools.
+- **M5 Protocol:** ACP over stdio, a versioned HTTP API shared with the
+  browser, and a JavaScript SDK.
+- **M6 Operations:** shared session store and HTTP edge hardening, LLVM
+  backend, signed releases and version channels.
 
 ## Definition of done
 
@@ -184,3 +311,6 @@ A/RVM reaches practical parity when a user can:
 8. Connect an editor through ACP.
 9. Embed the agent or terminal in a JavaScript/Wasm host.
 10. Ask the agent to compile, execute, inspect, and explain A/RVM programs.
+
+And it is quick and efficient when the budgets above hold on the Q1
+benchmark, which is checked on every release.

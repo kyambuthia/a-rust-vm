@@ -53,7 +53,8 @@ Landed capabilities (last known green count: 218 lib + 16 CLI tests):
 - Terminal: `arvm agent | ask` REPL, one-shot `ask`, `--json` NDJSON output,
   `--auto`/`--deny`, `--rule`, `--workspace-dir`, `--skill`.
 - Sessions: save/list/show/export transcripts, resume via `--session`,
-  private local state under `~/.local/state/a-rust-vm/sessions`.
+  local state under `~/.local/state/a-rust-vm/sessions` (not yet private;
+  see ROADMAP S1.1).
 - Permissions: rule effects (allow/ask/deny), target-prefix scoping, durable
   rule storage (`arvm permission list|add|clear`), dangerous-command deny-list,
   workspace additional directories.
@@ -72,17 +73,10 @@ Landed capabilities (last known green count: 218 lib + 16 CLI tests):
 2. Read the smallest relevant slice of `ROADMAP.md`, `ARCHITECTURE.md`, and the
    previous decision in `docs/next-direction.md`.
 3. Pick ONE small vertical slice that is testable and keeps the product
-   coherent. Prefer, in order of remaining roadmap value:
-   - CLI/config plumbing to expose MCP servers and skills/subagents to real
-     `arvm agent|ask` runs (today they are library-level).
-   - ACP JSON-RPC 2.0 server foundation over stdio.
-   - Deterministic replay: define the recording contract first, then implement
-     a narrow replay that reproduces recorded tool/VM results.
-   - The small source language: lexer, then parser/AST, then compiler to
-     validated bytecode.
-   - Code-quality and utility passes: eliminate the pre-existing doc-comment
-     warning, add missing error contexts, CLI polish (slash menu, status,
-     doctor), and keep the wasm/browser surface consistent.
+   coherent. Follow the milestone order in `ROADMAP.md`: S1 (close the
+   leaks), U1 (native fast model path), Q1 (benchmark harness), U2 (tools),
+   U3 (terminal), S2 (sandbox), with Q2 quality slices in between. State in
+   the commit body which roadmap budget or baseline number the slice moves.
 4. Update `docs/next-direction.md` with the decision and explicit out-of-scope,
    commit it as `docs: update next roadmap decision`.
 5. Implement the slice with focused tests (parsing/pure helpers at minimum).
