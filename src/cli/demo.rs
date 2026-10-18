@@ -53,6 +53,7 @@ pub(crate) fn run_agent_demo() {
             for event in events {
                 match event {
                     AgentEvent::UserMessage { content } => println!("user: {content}"),
+                    AgentEvent::Usage(_) => {}
                     AgentEvent::AssistantText { content } => println!("assistant: {content}"),
                     AgentEvent::AssistantDelta { content } => {
                         println!("assistant delta: {content}")
@@ -206,6 +207,7 @@ pub(crate) fn run_coding_demo() {
             for event in events {
                 match event {
                     AgentEvent::UserMessage { content } => println!("user: {content}"),
+                    AgentEvent::Usage(_) => {}
                     AgentEvent::AssistantText { content } => println!("assistant: {content}"),
                     AgentEvent::ToolCall(call) => {
                         println!("tool call: {} ({})", call.name, call.id)

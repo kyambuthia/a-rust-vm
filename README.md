@@ -167,6 +167,11 @@ depth; the defaults favour a quick interactive loop:
   measurements throughput routing finished turns about twice as fast for a
   few hundredths of a cent more.
 
+After each turn `arvm` prints what it cost, for example
+`[usage] 2 model steps · 2,291 in (1,925 cached) · 91 out · $0.000085 · 7.7 s`;
+`/usage` in the REPL shows the session total, and `ask --json` emits a
+`usage` event per model step with the provider and first-token time.
+
 Optional limits: `OPENROUTER_MAX_TOKENS` (128-32768, default 8192) and
 `OPENROUTER_TIMEOUT_SECS` (1-600, default 120).
 

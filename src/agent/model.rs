@@ -83,7 +83,11 @@ pub struct ModelSelection {
 /// A partial model output received while a response is still being produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStreamEvent {
-    TextDelta { content: String },
+    TextDelta {
+        content: String,
+    },
+    /// Token and cost figures reported at the end of a response.
+    Usage(super::Usage),
 }
 
 impl Model for Box<dyn Model> {

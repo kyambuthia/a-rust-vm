@@ -134,8 +134,9 @@ fn router_does_not_fallback_after_streaming_output() {
 
     let error = router
         .respond_stream(&model_request(RouteRequest::default()), &mut |event| {
-            let ModelStreamEvent::TextDelta { content } = event;
-            chunks.push(content);
+            if let ModelStreamEvent::TextDelta { content } = event {
+                chunks.push(content);
+            }
         })
         .unwrap_err();
 

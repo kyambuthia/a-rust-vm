@@ -202,8 +202,9 @@ no process behind.
    `OPENROUTER_REASONING` (default `low`) and `OPENROUTER_PROVIDER_SORT`
    (default `throughput`) were added. Typical one-step answers went from
    8 s to 3-5 s.
-3. Usage events: input, output, and cached tokens, cost, and latency per step;
-   `/usage` in the REPL and a summary line after `ask`.
+3. ~~Usage events: input, output, and cached tokens, cost, and latency per step;
+   `/usage` in the REPL and a summary line after `ask`~~. Events also carry
+   the provider and first-token time.
 4. Cache-friendly prompts: a fixed order (system prompt, tools, history,
    new turn) and provider cache markers where supported.
 5. Model settings in `config.json`: default and fast model, OpenAI-compatible

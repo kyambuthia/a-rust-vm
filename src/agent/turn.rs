@@ -309,6 +309,9 @@ where
                 return Err(AgentError::TurnTimeoutExceeded);
             }
             let mut emitted_text = false;
+            let mut step_usage: Option<super::Usage> = None;
+            let mut first_token_ms: Option<u64> = None;
+            let started = Instant::now();
             let request = ModelRequest {
                 prompt: prompt.to_owned(),
                 tool_results: tool_results.clone(),
@@ -323,13 +326,21 @@ where
                     .respond_stream(&request, &mut |event| match event {
                         ModelStreamEvent::TextDelta { content } => {
                             emitted_text = true;
+                            first_token_ms
+                                .get_or_insert_with(|| started.elapsed().as_millis() as u64);
                             emit(AgentEvent::AssistantDelta { content });
                         }
+                        ModelStreamEvent::Usage(usage) => step_usage = Some(usage),
                     })
             } else {
                 self.model.respond(&request)
             }
             .map_err(AgentError::Model)?;
+            if let Some(mut usage) = step_usage {
+                usage.latency_ms = started.elapsed().as_millis() as u64;
+                usage.first_token_ms = first_token_ms;
+                emit(AgentEvent::Usage(usage));
+            }
 
             match response {
                 ModelResponse::Text(content) => {

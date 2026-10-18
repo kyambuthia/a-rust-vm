@@ -185,7 +185,9 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     let stdin = io::stdin();
 
     println!("A/RVM agent. Type /exit to quit.");
-    println!("Routes: /model <name>, /fast, /strong, /default, /status");
+    println!("Routes: /model <name>, /fast, /strong, /default, /status, /usage");
+    let mut session_usage = a_rust_vm::agent::Usage::default();
+    let mut session_steps = 0usize;
     match backend {
         ModelBackend::OpenRouter => println!("Model: {model_name} (OpenRouter)"),
         ModelBackend::Program => println!("Model: {model_name} (external program)"),
@@ -211,6 +213,17 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         }
         if matches!(prompt, "/exit" | "/quit") {
             break;
+        }
+        if prompt == "/usage" {
+            if session_steps == 0 {
+                println!("[usage] no model usage reported yet");
+            } else {
+                println!(
+                    "[usage] session: {}",
+                    usage_line(session_steps, &session_usage)
+                );
+            }
+            continue;
         }
         if prompt == "/status" {
             let selected = match route.requested_model.as_deref() {
@@ -253,6 +266,8 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
 
         session.push("user", prompt);
         let mut reply = String::new();
+        let mut turn_usage = a_rust_vm::agent::Usage::default();
+        let mut turn_steps = 0usize;
         if let Err(error) = agent.run_streaming_with_approval(
             prompt,
             |request| {
@@ -297,10 +312,19 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
                         session.push("assistant", std::mem::take(&mut reply));
                     }
                 }
+                AgentEvent::Usage(usage) => {
+                    turn_usage.accumulate(&usage);
+                    turn_steps += 1;
+                }
                 AgentEvent::UserMessage { .. } => {}
             },
         ) {
             eprintln!("\n[agent error] {error}");
+        }
+        if turn_steps > 0 {
+            println!("\n[usage] {}", usage_line(turn_steps, &turn_usage));
+            session_usage.accumulate(&turn_usage);
+            session_steps += turn_steps;
         }
         if let Err(error) = store.save(&session) {
             eprintln!("\n[session] cannot save: {error}");
@@ -415,6 +439,8 @@ fn run_one_shot_agent(
     json: bool,
     permission: OneShotPermission,
 ) {
+    let mut total = a_rust_vm::agent::Usage::default();
+    let mut steps = 0usize;
     let result = agent.run_streaming_with_approval(
         prompt,
         |request| match permission {
@@ -424,6 +450,10 @@ fn run_one_shot_agent(
             },
         },
         |event| {
+            if let AgentEvent::Usage(usage) = &event {
+                total.accumulate(usage);
+                steps += 1;
+            }
             if json {
                 if let Ok(line) = serde_json::to_string(&event) {
                     println!("{line}");
@@ -445,10 +475,13 @@ fn run_one_shot_agent(
                 }
                 AgentEvent::Error { message } => println!("\n[error] {message}\n"),
                 AgentEvent::Cancelled => println!("\n[agent] cancelled\n"),
-                AgentEvent::UserMessage { .. } | AgentEvent::Done => {}
+                AgentEvent::UserMessage { .. } | AgentEvent::Done | AgentEvent::Usage(_) => {}
             }
         },
     );
+    if !json && steps > 0 {
+        eprintln!("\n[usage] {}", usage_line(steps, &total));
+    }
     if let Err(error) = result {
         if json {
             let event = serde_json::json!({"type": "error", "message": error.to_string()});
@@ -461,6 +494,11 @@ fn run_one_shot_agent(
     if !json {
         println!();
     }
+}
+
+fn usage_line(steps: usize, total: &a_rust_vm::agent::Usage) -> String {
+    let noun = if steps == 1 { "step" } else { "steps" };
+    format!("{steps} model {noun} · {}", total.summary())
 }
 
 fn workspace_system_prompt_with_skills(root: &std::path::Path, skills: &[String]) -> String {

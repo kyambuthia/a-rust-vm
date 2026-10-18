@@ -38,7 +38,7 @@ pub use turn::{Agent, AgentError};
 use turn::{DEFAULT_CONTEXT_CHARS, DEFAULT_CONTEXT_MESSAGES};
 pub use types::{
     AgentEvent, ConversationMessage, PermissionDecision, PermissionRequest, ToolArguments,
-    ToolCall, ToolResult, ToolSpec, ToolValue,
+    ToolCall, ToolResult, ToolSpec, ToolValue, Usage,
 };
 pub(crate) use vm_tools::parse_program;
 pub use vm_tools::vm_tool_registry;

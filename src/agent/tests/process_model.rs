@@ -20,6 +20,7 @@ fn process_model_streams_json_events_without_a_shell_wrapper() {
     let response = model
         .respond_stream(&request, &mut |event| match event {
             super::ModelStreamEvent::TextDelta { content } => chunks.push(content),
+            super::ModelStreamEvent::Usage(_) => {}
         })
         .unwrap();
 

@@ -596,3 +596,27 @@ fn tool_output_secrets_are_redacted_before_events_and_context() {
     assert!(!context.contains("hunter2hunter"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn usage_accumulates_and_summarises() {
+    let mut total = Usage::default();
+    total.accumulate(&Usage {
+        input_tokens: 1200,
+        output_tokens: 56,
+        cached_tokens: 800,
+        cost_micro_usd: Some(120),
+        latency_ms: 2100,
+        ..Default::default()
+    });
+    total.accumulate(&Usage {
+        input_tokens: 1000,
+        output_tokens: 4,
+        latency_ms: 900,
+        ..Default::default()
+    });
+    assert_eq!(
+        total.summary(),
+        "2,200 in (800 cached) · 60 out · $0.000120 · 3.0 s"
+    );
+    assert_eq!(Usage::default().summary(), "0 in · 0 out · 0.0 s");
+}

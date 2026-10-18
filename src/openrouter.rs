@@ -277,6 +277,7 @@ impl Model for OpenRouterModel {
     ) -> Result<ModelResponse, ModelError> {
         let mut body = self.build_request_body(request);
         body["stream"] = serde_json::json!(true);
+        body["stream_options"] = serde_json::json!({"include_usage": true});
         let response = self.send(&body)?;
         let api_key = self.inner.config.api_key.clone();
         parse_sse_stream(
@@ -286,6 +287,7 @@ impl Model for OpenRouterModel {
                 ModelStreamEvent::TextDelta { content } => emit(ModelStreamEvent::TextDelta {
                     content: redact_secret(&content, &api_key),
                 }),
+                usage @ ModelStreamEvent::Usage(_) => emit(usage),
             },
         )
         .map_err(ModelError::new)
@@ -312,6 +314,8 @@ fn parse_sse_stream(
 ) -> Result<ModelResponse, String> {
     let mut text = String::new();
     let mut calls: std::collections::BTreeMap<u64, PartialToolCall> = Default::default();
+    let mut usage: Option<crate::agent::Usage> = None;
+    let mut provider: Option<String> = None;
     let mut total = 0usize;
     let mut line = Vec::new();
     loop {
@@ -348,6 +352,12 @@ fn parse_sse_stream(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("provider stream error");
             return Err(sanitize_provider_error(400, message));
+        }
+        if let Some(name) = chunk.get("provider").and_then(serde_json::Value::as_str) {
+            provider = Some(name.to_owned());
+        }
+        if let Some(reported) = chunk.get("usage").filter(|value| value.is_object()) {
+            usage = Some(parse_usage(reported));
         }
         let Some(delta) = chunk.pointer("/choices/0/delta") else {
             continue;
@@ -393,6 +403,10 @@ fn parse_sse_stream(
             }
         }
     }
+    if let Some(mut usage) = usage {
+        usage.provider = provider;
+        emit(ModelStreamEvent::Usage(usage));
+    }
     if !calls.is_empty() {
         if calls.len() > 1 {
             return Err(
@@ -407,6 +421,29 @@ fn parse_sse_stream(
         return Err("provider returned an empty response".to_owned());
     }
     Ok(ModelResponse::Text(trimmed.to_owned()))
+}
+
+/// Read OpenAI-style usage, with OpenRouter's cache, reasoning, and cost fields.
+fn parse_usage(value: &serde_json::Value) -> crate::agent::Usage {
+    let count = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cost_micro_usd = value
+        .get("cost")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .map(|cost| (cost * 1_000_000.0).round() as u64);
+    crate::agent::Usage {
+        input_tokens: count("/prompt_tokens"),
+        output_tokens: count("/completion_tokens"),
+        cached_tokens: count("/prompt_tokens_details/cached_tokens"),
+        reasoning_tokens: count("/completion_tokens_details/reasoning_tokens"),
+        cost_micro_usd,
+        ..Default::default()
+    }
 }
 
 /// Validate one tool call's parts into a response.
@@ -933,6 +970,31 @@ mod tests {
         assert!(!is_transient_status(422));
     }
 
+    #[test]
+    fn stream_reports_usage_cost_and_provider() {
+        let body = concat!(
+            "data: {\"provider\":\"StreamLake\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"provider\":\"StreamLake\",\"choices\":[],\"usage\":{\"prompt_tokens\":1200,",
+            "\"completion_tokens\":56,\"prompt_tokens_details\":{\"cached_tokens\":800},",
+            "\"completion_tokens_details\":{\"reasoning_tokens\":30},\"cost\":0.000123}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut usage = None;
+        let result = parse_sse_stream(std::io::Cursor::new(body), MAX_STREAM_BYTES, &mut |event| {
+            if let ModelStreamEvent::Usage(reported) = event {
+                usage = Some(reported);
+            }
+        });
+        assert_eq!(result.unwrap(), ModelResponse::Text("hi".to_owned()));
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.output_tokens, 56);
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.reasoning_tokens, 30);
+        assert_eq!(usage.cost_micro_usd, Some(123));
+        assert_eq!(usage.provider.as_deref(), Some("StreamLake"));
+    }
+
     fn stream(chunks: &[&str]) -> (Result<ModelResponse, String>, Vec<String>) {
         let body = chunks
             .iter()
@@ -944,6 +1006,7 @@ mod tests {
             MAX_STREAM_BYTES,
             &mut |event| match event {
                 ModelStreamEvent::TextDelta { content } => deltas.push(content),
+                ModelStreamEvent::Usage(_) => {}
             },
         );
         (result, deltas)
