@@ -61,8 +61,9 @@ test):
 
 ### Known debt and risks
 
-- **Large modules.** `agent.rs` (~3.9k lines) and `main.rs` (~2k lines) mix
-  model routing, tools, subagents, CLI parsing, and REPL code.
+- **Large modules.** The agent and CLI splits are done, but `server.rs`
+  (~2k lines, ~1.6k without tests) still mixes HTTP parsing, routing, and
+  session handling.
 - **MCP spawns a server per call.** Stateful servers lose state between calls,
   and every call pays a full handshake.
 - **Hand-written HTTP/1.0 server.** No keep-alive, `Transfer-Encoding` is
@@ -80,18 +81,19 @@ Each milestone is a sequence of small slices; each slice is one focused,
 verified commit as described in `AGENTS.md`. Exit criteria are what a user can
 do, checked by tests or a scripted demo.
 
-### M0: Guard rails (next)
+### M0: Guard rails (done)
 
 1. ~~GitHub Actions workflow running the `AGENTS.md` checks~~ (`40455c3`).
 2. ~~Commit turns that end without an answer, with a marker saying why, so
    the next turn keeps its context~~.
-3. Split `agent.rs` into `agent/{model,router,tools,loop,subagent}.rs` and
-   `main.rs` into `cli/` command modules, with no behaviour change.
+3. ~~Split `agent.rs` into `agent/{model,router,tools,loop,subagent}.rs` and
+   `main.rs` into `cli/` command modules, with no behaviour change~~
+   (`311a27b`, `fbad5b8`).
 
 Exit: every push is checked automatically; the largest module is under
 1,500 lines.
 
-### M1: Wire the extensibility that already exists
+### M1: Wire the extensibility that already exists (next)
 
 1. `arvm` configuration file (`.arvm/config.json` in the workspace, plus
    user config) declaring MCP servers and default rules, with environment and

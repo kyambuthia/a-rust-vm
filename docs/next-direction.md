@@ -1,27 +1,43 @@
-Decision: start roadmap milestone M0 ("Guard rails") with a GitHub Actions
-workflow that runs the `AGENTS.md` verification set on every push and pull
-request.
+Decision: start roadmap milestone M1 ("Wire the extensibility that already
+exists") with slice M1.1, an `arvm` configuration file.
 
-Rationale: an October 2026 review found and fixed twelve defects, several of
-them security-relevant (workspace escape, permission-rule bypasses, stale
-browser approvals). None of the fixes are protected unless the checks run
-automatically. CI is the cheapest way to keep them fixed and is a prerequisite
-for the larger refactors that follow in M0.
+Rationale: M0 is done. CI checks every push, failed turns keep their context,
+and `agent.rs` and `main.rs` are split into modules. MCP servers and default
+permission rules are still only reachable through library code or repeated
+`--rule` flags. A configuration file is the shared input that M1.2 (MCP tools
+in `arvm` runs) and M1.4 (subagent budgets) both need.
 
 Plan (one small slice):
 
-1. Add `.github/workflows/ci.yml` running on push and pull request to `main`:
-   `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`,
-   `cargo test`, `cargo build --target wasm32-unknown-unknown --lib`, and
-   `node --input-type=module --check < web/main.js`.
-2. Cache the cargo registry and target directory; pin the toolchain to
-   stable with the wasm32 target installed.
-3. Verify locally that each command in the workflow passes, then commit as
-   `build: run repository checks in CI`.
+1. A `config` library module that parses one configuration file:
 
-Next slices in M0: commit failed-turn transcripts so context survives an
-errored turn, then split `agent.rs` and `main.rs` into modules without
-behaviour change.
+   ```json
+   {
+     "rules": ["deny run_command:rm"],
+     "mcpServers": {
+       "files": { "command": "mcp-files", "args": ["--root", "."] }
+     }
+   }
+   ```
 
-Explicitly out of this slice: release builds, deployment, CDK synth in CI,
-coverage reporting, and any change to GitHub repository settings.
+   Unknown fields, invalid rules, and invalid server entries are errors, so a
+   typo never silently drops a rule.
+2. Two scopes: the user config at `<config dir>/config.json` (the directory
+   honours `A_RVM_CONFIG_DIR` and `XDG_CONFIG_HOME`) and the workspace config
+   at `.arvm/config.json` in the working directory. A missing file is empty.
+3. The workspace config can only tighten permissions. It may declare `ask`
+   and `deny` rules; an `allow` rule there is an error, because a cloned
+   repository must not be able to approve its own commands.
+4. Rule precedence, first match wins: `--rule` flags, workspace config, user
+   config, then rules saved with `arvm permission add`.
+5. `arvm config show [--json]` prints both paths, whether each file exists,
+   and the rules and MCP servers each declares.
+
+Next slices in M1: register configured MCP tools in `agent`/`ask` runs behind
+the approval flow (workspace-declared servers need explicit user approval
+before they start), add `arvm mcp list|tools`, then keep one server process
+per session.
+
+Explicitly out of this slice: starting MCP servers, subagent budgets, model
+selection in the config file, a `--config` flag, and any change to the
+browser host.
