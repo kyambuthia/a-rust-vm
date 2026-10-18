@@ -15,7 +15,6 @@ use crate::permissions::{PermissionEffect, PermissionPolicy, SessionApprovals, T
 pub(super) const DEFAULT_CONTEXT_MESSAGES: usize = 24;
 pub(super) const DEFAULT_CONTEXT_CHARS: usize = 32 * 1024;
 
-/// Errors raised while coordinating one agent turn.
 /// How a turn that did not fail came to an end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnEnd {
@@ -24,6 +23,7 @@ enum TurnEnd {
     RepeatedToolCall,
 }
 
+/// Errors raised while coordinating one agent turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentError {
     Model(ModelError),

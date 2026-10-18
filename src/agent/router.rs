@@ -8,7 +8,7 @@ use super::{
     ModelStreamEvent, RouteRequest,
 };
 
-/// Profiles used by the router when the caller did not name a model.
+/// Errors from registering models or resolving a route to one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
     NoModels,
