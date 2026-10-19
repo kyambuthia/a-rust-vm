@@ -5,6 +5,8 @@
 
 use std::{cell::Cell, collections::BTreeMap, fmt, mem::size_of, rc::Rc};
 
+use serde::{Deserialize, Serialize};
+
 pub const MODULE_VERSION: u16 = 2;
 pub const MAX_FUNCTIONS: usize = 1_024;
 pub const MAX_MODULE_INSTRUCTIONS: usize = 65_536;
@@ -24,7 +26,8 @@ const HEAP_OBJECT_CHARGE: usize = size_of::<HeapObject>();
 const MAP_ENTRY_CHARGE: usize = size_of::<String>() + size_of::<Value>() + 4 * size_of::<usize>();
 
 /// An owned value at the module boundary. Collections are ordered by key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OwnedValue {
     Null,
     Bool(bool),
@@ -123,7 +126,8 @@ fn value_charge(value: &OwnedValue, depth: usize) -> Result<usize, ModuleVmError
 }
 
 /// An instruction in a validated module function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Op {
     Const(i64),
     ConstValue(usize),

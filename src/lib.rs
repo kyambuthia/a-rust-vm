@@ -22,6 +22,7 @@ pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 pub mod module;
+pub mod module_format;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod openrouter;
 pub mod permissions;
