@@ -58,7 +58,9 @@ milestone can compare task completion and cost against it. All scripted
 authorization and interruption cases pass.
 
 In progress: `scripts/bench` has 12 disposable cases and runs the scripted
-suite in CI. An explicitly requested live-model baseline is still open.
+suite in CI. The [scripted baseline](agent-benchmark-baseline.md) passed 12/12
+at clean commit `3c52ec4`. An explicitly requested live-model baseline is
+still open.
 
 ### G1. Make a task durable and reviewable
 

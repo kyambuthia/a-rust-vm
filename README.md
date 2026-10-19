@@ -69,6 +69,8 @@ OPENROUTER_API_KEY=... OPENROUTER_MODEL=... \
 The summary records completion, model steps, tool calls, elapsed time, usage
 reported by the provider, and hashes of expected and actual output files. It
 does not retain prompts, tool output, session transcripts, or credentials.
+The first [scripted baseline](docs/agent-benchmark-baseline.md) records results
+from a clean revision; it does not measure live-model task success.
 
 ## Run the browser agent
 
