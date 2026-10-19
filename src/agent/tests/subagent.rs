@@ -708,3 +708,18 @@ fn persistent_session_load_rejects_unknown_and_blank_ids() {
     let session = SubagentSession::new("with space", SubagentConfig::default()).unwrap();
     assert!(session.save(&store).is_err());
 }
+
+#[test]
+fn transcripts_are_cut_on_character_boundaries() {
+    let result = run_subagent(
+        ScriptedModel::new([ModelResponse::Text("日本語".to_owned())]),
+        vm_tool_registry().unwrap(),
+        "child task",
+        SubagentConfig {
+            max_transcript_chars: 4,
+            ..SubagentConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(result.assistant_text, "日");
+}

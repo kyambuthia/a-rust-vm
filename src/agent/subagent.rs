@@ -138,7 +138,7 @@ where
         .collect::<Vec<_>>()
         .join("\n");
     if assistant_text.len() > config.max_transcript_chars {
-        assistant_text.truncate(config.max_transcript_chars);
+        truncate_at_char_boundary(&mut assistant_text, config.max_transcript_chars);
     }
     Ok(SubagentResult {
         events,
@@ -294,7 +294,7 @@ impl SubagentSession {
             .collect::<Vec<_>>()
             .join("\n");
         if assistant_text.len() > self.config.max_transcript_chars {
-            assistant_text.truncate(self.config.max_transcript_chars);
+            truncate_at_char_boundary(&mut assistant_text, self.config.max_transcript_chars);
         }
         Ok(SubagentResult {
             events,
@@ -431,4 +431,17 @@ impl Tool for SubagentTool {
     fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
         self.cancel = cancel;
     }
+}
+
+/// Cut `text` to at most `max_bytes`, backing off to a character boundary so
+/// multi-byte text cannot cause a panic.
+fn truncate_at_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
