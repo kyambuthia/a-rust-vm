@@ -5,7 +5,7 @@
 //! task concurrently.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -16,11 +16,18 @@ pub struct TaskStore {
     directory: PathBuf,
 }
 
+/// Holds an exclusive local process lock until dropped. The lock file remains
+/// so every process locks the same inode; the OS releases the lock on exit.
+pub struct TaskLease {
+    _file: File,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStoreError {
     Task(TaskError),
     NotFound { id: String },
     Conflict { id: String },
+    Busy { id: String },
     Io(String),
 }
 
@@ -30,6 +37,7 @@ impl fmt::Display for TaskStoreError {
             Self::Task(error) => write!(formatter, "{error}"),
             Self::NotFound { id } => write!(formatter, "task '{id}' does not exist"),
             Self::Conflict { id } => write!(formatter, "task '{id}' changed since it was read"),
+            Self::Busy { id } => write!(formatter, "task '{id}' is already running"),
             Self::Io(message) => formatter.write_str(message),
         }
     }
@@ -52,6 +60,33 @@ impl TaskStore {
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Exclude another local CLI process from running the same task.
+    pub fn lease(&self, id: &str) -> Result<TaskLease, TaskStoreError> {
+        TaskRecord::validate_id(id)?;
+        crate::private_fs::create_private_dir_all(&self.directory).map_err(|error| {
+            TaskStoreError::Io(format!("cannot create task directory: {error}"))
+        })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(self.directory.join(format!("{id}.lock")))
+            .map_err(|error| {
+                TaskStoreError::Io(format!("cannot open task lock '{id}': {error}"))
+            })?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => TaskStoreError::Busy { id: id.to_owned() },
+            std::fs::TryLockError::Error(error) => {
+                TaskStoreError::Io(format!("cannot lock task '{id}': {error}"))
+            }
+        })?;
+        Ok(TaskLease { _file: file })
     }
 
     /// Save atomically, rejecting a different spec or a shorter event history.
@@ -146,6 +181,31 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn lease_excludes_concurrent_local_runs_and_releases_on_drop() {
+        let root = std::env::temp_dir().join(format!("arvm-task-lease-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = TaskStore::new(root.join("tasks"));
+        let lease = store.lease("task-1").unwrap();
+        assert!(matches!(
+            store.lease("task-1"),
+            Err(TaskStoreError::Busy { id }) if id == "task-1"
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(store.directory().join("task-1.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        drop(lease);
+        store.lease("task-1").unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
