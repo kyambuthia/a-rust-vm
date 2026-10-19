@@ -14,7 +14,7 @@ const MAX_EVENTS: usize = 512;
 const MAX_PLAN_STEPS: usize = 128;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
-const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_TASK_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +136,10 @@ impl fmt::Display for TaskError {
 impl std::error::Error for TaskError {}
 
 impl TaskRecord {
+    pub fn validate_id(id: &str) -> Result<(), TaskError> {
+        validate_file_id(id, "id")
+    }
+
     pub fn new(spec: TaskSpec) -> Result<Self, TaskError> {
         validate_file_id(&spec.id, "id")?;
         validate_resource_id(&spec.owner, "owner")?;
@@ -207,7 +211,7 @@ impl TaskRecord {
 
     /// Decode and replay all events, rejecting changed state or missing events.
     pub fn restore(bytes: &[u8]) -> Result<Self, TaskError> {
-        if bytes.len() > MAX_RECORD_BYTES {
+        if bytes.len() > MAX_TASK_RECORD_BYTES {
             return Err(TaskError::InvalidField("record size"));
         }
         let stored: Self =

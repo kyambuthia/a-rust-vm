@@ -80,8 +80,10 @@ client without repeating a material effect. Its final answer links to the
 exact output versions and verification events.
 
 In progress: `src/task.rs` defines a versioned, replay-validated task record
-with plans, checkpoints, approval states, and terminal outcomes. Persistence
-and CLI/browser wiring remain open.
+with plans, checkpoints, approval states, and terminal outcomes.
+`src/task_store.rs` saves it as a private, atomic local file and refuses event
+history rollback. CLI/browser wiring and a shared transactional store remain
+open.
 
 ### G2. Execute useful work inside real boundaries
 
