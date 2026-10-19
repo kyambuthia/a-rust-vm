@@ -3,7 +3,7 @@
 //! The legacy assembly VM remains available through crate::program. A module
 //! is validated as a whole before its instructions can be executed.
 
-use std::{collections::BTreeMap, fmt, mem::size_of};
+use std::{cell::Cell, collections::BTreeMap, fmt, mem::size_of, rc::Rc};
 
 pub const MODULE_VERSION: u16 = 2;
 pub const MAX_FUNCTIONS: usize = 1_024;
@@ -35,17 +35,43 @@ pub enum OwnedValue {
     Map(BTreeMap<String, OwnedValue>),
 }
 
-/// A cheap VM value. Heap references belong to the VM that produced them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A cheap VM value. Cloning a heap value shares its immutable contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Null,
     Bool(bool),
     Integer(i64),
-    Heap(usize),
+    Heap(HeapValue),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HeapObject {
+/// An opaque reference whose allocation stays live while it is held.
+#[derive(Debug, Clone)]
+pub struct HeapValue(Rc<HeapObject>);
+
+impl PartialEq for HeapValue {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HeapValue {}
+
+#[derive(Debug)]
+struct HeapObject {
+    data: HeapData,
+    charge: usize,
+    depth: usize,
+    usage: Rc<Cell<usize>>,
+}
+
+impl Drop for HeapObject {
+    fn drop(&mut self) {
+        self.usage.set(self.usage.get() - self.charge);
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HeapData {
     Text(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
@@ -573,7 +599,7 @@ impl fmt::Display for ModuleVmError {
 
 impl std::error::Error for ModuleVmError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleStep {
     pub function: usize,
     pub instruction_pointer: usize,
@@ -606,9 +632,7 @@ pub struct ModuleVm<'a> {
     steps: usize,
     result: Option<Value>,
     inputs: Vec<Value>,
-    heap: Vec<HeapObject>,
-    heap_depths: Vec<usize>,
-    heap_bytes: usize,
+    heap_bytes: Rc<Cell<usize>>,
     heap_limit: usize,
 }
 
@@ -626,9 +650,7 @@ impl<'a> ModuleVm<'a> {
             steps: 0,
             result: None,
             inputs: Vec::new(),
-            heap: Vec::new(),
-            heap_depths: Vec::new(),
-            heap_bytes: 0,
+            heap_bytes: Rc::new(Cell::new(0)),
             heap_limit: MAX_MODULE_HEAP_BYTES,
         }
     }
@@ -662,12 +684,12 @@ impl<'a> ModuleVm<'a> {
     }
 
     pub fn result(&self) -> Option<Value> {
-        self.result
+        self.result.clone()
     }
 
-    /// Guest heap charge, including objects that are no longer referenced.
+    /// Guest heap charge for values still reachable from the VM or its callers.
     pub fn heap_bytes(&self) -> usize {
-        self.heap_bytes
+        self.heap_bytes.get()
     }
 
     pub fn resolve(&self, value: Value) -> Result<OwnedValue, ModuleVmError> {
@@ -682,21 +704,17 @@ impl<'a> ModuleVm<'a> {
             Value::Null => Ok(OwnedValue::Null),
             Value::Bool(value) => Ok(OwnedValue::Bool(value)),
             Value::Integer(value) => Ok(OwnedValue::Integer(value)),
-            Value::Heap(index) => match self
-                .heap
-                .get(index)
-                .ok_or(ModuleVmError::InvalidReference)?
-            {
-                HeapObject::Text(text) => Ok(OwnedValue::Text(text.clone())),
-                HeapObject::Bytes(bytes) => Ok(OwnedValue::Bytes(bytes.clone())),
-                HeapObject::List(items) => items
+            Value::Heap(reference) => match &reference.0.data {
+                HeapData::Text(text) => Ok(OwnedValue::Text(text.clone())),
+                HeapData::Bytes(bytes) => Ok(OwnedValue::Bytes(bytes.clone())),
+                HeapData::List(items) => items
                     .iter()
-                    .map(|item| self.resolve_at(*item, depth + 1))
+                    .map(|item| self.resolve_at(item.clone(), depth + 1))
                     .collect::<Result<Vec<_>, _>>()
                     .map(OwnedValue::List),
-                HeapObject::Map(entries) => entries
+                HeapData::Map(entries) => entries
                     .iter()
-                    .map(|(key, item)| Ok((key.clone(), self.resolve_at(*item, depth + 1)?)))
+                    .map(|(key, item)| Ok((key.clone(), self.resolve_at(item.clone(), depth + 1)?)))
                     .collect::<Result<BTreeMap<_, _>, _>>()
                     .map(OwnedValue::Map),
             },
@@ -706,6 +724,7 @@ impl<'a> ModuleVm<'a> {
     fn reserve_heap(&self, charge: usize) -> Result<(), ModuleVmError> {
         if self
             .heap_bytes
+            .get()
             .checked_add(charge)
             .is_none_or(|total| total > self.heap_limit)
         {
@@ -714,17 +733,19 @@ impl<'a> ModuleVm<'a> {
         Ok(())
     }
 
-    fn allocate(&mut self, object: HeapObject, charge: usize, depth: usize) -> Value {
-        let index = self.heap.len();
-        self.heap.push(object);
-        self.heap_depths.push(depth);
-        self.heap_bytes += charge;
-        Value::Heap(index)
+    fn allocate(&self, data: HeapData, charge: usize, depth: usize) -> Value {
+        self.heap_bytes.set(self.heap_bytes.get() + charge);
+        Value::Heap(HeapValue(Rc::new(HeapObject {
+            data,
+            charge,
+            depth,
+            usage: self.heap_bytes.clone(),
+        })))
     }
 
-    fn value_depth(&self, value: Value) -> usize {
+    fn value_depth(&self, value: &Value) -> usize {
         match value {
-            Value::Heap(index) => self.heap_depths[index],
+            Value::Heap(reference) => reference.0.depth,
             _ => 0,
         }
     }
@@ -737,12 +758,12 @@ impl<'a> ModuleVm<'a> {
             OwnedValue::Bool(value) => Value::Bool(*value),
             OwnedValue::Integer(value) => Value::Integer(*value),
             OwnedValue::Text(text) => self.allocate(
-                HeapObject::Text(text.clone()),
+                HeapData::Text(text.clone()),
                 HEAP_OBJECT_CHARGE + text.len(),
                 0,
             ),
             OwnedValue::Bytes(bytes) => self.allocate(
-                HeapObject::Bytes(bytes.clone()),
+                HeapData::Bytes(bytes.clone()),
                 HEAP_OBJECT_CHARGE + bytes.len(),
                 0,
             ),
@@ -750,11 +771,11 @@ impl<'a> ModuleVm<'a> {
                 let values: Vec<_> = items.iter().map(|item| self.import(item)).collect();
                 let depth = values
                     .iter()
-                    .map(|value| self.value_depth(*value) + 1)
+                    .map(|value| self.value_depth(value) + 1)
                     .max()
                     .unwrap_or(0);
                 self.allocate(
-                    HeapObject::List(values),
+                    HeapData::List(values),
                     HEAP_OBJECT_CHARGE + items.len() * size_of::<Value>(),
                     depth,
                 )
@@ -766,7 +787,7 @@ impl<'a> ModuleVm<'a> {
                     .collect();
                 let depth = values
                     .values()
-                    .map(|value| self.value_depth(*value) + 1)
+                    .map(|value| self.value_depth(value) + 1)
                     .max()
                     .unwrap_or(0);
                 let charge = HEAP_OBJECT_CHARGE
@@ -774,7 +795,7 @@ impl<'a> ModuleVm<'a> {
                         .keys()
                         .map(|key| MAP_ENTRY_CHARGE + key.len())
                         .sum::<usize>();
-                self.allocate(HeapObject::Map(values), charge, depth)
+                self.allocate(HeapData::Map(values), charge, depth)
             }
         }
     }
@@ -803,7 +824,7 @@ impl<'a> ModuleVm<'a> {
         while self.result.is_none() {
             self.step()?;
         }
-        Ok(self.result.expect("result checked above"))
+        Ok(self.result.clone().expect("result checked above"))
     }
 
     pub fn step(&mut self) -> Result<ModuleStep, ModuleVmError> {
@@ -833,24 +854,28 @@ impl<'a> ModuleVm<'a> {
             }
             Op::Input(index) => {
                 self.check_push()?;
-                let value = *self.inputs.get(index).ok_or(ModuleVmError::MissingInput)?;
+                let value = self
+                    .inputs
+                    .get(index)
+                    .ok_or(ModuleVmError::MissingInput)?
+                    .clone();
                 self.frames[frame_index].stack.push(value);
                 self.frames[frame_index].ip += 1;
             }
             Op::LocalGet(slot) => {
                 self.check_push()?;
                 let value = self.frames[frame_index].locals[slot]
+                    .clone()
                     .ok_or(ModuleVmError::UninitializedLocal)?;
                 self.frames[frame_index].stack.push(value);
                 self.frames[frame_index].ip += 1;
             }
             Op::LocalSet(slot) => {
                 let frame = &mut self.frames[frame_index];
-                let value = *frame
+                let value = frame
                     .stack
-                    .last()
+                    .pop()
                     .ok_or(ModuleVmError::OperandStackUnderflow)?;
-                frame.stack.pop();
                 frame.locals[slot] = Some(value);
                 frame.ip += 1;
             }
@@ -862,7 +887,7 @@ impl<'a> ModuleVm<'a> {
                 if stack.len() < 2 {
                     return Err(ModuleVmError::OperandStackUnderflow);
                 }
-                if self.integer(stack[stack.len() - 1])? == 0 {
+                if self.integer(&stack[stack.len() - 1])? == 0 {
                     return Err(ModuleVmError::DivisionByZero);
                 }
                 self.binary_int(|a, b| a.checked_div(b))?;
@@ -882,8 +907,8 @@ impl<'a> ModuleVm<'a> {
                 let value = Value::Bool(self.integer(lhs)? < self.integer(rhs)?);
                 self.replace_operands(2, value);
             }
-            Op::ListNew => self.new_collection(HeapObject::List(Vec::new()))?,
-            Op::MapNew => self.new_collection(HeapObject::Map(BTreeMap::new()))?,
+            Op::ListNew => self.new_collection(HeapData::List(Vec::new()))?,
+            Op::MapNew => self.new_collection(HeapData::Map(BTreeMap::new()))?,
             Op::ListPush => self.list_push()?,
             Op::ListGet => self.list_get()?,
             Op::ListLen => self.list_len()?,
@@ -891,13 +916,13 @@ impl<'a> ModuleVm<'a> {
             Op::MapGet => self.map_get()?,
             Op::Jump(target) => self.frames[frame_index].ip = target,
             Op::JumpIfZero(target) => {
-                let condition = *self.frames[frame_index]
+                let condition = self.frames[frame_index]
                     .stack
                     .last()
                     .ok_or(ModuleVmError::OperandStackUnderflow)?;
                 let is_zero = match condition {
-                    Value::Integer(value) => value == 0,
-                    Value::Bool(value) => !value,
+                    Value::Integer(value) => *value == 0,
+                    Value::Bool(value) => !*value,
                     _ => {
                         return Err(ModuleVmError::TypeMismatch {
                             expected: "integer or bool",
@@ -939,10 +964,11 @@ impl<'a> ModuleVm<'a> {
                 });
             }
             Op::Return => {
-                let value = *self.frames[frame_index]
+                let value = self.frames[frame_index]
                     .stack
                     .last()
-                    .ok_or(ModuleVmError::OperandStackUnderflow)?;
+                    .ok_or(ModuleVmError::OperandStackUnderflow)?
+                    .clone();
                 if frame_index == 0 {
                     self.result = Some(value);
                 } else {
@@ -960,7 +986,7 @@ impl<'a> ModuleVm<'a> {
             function,
             instruction_pointer,
             instruction,
-            result: self.result,
+            result: self.result.clone(),
         })
     }
 
@@ -982,24 +1008,23 @@ impl<'a> ModuleVm<'a> {
         Ok(())
     }
 
-    fn kind(&self, value: Value) -> &'static str {
+    fn kind(&self, value: &Value) -> &'static str {
         match value {
             Value::Null => "null",
             Value::Bool(_) => "bool",
             Value::Integer(_) => "integer",
-            Value::Heap(index) => match self.heap.get(index) {
-                Some(HeapObject::Text(_)) => "text",
-                Some(HeapObject::Bytes(_)) => "bytes",
-                Some(HeapObject::List(_)) => "list",
-                Some(HeapObject::Map(_)) => "map",
-                None => "invalid reference",
+            Value::Heap(reference) => match &reference.0.data {
+                HeapData::Text(_) => "text",
+                HeapData::Bytes(_) => "bytes",
+                HeapData::List(_) => "list",
+                HeapData::Map(_) => "map",
             },
         }
     }
 
-    fn integer(&self, value: Value) -> Result<i64, ModuleVmError> {
+    fn integer(&self, value: &Value) -> Result<i64, ModuleVmError> {
         match value {
-            Value::Integer(value) => Ok(value),
+            Value::Integer(value) => Ok(*value),
             other => Err(ModuleVmError::TypeMismatch {
                 expected: "integer",
                 actual: self.kind(other),
@@ -1007,13 +1032,13 @@ impl<'a> ModuleVm<'a> {
         }
     }
 
-    fn operands<const N: usize>(&self) -> Result<[Value; N], ModuleVmError> {
+    fn operands<const N: usize>(&self) -> Result<[&Value; N], ModuleVmError> {
         let stack = &self.frames.last().expect("running VM has a frame").stack;
         let start = stack
             .len()
             .checked_sub(N)
             .ok_or(ModuleVmError::OperandStackUnderflow)?;
-        Ok(stack[start..].try_into().expect("slice length checked"))
+        Ok(std::array::from_fn(|index| &stack[start + index]))
     }
 
     fn replace_operands(&mut self, count: usize, result: Value) {
@@ -1023,9 +1048,13 @@ impl<'a> ModuleVm<'a> {
         frame.ip += 1;
     }
 
-    fn object(&self, value: Value, expected: &'static str) -> Result<&HeapObject, ModuleVmError> {
+    fn object<'b>(
+        &self,
+        value: &'b Value,
+        expected: &'static str,
+    ) -> Result<&'b HeapData, ModuleVmError> {
         match value {
-            Value::Heap(index) => self.heap.get(index).ok_or(ModuleVmError::InvalidReference),
+            Value::Heap(reference) => Ok(&reference.0.data),
             other => Err(ModuleVmError::TypeMismatch {
                 expected,
                 actual: self.kind(other),
@@ -1033,9 +1062,9 @@ impl<'a> ModuleVm<'a> {
         }
     }
 
-    fn text(&self, value: Value) -> Result<&str, ModuleVmError> {
+    fn text<'b>(&self, value: &'b Value) -> Result<&'b str, ModuleVmError> {
         match self.object(value, "text")? {
-            HeapObject::Text(text) => Ok(text),
+            HeapData::Text(text) => Ok(text),
             _ => Err(ModuleVmError::TypeMismatch {
                 expected: "text",
                 actual: self.kind(value),
@@ -1043,9 +1072,9 @@ impl<'a> ModuleVm<'a> {
         }
     }
 
-    fn list(&self, value: Value) -> Result<&[Value], ModuleVmError> {
+    fn list<'b>(&self, value: &'b Value) -> Result<&'b [Value], ModuleVmError> {
         match self.object(value, "list")? {
-            HeapObject::List(items) => Ok(items),
+            HeapData::List(items) => Ok(items),
             _ => Err(ModuleVmError::TypeMismatch {
                 expected: "list",
                 actual: self.kind(value),
@@ -1053,9 +1082,9 @@ impl<'a> ModuleVm<'a> {
         }
     }
 
-    fn map(&self, value: Value) -> Result<&BTreeMap<String, Value>, ModuleVmError> {
+    fn map<'b>(&self, value: &'b Value) -> Result<&'b BTreeMap<String, Value>, ModuleVmError> {
         match self.object(value, "map")? {
-            HeapObject::Map(entries) => Ok(entries),
+            HeapData::Map(entries) => Ok(entries),
             _ => Err(ModuleVmError::TypeMismatch {
                 expected: "map",
                 actual: self.kind(value),
@@ -1063,7 +1092,7 @@ impl<'a> ModuleVm<'a> {
         }
     }
 
-    fn new_collection(&mut self, object: HeapObject) -> Result<(), ModuleVmError> {
+    fn new_collection(&mut self, object: HeapData) -> Result<(), ModuleVmError> {
         self.check_push()?;
         self.reserve_heap(HEAP_OBJECT_CHARGE)?;
         let value = self.allocate(object, HEAP_OBJECT_CHARGE, 0);
@@ -1093,8 +1122,8 @@ impl<'a> ModuleVm<'a> {
         }
         let mut new_items = Vec::with_capacity(count);
         new_items.extend_from_slice(items);
-        new_items.push(value);
-        let result = self.allocate(HeapObject::List(new_items), charge, depth);
+        new_items.push(value.clone());
+        let result = self.allocate(HeapData::List(new_items), charge, depth);
         self.replace_operands(2, result);
         Ok(())
     }
@@ -1103,10 +1132,11 @@ impl<'a> ModuleVm<'a> {
         let [list, index] = self.operands::<2>()?;
         let index =
             usize::try_from(self.integer(index)?).map_err(|_| ModuleVmError::IndexOutOfBounds)?;
-        let value = *self
+        let value = self
             .list(list)?
             .get(index)
-            .ok_or(ModuleVmError::IndexOutOfBounds)?;
+            .ok_or(ModuleVmError::IndexOutOfBounds)?
+            .clone();
         self.replace_operands(2, value);
         Ok(())
     }
@@ -1132,18 +1162,18 @@ impl<'a> ModuleVm<'a> {
         let [map, key, value] = self.operands::<3>()?;
         let key = self.text(key)?.to_owned();
         let mut entries = self.map(map)?.clone();
-        entries.insert(key, value);
+        entries.insert(key, value.clone());
         let charge = Self::map_charge(&entries)?;
         self.reserve_heap(charge)?;
         let depth = entries
             .values()
-            .map(|value| self.value_depth(*value) + 1)
+            .map(|value| self.value_depth(value) + 1)
             .max()
             .unwrap_or(0);
         if depth > MAX_VALUE_DEPTH {
             return Err(ModuleVmError::ValueDepthLimit);
         }
-        let result = self.allocate(HeapObject::Map(entries), charge, depth);
+        let result = self.allocate(HeapData::Map(entries), charge, depth);
         self.replace_operands(3, result);
         Ok(())
     }
@@ -1151,7 +1181,11 @@ impl<'a> ModuleVm<'a> {
     fn map_get(&mut self) -> Result<(), ModuleVmError> {
         let [map, key] = self.operands::<2>()?;
         let key = self.text(key)?;
-        let value = *self.map(map)?.get(key).ok_or(ModuleVmError::MissingKey)?;
+        let value = self
+            .map(map)?
+            .get(key)
+            .ok_or(ModuleVmError::MissingKey)?
+            .clone();
         self.replace_operands(2, value);
         Ok(())
     }
@@ -1495,12 +1529,11 @@ mod tests {
                 ),
             ),
         ]));
-        let mut first =
-            ModuleVm::with_inputs(&program, vec![records.clone()], 2 * 1024 * 1024).unwrap();
+        let mut first = ModuleVm::with_inputs(&program, vec![records.clone()], 128 * 1024).unwrap();
         let result = first.run().unwrap();
         assert_eq!(first.resolve(result), Ok(expected.clone()));
-        assert!(first.heap_bytes() <= 2 * 1024 * 1024);
-        let mut second = ModuleVm::with_inputs(&program, vec![records], 2 * 1024 * 1024).unwrap();
+        assert!(first.heap_bytes() <= 128 * 1024);
+        let mut second = ModuleVm::with_inputs(&program, vec![records], 128 * 1024).unwrap();
         let result = second.run().unwrap();
         assert_eq!(second.resolve(result), Ok(expected));
         assert_eq!(first.steps(), second.steps());
@@ -1593,6 +1626,46 @@ mod tests {
         let result = vm.run().unwrap();
         assert_eq!(vm.resolve(result), Ok(value));
         assert!(vm.heap_bytes() > 0);
+    }
+
+    #[test]
+    fn releases_unreferenced_values_but_keeps_debugger_values_live() {
+        let program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(
+                0,
+                1,
+                vec![
+                    Op::ConstValue(0),
+                    Op::LocalSet(0),
+                    Op::ConstValue(1),
+                    Op::LocalSet(0),
+                    Op::Const(0),
+                    Op::Return,
+                ],
+            )],
+            0,
+            vec![
+                OwnedValue::Text("first".into()),
+                OwnedValue::Text("second".into()),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut vm = ModuleVm::new(&program);
+        vm.step().unwrap();
+        vm.step().unwrap();
+        let snapshot = vm.frames();
+        let first_charge = vm.heap_bytes();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert!(vm.heap_bytes() > first_charge);
+        assert_eq!(
+            vm.resolve(snapshot[0].locals[0].clone().unwrap()),
+            Ok(OwnedValue::Text("first".into()))
+        );
+        drop(snapshot);
+        assert_eq!(vm.heap_bytes(), HEAP_OBJECT_CHARGE + "second".len());
     }
 
     #[test]
