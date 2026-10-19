@@ -239,8 +239,9 @@ before-and-after benchmark numbers.
 1. ~~`edit_file`: replace one exact, unique string (or a list of them) and
    return a short diff; same approval and path rules as `write_file`~~.
    `replace_all` covers repeated strings; `write_file` rules also govern it.
-2. `read_file` with line ranges and line numbers; a `glob` tool; `search`
-   that skips `.gitignore`d and binary files and caps results.
+2. `read_file` with line ranges and line numbers (done: `offset`/`limit`
+   return numbered lines and reach into files up to 16 MB); a `glob` tool;
+   `search` that skips `.gitignore`d and binary files and caps results.
 3. Parallel tool calls: accept several calls per step; run read-only tools
    concurrently and guarded tools in order.
 4. ~~Budgets instead of a step count: default about 50 steps per turn with a

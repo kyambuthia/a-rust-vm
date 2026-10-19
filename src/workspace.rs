@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::{
     PermissionRequest, Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ensure_arguments,
-    optional_flag, optional_text, required_text, required_text_allow_empty,
+    optional_flag, optional_positive, optional_text, required_text, required_text_allow_empty,
 };
 
 fn sanitize_permission_component(value: &str) -> String {
@@ -337,17 +337,34 @@ impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "read_file",
-            "Read a bounded text file from the workspace.",
-            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+            "Read a UTF-8 text file from the workspace. Without offset or limit the whole \
+             file is returned as is (up to 128 KB). With offset (first line, 1-based) and/or \
+             limit (line count) the lines come numbered, which suits large files; the \
+             numbers are not part of the file.",
+            r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"]}"#,
         )
     }
 
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
-        ensure_arguments(arguments, &["path"])?;
+        ensure_arguments(arguments, &["path", "offset", "limit"])?;
         let requested = required_text(arguments, "path")?;
+        let offset = optional_positive(arguments, "offset")?;
+        let limit = optional_positive(arguments, "limit")?;
         let workspace = self.workspace.borrow();
         let path = workspace.resolve(requested, false)?;
-        read_bounded_text(&path, requested)
+        if offset.is_none() && limit.is_none() {
+            return read_bounded_text(&path, requested).map_err(|error| {
+                if error.message.contains("byte limit") {
+                    ToolError::new(format!(
+                        "{}; read it in parts with offset and limit",
+                        error.message
+                    ))
+                } else {
+                    error
+                }
+            });
+        }
+        read_line_range(&path, requested, offset.unwrap_or(1), limit)
     }
 }
 
@@ -553,6 +570,79 @@ fn read_bounded_text(path: &Path, requested: &str) -> Result<String, ToolError> 
         .map_err(|error| ToolError::new(format!("cannot read '{requested}': {error}")))?;
     String::from_utf8(bytes)
         .map_err(|_| ToolError::new(format!("file is not valid UTF-8: {requested}")))
+}
+
+/// Largest file `read_file` will scan for a line range.
+const MAX_RANGE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Lines returned for a range when no limit is given.
+const DEFAULT_RANGE_LINES: usize = 2_000;
+/// Longest line shown in a numbered range before it is cut.
+const MAX_RANGE_LINE_CHARS: usize = 2_000;
+
+/// Numbered lines `first..first + limit` of a text file, bounded in size.
+fn read_line_range(
+    path: &Path,
+    requested: &str,
+    first: usize,
+    limit: Option<usize>,
+) -> Result<String, ToolError> {
+    use std::io::BufRead;
+    let metadata = fs::metadata(path)
+        .map_err(|error| ToolError::new(format!("cannot inspect '{requested}': {error}")))?;
+    if !metadata.is_file() {
+        return Err(ToolError::new(format!("not a file: {requested}")));
+    }
+    if metadata.len() > MAX_RANGE_FILE_BYTES {
+        return Err(ToolError::new(format!(
+            "file exceeds the {MAX_RANGE_FILE_BYTES} byte limit for ranged reads: {requested}"
+        )));
+    }
+    let file = fs::File::open(path)
+        .map_err(|error| ToolError::new(format!("cannot read '{requested}': {error}")))?;
+    let limit = limit.unwrap_or(DEFAULT_RANGE_LINES);
+    let mut output = String::new();
+    let mut total = 0usize;
+    let mut shown = 0usize;
+    let mut cut_short = false;
+    for line in std::io::BufReader::new(file).split(b'\n') {
+        let line =
+            line.map_err(|error| ToolError::new(format!("cannot read '{requested}': {error}")))?;
+        total += 1;
+        if total < first || shown >= limit || cut_short {
+            continue;
+        }
+        let text = String::from_utf8(line)
+            .map_err(|_| ToolError::new(format!("file is not valid UTF-8: {requested}")))?;
+        let text = text.strip_suffix('\r').unwrap_or(&text);
+        let entry = match text.char_indices().nth(MAX_RANGE_LINE_CHARS) {
+            Some((end, _)) => format!("{total:>6}\t{}... [line cut]\n", &text[..end]),
+            None => format!("{total:>6}\t{text}\n"),
+        };
+        if output.len() + entry.len() > MAX_FILE_BYTES {
+            cut_short = true;
+            continue;
+        }
+        output.push_str(&entry);
+        shown += 1;
+    }
+    if first > total.max(1) {
+        return Err(ToolError::new(format!(
+            "offset {first} is past the end of {requested} ({total} lines)"
+        )));
+    }
+    let last = first + shown.saturating_sub(1);
+    if shown == 0 {
+        output.push_str("(no lines)\n");
+    }
+    if last < total {
+        output.push_str(&format!(
+            "[lines {first}-{last} of {total}; continue with offset {}]",
+            last + 1
+        ));
+    } else {
+        output.push_str(&format!("[end of file, {total} lines]"));
+    }
+    Ok(output)
 }
 
 /// The 1-based line on which byte offset `index` falls.
@@ -974,6 +1064,68 @@ mod tests {
             arguments.insert("replace_all".to_owned(), ToolValue::Boolean(flag));
         }
         registry.execute(&ToolCall::new("edit-1", "edit_file", arguments))
+    }
+
+    fn read(
+        registry: &mut crate::agent::ToolRegistry,
+        path: &str,
+        offset: Option<i32>,
+        limit: Option<i32>,
+    ) -> crate::agent::ToolResult {
+        let mut arguments: ToolArguments = [("path".to_owned(), ToolValue::Text(path.to_owned()))]
+            .into_iter()
+            .collect();
+        if let Some(offset) = offset {
+            arguments.insert("offset".to_owned(), ToolValue::Integer(offset));
+        }
+        if let Some(limit) = limit {
+            arguments.insert("limit".to_owned(), ToolValue::Integer(limit));
+        }
+        registry.execute(&ToolCall::new("read-1", "read_file", arguments))
+    }
+
+    #[test]
+    fn read_file_returns_numbered_line_ranges() {
+        let root = test_root("read-range");
+        std::fs::write(root.join("a.txt"), "one\ntwo\r\nthree\nfour\n").unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+
+        let middle = read(&mut registry, "a.txt", Some(2), Some(2));
+        assert!(!middle.is_error, "{}", middle.content);
+        assert_eq!(
+            middle.content,
+            "     2\ttwo\n     3\tthree\n[lines 2-3 of 4; continue with offset 4]"
+        );
+        let tail = read(&mut registry, "a.txt", Some(4), None);
+        assert_eq!(tail.content, "     4\tfour\n[end of file, 4 lines]");
+        let past = read(&mut registry, "a.txt", Some(9), None);
+        assert!(past.is_error && past.content.contains("past the end"));
+        let zero = read(&mut registry, "a.txt", Some(0), None);
+        assert!(zero.is_error, "{}", zero.content);
+        // Without a range the file comes back unchanged.
+        let whole = read(&mut registry, "a.txt", None, None);
+        assert_eq!(whole.content, "one\ntwo\r\nthree\nfour\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_ranges_reach_into_large_files() {
+        let root = test_root("read-large");
+        let big = (1..=40_000)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>();
+        assert!(big.len() > super::MAX_FILE_BYTES);
+        std::fs::write(root.join("big.log"), &big).unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+
+        let whole = read(&mut registry, "big.log", None, None);
+        assert!(whole.is_error && whole.content.contains("offset and limit"));
+        let part = read(&mut registry, "big.log", Some(39_999), Some(5));
+        assert_eq!(
+            part.content,
+            " 39999\tline 39999\n 40000\tline 40000\n[end of file, 40000 lines]"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

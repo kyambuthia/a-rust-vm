@@ -171,6 +171,20 @@ pub(crate) fn optional_flag(arguments: &ToolArguments, name: &str) -> Result<boo
     }
 }
 
+/// Reads an optional positive integer argument.
+pub(crate) fn optional_positive(
+    arguments: &ToolArguments,
+    name: &str,
+) -> Result<Option<usize>, ToolError> {
+    match arguments.get(name) {
+        None => Ok(None),
+        Some(ToolValue::Integer(value)) if *value >= 1 => Ok(Some(*value as usize)),
+        Some(_) => Err(ToolError::new(format!(
+            "argument '{name}' must be a positive integer"
+        ))),
+    }
+}
+
 /// Rejects arguments outside `allowed` so typos fail instead of being ignored.
 pub(crate) fn ensure_arguments(
     arguments: &ToolArguments,

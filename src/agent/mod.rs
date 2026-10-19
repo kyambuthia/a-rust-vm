@@ -34,7 +34,8 @@ pub use subagent::{
 };
 pub use tools::{Tool, ToolError, ToolRegistry};
 pub(crate) use tools::{
-    ensure_arguments, optional_flag, optional_text, required_text, required_text_allow_empty,
+    ensure_arguments, optional_flag, optional_positive, optional_text, required_text,
+    required_text_allow_empty,
 };
 pub use turn::{Agent, AgentError};
 use turn::{DEFAULT_CONTEXT_CHARS, DEFAULT_CONTEXT_MESSAGES};
