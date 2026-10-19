@@ -305,6 +305,43 @@ fn resume_rejects_changed_session_and_in_flight_task() {
 }
 
 #[test]
+fn crash_after_a_tool_effect_refuses_automatic_replay() {
+    let fixture = Fixture::new("task-crash");
+    let call = tool_call(
+        "write-1",
+        "run_command",
+        serde_json::json!({"command": "printf 'once\\n' >> effect.txt; sleep 2"}),
+    );
+    let model = fixture.model(&[&call], "done");
+    let mut child = fixture
+        .command(&model, &["ask", "--auto", "--task", "task-1", "go"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let effect = fixture.workspace().join("effect.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs::read_to_string(&effect).ok().as_deref() != Some("once\n") && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let observed = fs::read_to_string(&effect).ok().as_deref() == Some("once\n");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(observed, "tool effect was not observed before the deadline");
+    assert_eq!(fixture.read("effect.txt"), "once\n");
+
+    let task: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/tasks/task-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(task["status"], "running");
+    assert!(!fixture.root.join("state/sessions/task-1.json").exists());
+    let retry = fixture.ask(&model, &["--task", "task-1", "retry"]);
+    assert_eq!(retry.status.code(), Some(2));
+    assert_eq!(fixture.read("effect.txt"), "once\n");
+}
+
+#[test]
 fn edit_file_with_auto_changes_the_file_and_records_the_session() {
     let fixture = Fixture::new("edit");
     fixture.write("a.txt", "say hello\n");
