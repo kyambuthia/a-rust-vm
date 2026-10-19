@@ -3,9 +3,9 @@
 //! The legacy assembly VM remains available through crate::program. A module
 //! is validated as a whole before its instructions can be executed.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt, mem::size_of};
 
-pub const MODULE_VERSION: u16 = 1;
+pub const MODULE_VERSION: u16 = 2;
 pub const MAX_FUNCTIONS: usize = 1_024;
 pub const MAX_MODULE_INSTRUCTIONS: usize = 65_536;
 pub const MAX_LOCALS_PER_FUNCTION: usize = 256;
@@ -14,11 +14,94 @@ pub const MAX_CALL_FRAMES: usize = 128;
 pub const MAX_LIVE_SLOTS: usize = 16_384;
 pub const MAX_MODULE_STEPS: usize = 1_000_000;
 pub const MAX_MODULE_VALIDATION_VISITS: usize = 1_000_000;
+pub const MAX_MODULE_CONSTANT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MODULE_CONSTANTS: usize = 65_536;
+pub const MAX_MODULE_HEAP_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_VALUE_DEPTH: usize = 64;
+// Deterministic logical charges. They cover payloads and conservative object
+// overhead, but are not a measurement of the host allocator's resident memory.
+const HEAP_OBJECT_CHARGE: usize = size_of::<HeapObject>();
+const MAP_ENTRY_CHARGE: usize = size_of::<String>() + size_of::<Value>() + 4 * size_of::<usize>();
+
+/// An owned value at the module boundary. Collections are ordered by key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+    List(Vec<OwnedValue>),
+    Map(BTreeMap<String, OwnedValue>),
+}
+
+/// A cheap VM value. Heap references belong to the VM that produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Heap(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeapObject {
+    Text(String),
+    Bytes(Vec<u8>),
+    List(Vec<Value>),
+    Map(BTreeMap<String, Value>),
+}
+
+fn value_charge(value: &OwnedValue, depth: usize) -> Result<usize, ModuleVmError> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(ModuleVmError::ValueDepthLimit);
+    }
+    match value {
+        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Integer(_) => Ok(0),
+        OwnedValue::Text(text) => HEAP_OBJECT_CHARGE
+            .checked_add(text.len())
+            .ok_or(ModuleVmError::HeapLimit),
+        OwnedValue::Bytes(bytes) => HEAP_OBJECT_CHARGE
+            .checked_add(bytes.len())
+            .ok_or(ModuleVmError::HeapLimit),
+        OwnedValue::List(items) => {
+            let mut total = HEAP_OBJECT_CHARGE
+                .checked_add(
+                    items
+                        .len()
+                        .checked_mul(size_of::<Value>())
+                        .ok_or(ModuleVmError::HeapLimit)?,
+                )
+                .ok_or(ModuleVmError::HeapLimit)?;
+            for item in items {
+                total = total
+                    .checked_add(value_charge(item, depth + 1)?)
+                    .ok_or(ModuleVmError::HeapLimit)?;
+            }
+            Ok(total)
+        }
+        OwnedValue::Map(entries) => {
+            let mut total = HEAP_OBJECT_CHARGE;
+            for (key, item) in entries {
+                total = total
+                    .checked_add(MAP_ENTRY_CHARGE)
+                    .and_then(|charge| charge.checked_add(key.len()))
+                    .ok_or(ModuleVmError::HeapLimit)?;
+                total = total
+                    .checked_add(value_charge(item, depth + 1)?)
+                    .ok_or(ModuleVmError::HeapLimit)?;
+            }
+            Ok(total)
+        }
+    }
+}
 
 /// An instruction in a validated module function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Const(i64),
+    ConstValue(usize),
+    Input(usize),
     LocalGet(usize),
     LocalSet(usize),
     Add,
@@ -27,6 +110,13 @@ pub enum Op {
     Div,
     Eq,
     Lt,
+    ListNew,
+    ListPush,
+    ListGet,
+    ListLen,
+    MapNew,
+    MapInsert,
+    MapGet,
     Jump(usize),
     JumpIfZero(usize),
     Call(usize),
@@ -69,6 +159,8 @@ pub struct Module {
     version: u16,
     functions: Vec<Function>,
     entry: usize,
+    constants: Vec<OwnedValue>,
+    input_count: usize,
     max_operand_stack: Vec<usize>,
 }
 
@@ -113,6 +205,16 @@ impl std::error::Error for ModuleError {}
 
 impl Module {
     pub fn new(version: u16, functions: Vec<Function>, entry: usize) -> Result<Self, ModuleError> {
+        Self::with_values(version, functions, entry, vec![], 0)
+    }
+
+    pub fn with_values(
+        version: u16,
+        functions: Vec<Function>,
+        entry: usize,
+        constants: Vec<OwnedValue>,
+        input_count: usize,
+    ) -> Result<Self, ModuleError> {
         if version != MODULE_VERSION {
             return Err(ModuleError::new(
                 None,
@@ -140,6 +242,26 @@ impl Module {
                 None,
                 "entry function must have no parameters",
             ));
+        }
+        if input_count > MAX_LOCALS_PER_FUNCTION {
+            return Err(ModuleError::new(None, None, "too many inputs"));
+        }
+        if constants.len() > MAX_MODULE_CONSTANTS {
+            return Err(ModuleError::new(None, None, "too many constants"));
+        }
+        let mut constant_bytes = 0usize;
+        for (index, value) in constants.iter().enumerate() {
+            let charge = value_charge(value, 0).map_err(|error| {
+                ModuleError::new(None, None, format!("constant {index}: {error}"))
+            })?;
+            constant_bytes = constant_bytes.saturating_add(charge);
+            if constant_bytes > MAX_MODULE_CONSTANT_BYTES {
+                return Err(ModuleError::new(
+                    None,
+                    None,
+                    "module constant limit exceeded",
+                ));
+            }
         }
         let mut total_instructions = 0usize;
         for (function_index, function) in functions.iter().enumerate() {
@@ -178,6 +300,20 @@ impl Module {
             }
             for (ip, op) in function.code.iter().enumerate() {
                 match op {
+                    Op::ConstValue(index) if *index >= constants.len() => {
+                        return Err(ModuleError::new(
+                            Some(function_index),
+                            Some(ip),
+                            format!("constant {index} is missing"),
+                        ));
+                    }
+                    Op::Input(index) if *index >= input_count => {
+                        return Err(ModuleError::new(
+                            Some(function_index),
+                            Some(ip),
+                            format!("input {index} is missing"),
+                        ));
+                    }
                     Op::LocalGet(slot) | Op::LocalSet(slot) if *slot >= function.local_count => {
                         return Err(ModuleError::new(
                             Some(function_index),
@@ -215,6 +351,8 @@ impl Module {
             version,
             functions,
             entry,
+            constants,
+            input_count,
             max_operand_stack,
         })
     }
@@ -229,6 +367,14 @@ impl Module {
 
     pub fn entry(&self) -> usize {
         self.entry
+    }
+
+    pub fn constants(&self) -> &[OwnedValue] {
+        &self.constants
+    }
+
+    pub fn input_count(&self) -> usize {
+        self.input_count
     }
 
     pub fn max_operand_stack(&self, function: usize) -> Option<usize> {
@@ -305,9 +451,24 @@ fn validate_function(
         states[ip] = Some((depth, merged));
         let op = function.code[ip];
         let required = match op {
-            Op::Const(_) | Op::LocalGet(_) | Op::Jump(_) => 0,
-            Op::LocalSet(_) | Op::JumpIfZero(_) | Op::Return => 1,
-            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Eq | Op::Lt => 2,
+            Op::Const(_)
+            | Op::ConstValue(_)
+            | Op::Input(_)
+            | Op::LocalGet(_)
+            | Op::Jump(_)
+            | Op::ListNew
+            | Op::MapNew => 0,
+            Op::LocalSet(_) | Op::JumpIfZero(_) | Op::Return | Op::ListLen => 1,
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Eq
+            | Op::Lt
+            | Op::ListPush
+            | Op::ListGet
+            | Op::MapGet => 2,
+            Op::MapInsert => 3,
             Op::Call(target) => functions[target].arity,
         };
         if depth < required {
@@ -334,9 +495,24 @@ fn validate_function(
             ));
         }
         let next_depth = match op {
-            Op::Const(_) | Op::LocalGet(_) => depth + 1,
+            Op::Const(_)
+            | Op::ConstValue(_)
+            | Op::Input(_)
+            | Op::LocalGet(_)
+            | Op::ListNew
+            | Op::MapNew => depth + 1,
             Op::LocalSet(_) | Op::JumpIfZero(_) => depth - 1,
-            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Eq | Op::Lt => depth - 1,
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Eq
+            | Op::Lt
+            | Op::ListPush
+            | Op::ListGet
+            | Op::MapGet => depth - 1,
+            Op::MapInsert => depth - 2,
+            Op::ListLen => depth,
             Op::Call(_) => depth - required + 1,
             Op::Jump(_) | Op::Return => depth,
         };
@@ -372,6 +548,17 @@ pub enum ModuleVmError {
     UninitializedLocal,
     DivisionByZero,
     IntegerOverflow,
+    TypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+    MissingInput,
+    InputCountMismatch,
+    MissingKey,
+    IndexOutOfBounds,
+    InvalidReference,
+    ValueDepthLimit,
+    HeapLimit,
     OperandStackLimit,
     CallFrameLimit,
     LiveSlotLimit,
@@ -391,15 +578,15 @@ pub struct ModuleStep {
     pub function: usize,
     pub instruction_pointer: usize,
     pub instruction: Op,
-    pub result: Option<i64>,
+    pub result: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
     function: usize,
     ip: usize,
-    locals: Vec<Option<i64>>,
-    stack: Vec<i64>,
+    locals: Vec<Option<Value>>,
+    stack: Vec<Value>,
 }
 
 /// An owned debugger view of one call frame.
@@ -407,8 +594,8 @@ struct Frame {
 pub struct FrameSnapshot {
     pub function: usize,
     pub instruction_pointer: usize,
-    pub locals: Vec<Option<i64>>,
-    pub stack: Vec<i64>,
+    pub locals: Vec<Option<Value>>,
+    pub stack: Vec<Value>,
 }
 
 /// A stepwise, bounded executor for a validated module.
@@ -417,7 +604,12 @@ pub struct ModuleVm<'a> {
     module: &'a Module,
     frames: Vec<Frame>,
     steps: usize,
-    result: Option<i64>,
+    result: Option<Value>,
+    inputs: Vec<Value>,
+    heap: Vec<HeapObject>,
+    heap_depths: Vec<usize>,
+    heap_bytes: usize,
+    heap_limit: usize,
 }
 
 impl<'a> ModuleVm<'a> {
@@ -433,11 +625,158 @@ impl<'a> ModuleVm<'a> {
             }],
             steps: 0,
             result: None,
+            inputs: Vec::new(),
+            heap: Vec::new(),
+            heap_depths: Vec::new(),
+            heap_bytes: 0,
+            heap_limit: MAX_MODULE_HEAP_BYTES,
         }
     }
 
-    pub fn result(&self) -> Option<i64> {
+    /// Imports inputs into a bounded heap before execution begins.
+    pub fn with_inputs(
+        module: &'a Module,
+        inputs: Vec<OwnedValue>,
+        heap_limit: usize,
+    ) -> Result<Self, ModuleVmError> {
+        if inputs.len() != module.input_count {
+            return Err(ModuleVmError::InputCountMismatch);
+        }
+        if heap_limit > MAX_MODULE_HEAP_BYTES {
+            return Err(ModuleVmError::HeapLimit);
+        }
+        let mut vm = Self::new(module);
+        vm.heap_limit = heap_limit;
+        let mut charge = 0usize;
+        for input in &inputs {
+            charge = charge
+                .checked_add(value_charge(input, 0)?)
+                .ok_or(ModuleVmError::HeapLimit)?;
+        }
+        vm.reserve_heap(charge)?;
+        for input in &inputs {
+            let value = vm.import(input);
+            vm.inputs.push(value);
+        }
+        Ok(vm)
+    }
+
+    pub fn result(&self) -> Option<Value> {
         self.result
+    }
+
+    /// Guest heap charge, including objects that are no longer referenced.
+    pub fn heap_bytes(&self) -> usize {
+        self.heap_bytes
+    }
+
+    pub fn resolve(&self, value: Value) -> Result<OwnedValue, ModuleVmError> {
+        self.resolve_at(value, 0)
+    }
+
+    fn resolve_at(&self, value: Value, depth: usize) -> Result<OwnedValue, ModuleVmError> {
+        if depth > MAX_VALUE_DEPTH {
+            return Err(ModuleVmError::ValueDepthLimit);
+        }
+        match value {
+            Value::Null => Ok(OwnedValue::Null),
+            Value::Bool(value) => Ok(OwnedValue::Bool(value)),
+            Value::Integer(value) => Ok(OwnedValue::Integer(value)),
+            Value::Heap(index) => match self
+                .heap
+                .get(index)
+                .ok_or(ModuleVmError::InvalidReference)?
+            {
+                HeapObject::Text(text) => Ok(OwnedValue::Text(text.clone())),
+                HeapObject::Bytes(bytes) => Ok(OwnedValue::Bytes(bytes.clone())),
+                HeapObject::List(items) => items
+                    .iter()
+                    .map(|item| self.resolve_at(*item, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(OwnedValue::List),
+                HeapObject::Map(entries) => entries
+                    .iter()
+                    .map(|(key, item)| Ok((key.clone(), self.resolve_at(*item, depth + 1)?)))
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+                    .map(OwnedValue::Map),
+            },
+        }
+    }
+
+    fn reserve_heap(&self, charge: usize) -> Result<(), ModuleVmError> {
+        if self
+            .heap_bytes
+            .checked_add(charge)
+            .is_none_or(|total| total > self.heap_limit)
+        {
+            return Err(ModuleVmError::HeapLimit);
+        }
+        Ok(())
+    }
+
+    fn allocate(&mut self, object: HeapObject, charge: usize, depth: usize) -> Value {
+        let index = self.heap.len();
+        self.heap.push(object);
+        self.heap_depths.push(depth);
+        self.heap_bytes += charge;
+        Value::Heap(index)
+    }
+
+    fn value_depth(&self, value: Value) -> usize {
+        match value {
+            Value::Heap(index) => self.heap_depths[index],
+            _ => 0,
+        }
+    }
+
+    // The entire tree is preflighted by the caller. Immutable heap edges point
+    // only to earlier objects, so collections cannot form cycles.
+    fn import(&mut self, value: &OwnedValue) -> Value {
+        match value {
+            OwnedValue::Null => Value::Null,
+            OwnedValue::Bool(value) => Value::Bool(*value),
+            OwnedValue::Integer(value) => Value::Integer(*value),
+            OwnedValue::Text(text) => self.allocate(
+                HeapObject::Text(text.clone()),
+                HEAP_OBJECT_CHARGE + text.len(),
+                0,
+            ),
+            OwnedValue::Bytes(bytes) => self.allocate(
+                HeapObject::Bytes(bytes.clone()),
+                HEAP_OBJECT_CHARGE + bytes.len(),
+                0,
+            ),
+            OwnedValue::List(items) => {
+                let values: Vec<_> = items.iter().map(|item| self.import(item)).collect();
+                let depth = values
+                    .iter()
+                    .map(|value| self.value_depth(*value) + 1)
+                    .max()
+                    .unwrap_or(0);
+                self.allocate(
+                    HeapObject::List(values),
+                    HEAP_OBJECT_CHARGE + items.len() * size_of::<Value>(),
+                    depth,
+                )
+            }
+            OwnedValue::Map(entries) => {
+                let values: BTreeMap<_, _> = entries
+                    .iter()
+                    .map(|(key, item)| (key.clone(), self.import(item)))
+                    .collect();
+                let depth = values
+                    .values()
+                    .map(|value| self.value_depth(*value) + 1)
+                    .max()
+                    .unwrap_or(0);
+                let charge = HEAP_OBJECT_CHARGE
+                    + entries
+                        .keys()
+                        .map(|key| MAP_ENTRY_CHARGE + key.len())
+                        .sum::<usize>();
+                self.allocate(HeapObject::Map(values), charge, depth)
+            }
+        }
     }
 
     pub fn steps(&self) -> usize {
@@ -460,7 +799,7 @@ impl<'a> ModuleVm<'a> {
             .collect()
     }
 
-    pub fn run(&mut self) -> Result<i64, ModuleVmError> {
+    pub fn run(&mut self) -> Result<Value, ModuleVmError> {
         while self.result.is_none() {
             self.step()?;
         }
@@ -481,6 +820,20 @@ impl<'a> ModuleVm<'a> {
         match instruction {
             Op::Const(value) => {
                 self.check_push()?;
+                self.frames[frame_index].stack.push(Value::Integer(value));
+                self.frames[frame_index].ip += 1;
+            }
+            Op::ConstValue(index) => {
+                self.check_push()?;
+                let constant = &self.module.constants[index];
+                self.reserve_heap(value_charge(constant, 0)?)?;
+                let value = self.import(constant);
+                self.frames[frame_index].stack.push(value);
+                self.frames[frame_index].ip += 1;
+            }
+            Op::Input(index) => {
+                self.check_push()?;
+                let value = *self.inputs.get(index).ok_or(ModuleVmError::MissingInput)?;
                 self.frames[frame_index].stack.push(value);
                 self.frames[frame_index].ip += 1;
             }
@@ -501,30 +854,60 @@ impl<'a> ModuleVm<'a> {
                 frame.locals[slot] = Some(value);
                 frame.ip += 1;
             }
-            Op::Add => self.binary(|a, b| a.checked_add(b))?,
-            Op::Sub => self.binary(|a, b| a.checked_sub(b))?,
-            Op::Mul => self.binary(|a, b| a.checked_mul(b))?,
+            Op::Add => self.binary_int(|a, b| a.checked_add(b))?,
+            Op::Sub => self.binary_int(|a, b| a.checked_sub(b))?,
+            Op::Mul => self.binary_int(|a, b| a.checked_mul(b))?,
             Op::Div => {
                 let stack = &self.frames[frame_index].stack;
                 if stack.len() < 2 {
                     return Err(ModuleVmError::OperandStackUnderflow);
                 }
-                if stack[stack.len() - 1] == 0 {
+                if self.integer(stack[stack.len() - 1])? == 0 {
                     return Err(ModuleVmError::DivisionByZero);
                 }
-                self.binary(|a, b| a.checked_div(b))?;
+                self.binary_int(|a, b| a.checked_div(b))?;
             }
-            Op::Eq => self.binary(|a, b| Some(i64::from(a == b)))?,
-            Op::Lt => self.binary(|a, b| Some(i64::from(a < b)))?,
+            Op::Eq => {
+                let [lhs, rhs] = self.operands::<2>()?;
+                if matches!(lhs, Value::Heap(_)) || matches!(rhs, Value::Heap(_)) {
+                    return Err(ModuleVmError::TypeMismatch {
+                        expected: "scalar",
+                        actual: "heap value",
+                    });
+                }
+                self.replace_operands(2, Value::Bool(lhs == rhs));
+            }
+            Op::Lt => {
+                let [lhs, rhs] = self.operands::<2>()?;
+                let value = Value::Bool(self.integer(lhs)? < self.integer(rhs)?);
+                self.replace_operands(2, value);
+            }
+            Op::ListNew => self.new_collection(HeapObject::List(Vec::new()))?,
+            Op::MapNew => self.new_collection(HeapObject::Map(BTreeMap::new()))?,
+            Op::ListPush => self.list_push()?,
+            Op::ListGet => self.list_get()?,
+            Op::ListLen => self.list_len()?,
+            Op::MapInsert => self.map_insert()?,
+            Op::MapGet => self.map_get()?,
             Op::Jump(target) => self.frames[frame_index].ip = target,
             Op::JumpIfZero(target) => {
-                let frame = &mut self.frames[frame_index];
-                let condition = *frame
+                let condition = *self.frames[frame_index]
                     .stack
                     .last()
                     .ok_or(ModuleVmError::OperandStackUnderflow)?;
+                let is_zero = match condition {
+                    Value::Integer(value) => value == 0,
+                    Value::Bool(value) => !value,
+                    _ => {
+                        return Err(ModuleVmError::TypeMismatch {
+                            expected: "integer or bool",
+                            actual: self.kind(condition),
+                        });
+                    }
+                };
+                let frame = &mut self.frames[frame_index];
                 frame.stack.pop();
-                frame.ip = if condition == 0 { target } else { frame.ip + 1 };
+                frame.ip = if is_zero { target } else { frame.ip + 1 };
             }
             Op::Call(target) => {
                 let callee = &self.module.functions[target];
@@ -599,21 +982,188 @@ impl<'a> ModuleVm<'a> {
         Ok(())
     }
 
-    fn binary(
+    fn kind(&self, value: Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Integer(_) => "integer",
+            Value::Heap(index) => match self.heap.get(index) {
+                Some(HeapObject::Text(_)) => "text",
+                Some(HeapObject::Bytes(_)) => "bytes",
+                Some(HeapObject::List(_)) => "list",
+                Some(HeapObject::Map(_)) => "map",
+                None => "invalid reference",
+            },
+        }
+    }
+
+    fn integer(&self, value: Value) -> Result<i64, ModuleVmError> {
+        match value {
+            Value::Integer(value) => Ok(value),
+            other => Err(ModuleVmError::TypeMismatch {
+                expected: "integer",
+                actual: self.kind(other),
+            }),
+        }
+    }
+
+    fn operands<const N: usize>(&self) -> Result<[Value; N], ModuleVmError> {
+        let stack = &self.frames.last().expect("running VM has a frame").stack;
+        let start = stack
+            .len()
+            .checked_sub(N)
+            .ok_or(ModuleVmError::OperandStackUnderflow)?;
+        Ok(stack[start..].try_into().expect("slice length checked"))
+    }
+
+    fn replace_operands(&mut self, count: usize, result: Value) {
+        let frame = self.frames.last_mut().expect("running VM has a frame");
+        frame.stack.truncate(frame.stack.len() - count);
+        frame.stack.push(result);
+        frame.ip += 1;
+    }
+
+    fn object(&self, value: Value, expected: &'static str) -> Result<&HeapObject, ModuleVmError> {
+        match value {
+            Value::Heap(index) => self.heap.get(index).ok_or(ModuleVmError::InvalidReference),
+            other => Err(ModuleVmError::TypeMismatch {
+                expected,
+                actual: self.kind(other),
+            }),
+        }
+    }
+
+    fn text(&self, value: Value) -> Result<&str, ModuleVmError> {
+        match self.object(value, "text")? {
+            HeapObject::Text(text) => Ok(text),
+            _ => Err(ModuleVmError::TypeMismatch {
+                expected: "text",
+                actual: self.kind(value),
+            }),
+        }
+    }
+
+    fn list(&self, value: Value) -> Result<&[Value], ModuleVmError> {
+        match self.object(value, "list")? {
+            HeapObject::List(items) => Ok(items),
+            _ => Err(ModuleVmError::TypeMismatch {
+                expected: "list",
+                actual: self.kind(value),
+            }),
+        }
+    }
+
+    fn map(&self, value: Value) -> Result<&BTreeMap<String, Value>, ModuleVmError> {
+        match self.object(value, "map")? {
+            HeapObject::Map(entries) => Ok(entries),
+            _ => Err(ModuleVmError::TypeMismatch {
+                expected: "map",
+                actual: self.kind(value),
+            }),
+        }
+    }
+
+    fn new_collection(&mut self, object: HeapObject) -> Result<(), ModuleVmError> {
+        self.check_push()?;
+        self.reserve_heap(HEAP_OBJECT_CHARGE)?;
+        let value = self.allocate(object, HEAP_OBJECT_CHARGE, 0);
+        let frame = self.frames.last_mut().expect("running VM has a frame");
+        frame.stack.push(value);
+        frame.ip += 1;
+        Ok(())
+    }
+
+    fn list_push(&mut self) -> Result<(), ModuleVmError> {
+        let [list, value] = self.operands::<2>()?;
+        let items = self.list(list)?;
+        let count = items.len().checked_add(1).ok_or(ModuleVmError::HeapLimit)?;
+        let charge = HEAP_OBJECT_CHARGE
+            .checked_add(
+                count
+                    .checked_mul(size_of::<Value>())
+                    .ok_or(ModuleVmError::HeapLimit)?,
+            )
+            .ok_or(ModuleVmError::HeapLimit)?;
+        self.reserve_heap(charge)?;
+        let depth = self
+            .value_depth(list)
+            .max(self.value_depth(value).saturating_add(1));
+        if depth > MAX_VALUE_DEPTH {
+            return Err(ModuleVmError::ValueDepthLimit);
+        }
+        let mut new_items = Vec::with_capacity(count);
+        new_items.extend_from_slice(items);
+        new_items.push(value);
+        let result = self.allocate(HeapObject::List(new_items), charge, depth);
+        self.replace_operands(2, result);
+        Ok(())
+    }
+
+    fn list_get(&mut self) -> Result<(), ModuleVmError> {
+        let [list, index] = self.operands::<2>()?;
+        let index =
+            usize::try_from(self.integer(index)?).map_err(|_| ModuleVmError::IndexOutOfBounds)?;
+        let value = *self
+            .list(list)?
+            .get(index)
+            .ok_or(ModuleVmError::IndexOutOfBounds)?;
+        self.replace_operands(2, value);
+        Ok(())
+    }
+
+    fn list_len(&mut self) -> Result<(), ModuleVmError> {
+        let [list] = self.operands::<1>()?;
+        let count =
+            i64::try_from(self.list(list)?.len()).map_err(|_| ModuleVmError::IntegerOverflow)?;
+        self.replace_operands(1, Value::Integer(count));
+        Ok(())
+    }
+
+    fn map_charge(entries: &BTreeMap<String, Value>) -> Result<usize, ModuleVmError> {
+        entries.keys().try_fold(HEAP_OBJECT_CHARGE, |total, key| {
+            total
+                .checked_add(MAP_ENTRY_CHARGE)
+                .and_then(|charge| charge.checked_add(key.len()))
+                .ok_or(ModuleVmError::HeapLimit)
+        })
+    }
+
+    fn map_insert(&mut self) -> Result<(), ModuleVmError> {
+        let [map, key, value] = self.operands::<3>()?;
+        let key = self.text(key)?.to_owned();
+        let mut entries = self.map(map)?.clone();
+        entries.insert(key, value);
+        let charge = Self::map_charge(&entries)?;
+        self.reserve_heap(charge)?;
+        let depth = entries
+            .values()
+            .map(|value| self.value_depth(*value) + 1)
+            .max()
+            .unwrap_or(0);
+        if depth > MAX_VALUE_DEPTH {
+            return Err(ModuleVmError::ValueDepthLimit);
+        }
+        let result = self.allocate(HeapObject::Map(entries), charge, depth);
+        self.replace_operands(3, result);
+        Ok(())
+    }
+
+    fn map_get(&mut self) -> Result<(), ModuleVmError> {
+        let [map, key] = self.operands::<2>()?;
+        let key = self.text(key)?;
+        let value = *self.map(map)?.get(key).ok_or(ModuleVmError::MissingKey)?;
+        self.replace_operands(2, value);
+        Ok(())
+    }
+
+    fn binary_int(
         &mut self,
         operation: impl FnOnce(i64, i64) -> Option<i64>,
     ) -> Result<(), ModuleVmError> {
-        let frame = self.frames.last_mut().expect("running VM has a frame");
-        let len = frame.stack.len();
-        if len < 2 {
-            return Err(ModuleVmError::OperandStackUnderflow);
-        }
-        let lhs = frame.stack[len - 2];
-        let rhs = frame.stack[len - 1];
-        let value = operation(lhs, rhs).ok_or(ModuleVmError::IntegerOverflow)?;
-        frame.stack.truncate(len - 2);
-        frame.stack.push(value);
-        frame.ip += 1;
+        let [lhs, rhs] = self.operands::<2>()?;
+        let value = operation(self.integer(lhs)?, self.integer(rhs)?)
+            .ok_or(ModuleVmError::IntegerOverflow)?;
+        self.replace_operands(2, Value::Integer(value));
         Ok(())
     }
 }
@@ -659,9 +1209,9 @@ mod tests {
         assert_eq!(vm.step().unwrap().instruction, Op::Const(5));
         assert_eq!(vm.step().unwrap().instruction, Op::Call(1));
         assert_eq!(vm.frames().len(), 2);
-        assert_eq!(vm.frames()[1].locals, vec![Some(5)]);
-        assert_eq!(vm.run(), Ok(120));
-        assert_eq!(vm.result(), Some(120));
+        assert_eq!(vm.frames()[1].locals, vec![Some(Value::Integer(5))]);
+        assert_eq!(vm.run(), Ok(Value::Integer(120)));
+        assert_eq!(vm.result(), Some(Value::Integer(120)));
         assert_eq!(vm.frame_depth(), 1);
         assert_eq!(vm.step(), Err(ModuleVmError::AlreadyFinished));
     }
@@ -688,7 +1238,7 @@ mod tests {
                 vec![Op::LocalGet(0), Op::Const(2), Op::Mul, Op::Return],
             ),
         ]);
-        assert_eq!(ModuleVm::new(&program).run(), Ok(15));
+        assert_eq!(ModuleVm::new(&program).run(), Ok(Value::Integer(15)));
     }
 
     #[test]
@@ -732,7 +1282,7 @@ mod tests {
                 Op::Return,
             ],
         )]);
-        assert_eq!(ModuleVm::new(&program).run(), Ok(8));
+        assert_eq!(ModuleVm::new(&program).run(), Ok(Value::Integer(8)));
     }
 
     #[test]
@@ -857,5 +1407,241 @@ mod tests {
         let mut visits = 0;
         let error = validate_function(0, &functions[0], &functions, &mut visits).unwrap_err();
         assert!(error.message.contains("visit limit"));
+    }
+
+    #[test]
+    fn transforms_nested_records_with_bounded_memory() {
+        let program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(
+                0,
+                6,
+                vec![
+                    Op::Input(0), // records
+                    Op::LocalSet(0),
+                    Op::Const(0), // index
+                    Op::LocalSet(1),
+                    Op::Const(0), // total
+                    Op::LocalSet(2),
+                    Op::ListNew, // doubled scores
+                    Op::LocalSet(3),
+                    Op::LocalGet(1), // loop condition
+                    Op::LocalGet(0),
+                    Op::ListLen,
+                    Op::Lt,
+                    Op::JumpIfZero(36),
+                    Op::LocalGet(0), // record = records[index]
+                    Op::LocalGet(1),
+                    Op::ListGet,
+                    Op::LocalSet(4),
+                    Op::LocalGet(4), // score = record["score"]
+                    Op::ConstValue(0),
+                    Op::MapGet,
+                    Op::LocalSet(5),
+                    Op::LocalGet(2), // total += score
+                    Op::LocalGet(5),
+                    Op::Add,
+                    Op::LocalSet(2),
+                    Op::LocalGet(3), // doubled.push(score * 2)
+                    Op::LocalGet(5),
+                    Op::Const(2),
+                    Op::Mul,
+                    Op::ListPush,
+                    Op::LocalSet(3),
+                    Op::LocalGet(1), // index += 1
+                    Op::Const(1),
+                    Op::Add,
+                    Op::LocalSet(1),
+                    Op::Jump(8),
+                    Op::MapNew, // result
+                    Op::ConstValue(1),
+                    Op::LocalGet(1),
+                    Op::MapInsert,
+                    Op::ConstValue(2),
+                    Op::LocalGet(2),
+                    Op::MapInsert,
+                    Op::ConstValue(3),
+                    Op::LocalGet(3),
+                    Op::MapInsert,
+                    Op::Return,
+                ],
+            )],
+            0,
+            ["score", "count", "total", "doubled"]
+                .map(|text| OwnedValue::Text(text.into()))
+                .to_vec(),
+            1,
+        )
+        .unwrap();
+        let records = OwnedValue::List(
+            (0..256)
+                .map(|score| {
+                    OwnedValue::Map(BTreeMap::from([(
+                        "score".into(),
+                        OwnedValue::Integer(score),
+                    )]))
+                })
+                .collect(),
+        );
+        let expected = OwnedValue::Map(BTreeMap::from([
+            ("count".into(), OwnedValue::Integer(256)),
+            ("total".into(), OwnedValue::Integer(32_640)),
+            (
+                "doubled".into(),
+                OwnedValue::List(
+                    (0..256)
+                        .map(|score| OwnedValue::Integer(score * 2))
+                        .collect(),
+                ),
+            ),
+        ]));
+        let mut first =
+            ModuleVm::with_inputs(&program, vec![records.clone()], 2 * 1024 * 1024).unwrap();
+        let result = first.run().unwrap();
+        assert_eq!(first.resolve(result), Ok(expected.clone()));
+        assert!(first.heap_bytes() <= 2 * 1024 * 1024);
+        let mut second = ModuleVm::with_inputs(&program, vec![records], 2 * 1024 * 1024).unwrap();
+        let result = second.run().unwrap();
+        assert_eq!(second.resolve(result), Ok(expected));
+        assert_eq!(first.steps(), second.steps());
+        assert_eq!(first.heap_bytes(), second.heap_bytes());
+    }
+
+    #[test]
+    fn typed_and_memory_traps_do_not_change_the_instruction_state() {
+        let program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(
+                0,
+                0,
+                vec![Op::ConstValue(0), Op::Const(1), Op::Add, Op::Return],
+            )],
+            0,
+            vec![OwnedValue::Bool(true)],
+            0,
+        )
+        .unwrap();
+        let mut vm = ModuleVm::new(&program);
+        vm.step().unwrap();
+        vm.step().unwrap();
+        let before = vm.frames();
+        let bytes = vm.heap_bytes();
+        let steps = vm.steps();
+        assert_eq!(
+            vm.step(),
+            Err(ModuleVmError::TypeMismatch {
+                expected: "integer",
+                actual: "bool"
+            })
+        );
+        assert_eq!(vm.frames(), before);
+        assert_eq!(vm.heap_bytes(), bytes);
+        assert_eq!(vm.steps(), steps);
+
+        let program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(0, 0, vec![Op::ConstValue(0), Op::Return])],
+            0,
+            vec![OwnedValue::Text("large".into())],
+            0,
+        )
+        .unwrap();
+        let mut vm = ModuleVm::with_inputs(&program, vec![], HEAP_OBJECT_CHARGE + 4).unwrap();
+        let before = vm.frames();
+        assert_eq!(vm.step(), Err(ModuleVmError::HeapLimit));
+        assert_eq!(vm.frames(), before);
+        assert_eq!(vm.heap_bytes(), 0);
+        assert_eq!(vm.steps(), 0);
+
+        let program = module(vec![function(
+            0,
+            0,
+            vec![Op::ListNew, Op::Const(7), Op::ListPush, Op::Return],
+        )]);
+        let mut vm = ModuleVm::with_inputs(&program, vec![], HEAP_OBJECT_CHARGE).unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        let before = vm.frames();
+        assert_eq!(vm.step(), Err(ModuleVmError::HeapLimit));
+        assert_eq!(vm.frames(), before);
+        assert_eq!(vm.heap_bytes(), HEAP_OBJECT_CHARGE);
+        assert_eq!(vm.steps(), 2);
+    }
+
+    #[test]
+    fn round_trips_boundary_value_types() {
+        let program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(0, 0, vec![Op::Input(0), Op::Return])],
+            0,
+            vec![],
+            1,
+        )
+        .unwrap();
+        let value = OwnedValue::Map(BTreeMap::from([
+            ("null".into(), OwnedValue::Null),
+            ("bool".into(), OwnedValue::Bool(true)),
+            ("integer".into(), OwnedValue::Integer(-9)),
+            ("text".into(), OwnedValue::Text("hello".into())),
+            ("bytes".into(), OwnedValue::Bytes(vec![0, 255])),
+            (
+                "list".into(),
+                OwnedValue::List(vec![OwnedValue::Null, OwnedValue::Bool(false)]),
+            ),
+        ]));
+        let mut vm = ModuleVm::with_inputs(&program, vec![value.clone()], 1_024).unwrap();
+        let result = vm.run().unwrap();
+        assert_eq!(vm.resolve(result), Ok(value));
+        assert!(vm.heap_bytes() > 0);
+    }
+
+    #[test]
+    fn validates_constants_inputs_and_collection_bounds() {
+        let missing = Module::with_values(
+            MODULE_VERSION,
+            vec![function(0, 0, vec![Op::ConstValue(1), Op::Return])],
+            0,
+            vec![OwnedValue::Null],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(missing.instruction, Some(0));
+
+        let program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(
+                0,
+                0,
+                vec![Op::Input(0), Op::Const(-1), Op::ListGet, Op::Return],
+            )],
+            0,
+            vec![],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            ModuleVm::with_inputs(&program, vec![], 128).unwrap_err(),
+            ModuleVmError::InputCountMismatch
+        );
+        let mut vm = ModuleVm::with_inputs(&program, vec![OwnedValue::List(vec![])], 128).unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        let before = vm.frames();
+        assert_eq!(vm.step(), Err(ModuleVmError::IndexOutOfBounds));
+        assert_eq!(vm.frames(), before);
+
+        let mut deep = OwnedValue::Null;
+        for _ in 0..=MAX_VALUE_DEPTH {
+            deep = OwnedValue::List(vec![deep]);
+        }
+        let error = Module::with_values(
+            MODULE_VERSION,
+            vec![function(0, 0, vec![Op::ConstValue(0), Op::Return])],
+            0,
+            vec![deep],
+            0,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("ValueDepthLimit"));
     }
 }
