@@ -732,3 +732,90 @@ fn read_only_commands_skip_prompts_unless_a_rule_speaks() {
     assert!(output.contains("permission rule denies"), "{output}");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn several_tool_calls_in_one_step_run_in_order_and_share_one_step() {
+    let model = ScriptedModel::new([
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "a",
+                "run_program",
+                program_arguments("PUSH 2\nPUSH 3\nADD\nHALT"),
+            ),
+            ToolCall::new(
+                "b",
+                "run_program",
+                program_arguments("PUSH 4\nPUSH 5\nMUL\nHALT"),
+            ),
+        ]),
+        ModelResponse::Text("5 and 20".to_owned()),
+    ]);
+    let mut agent = Agent::new(model, vm_tool_registry().unwrap()).with_max_steps(2);
+
+    let events = agent.run("two sums").unwrap();
+
+    let ids = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult(result) if !result.is_error => Some(result.id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["a", "b"]);
+    // Calls first, then results: the layout providers expect for one step.
+    let layout = agent
+        .conversation()
+        .iter()
+        .map(
+            |message| match (&message.tool_call, &message.tool_call_id) {
+                (Some(call), _) => format!("call {}", call.id),
+                (_, Some(id)) => format!("result {id}"),
+                _ => message.role.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layout,
+        [
+            "user",
+            "call a",
+            "call b",
+            "result a",
+            "result b",
+            "assistant"
+        ]
+    );
+}
+
+#[test]
+fn a_batch_cut_short_keeps_only_the_calls_that_ran() {
+    let model = ScriptedModel::new([
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new("a", "inspect_vm", ToolArguments::new()),
+            ToolCall::new(
+                "b",
+                "inspect_vm",
+                [("tag".to_owned(), ToolValue::Text("b".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]),
+        ModelResponse::Text("unreachable".to_owned()),
+    ]);
+    let mut agent = Agent::new(model, vm_tool_registry().unwrap()).with_max_tool_calls(1);
+
+    let error = agent.run("probe").unwrap_err();
+
+    assert_eq!(error, super::AgentError::ToolCallLimitExceeded { limit: 1 });
+    let conversation = agent.conversation();
+    let calls = conversation
+        .iter()
+        .filter_map(|message| message.tool_call.as_ref().map(|call| call.id.as_str()))
+        .collect::<Vec<_>>();
+    let results = conversation
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(calls, results, "every recorded call has its result");
+    assert!(!calls.contains(&"b"));
+}

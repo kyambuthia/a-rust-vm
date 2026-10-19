@@ -186,7 +186,7 @@ impl ConversationMessage {
         }
     }
 
-    pub(super) fn assistant_tool_call(call: &ToolCall) -> Self {
+    pub(crate) fn assistant_tool_call(call: &ToolCall) -> Self {
         Self {
             role: "assistant".to_owned(),
             content: String::new(),
@@ -195,7 +195,7 @@ impl ConversationMessage {
         }
     }
 
-    pub(super) fn tool_result(result: &ToolResult) -> Self {
+    pub(crate) fn tool_result(result: &ToolResult) -> Self {
         Self {
             role: "tool".to_owned(),
             content: format_tool_result(result),

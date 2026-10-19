@@ -15,6 +15,8 @@ const DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RETRIES: u32 = 2;
 const MAX_TOOL_ARGS_BYTES: usize = 32 * 1024;
+/// Tool calls accepted from one model step.
+const MAX_TOOL_CALLS_PER_STEP: usize = 16;
 /// Enough output for a model to write a medium-sized file in one call.
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const MAX_MAX_TOKENS: u32 = 32_768;
@@ -516,13 +518,12 @@ fn parse_sse_stream(
         emit(ModelStreamEvent::Usage(usage));
     }
     if !calls.is_empty() {
-        if calls.len() > 1 {
-            return Err(
-                "provider returned multiple tool calls; one call per turn is required".to_owned(),
-            );
-        }
-        let call = calls.into_values().next().expect("one call is present");
-        return tool_call_response(call.id, Some(call.name), Some(call.arguments));
+        return tool_calls_response(
+            calls
+                .into_values()
+                .map(|call| (call.id, Some(call.name), Some(call.arguments)))
+                .collect(),
+        );
     }
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -552,6 +553,42 @@ fn parse_usage(value: &serde_json::Value) -> crate::agent::Usage {
         cost_micro_usd,
         ..Default::default()
     }
+}
+
+/// Validate the tool calls of one step into a response. Calls without an
+/// id get a distinct one, so their results cannot be confused.
+fn tool_calls_response(
+    calls: Vec<(Option<String>, Option<String>, Option<String>)>,
+) -> Result<ModelResponse, String> {
+    if calls.is_empty() {
+        return Err("provider returned an empty tool call list".to_owned());
+    }
+    if calls.len() > MAX_TOOL_CALLS_PER_STEP {
+        return Err(format!(
+            "provider returned {} tool calls; at most {MAX_TOOL_CALLS_PER_STEP} per step are accepted",
+            calls.len()
+        ));
+    }
+    let mut parsed = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            let id = id.unwrap_or_else(|| format!("call-{}", index + 1));
+            tool_call_response(Some(id), name, arguments).map(|response| match response {
+                ModelResponse::ToolCall(call) => call,
+                _ => unreachable!("tool_call_response returns a tool call"),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    if parsed.iter().any(|call| !seen.insert(call.id.clone())) {
+        return Err("provider returned duplicate tool call ids".to_owned());
+    }
+    Ok(if parsed.len() == 1 {
+        ModelResponse::ToolCall(parsed.remove(0))
+    } else {
+        ModelResponse::ToolCalls(parsed)
+    })
 }
 
 /// Validate one tool call's parts into a response.
@@ -590,7 +627,22 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
         messages.push(serde_json::json!({"role":"system","content":system}));
     }
     for entry in request.conversation.iter().chain(&request.current_turn) {
-        messages.push(conversation_message(entry));
+        let message = conversation_message(entry);
+        // Calls from one step travel as one assistant message listing them
+        // all, the form providers expect before the matching results.
+        if entry.tool_call.is_some()
+            && entry.content.is_empty()
+            && let Some(previous) = messages.last_mut()
+            && previous["role"] == "assistant"
+            && let (Some(calls), Some(new_calls)) = (
+                previous["tool_calls"].as_array_mut(),
+                message["tool_calls"].as_array(),
+            )
+        {
+            calls.extend(new_calls.iter().cloned());
+            continue;
+        }
+        messages.push(message);
     }
     if request.current_turn.is_empty() {
         messages.push(serde_json::json!({
@@ -650,9 +702,6 @@ fn build_request_body(config: &OpenRouterConfig, request: &ModelRequest) -> serd
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
         body["tool_choice"] = serde_json::json!("auto");
-        // The agent loop executes exactly one tool call per model turn and
-        // rejects responses carrying several, so ask for one at a time.
-        body["parallel_tool_calls"] = serde_json::json!(false);
     }
     body
 }
@@ -794,18 +843,16 @@ fn parse_chat_response(text: &str) -> Result<ModelResponse, String> {
         .message
         .ok_or_else(|| "provider response has no message".to_owned())?;
     if let Some(calls) = message.tool_calls {
-        if calls.len() > 1 {
-            return Err(
-                "provider returned multiple tool calls; one call per turn is required".to_owned(),
-            );
-        }
-        let Some(entry) = calls.into_iter().next() else {
-            return Err("provider returned an empty tool call list".to_owned());
-        };
-        let function = entry
-            .function
-            .ok_or_else(|| "provider tool call has no function".to_owned())?;
-        return tool_call_response(entry.id, function.name, function.arguments);
+        let calls = calls
+            .into_iter()
+            .map(|entry| {
+                let function = entry
+                    .function
+                    .ok_or_else(|| "provider tool call has no function".to_owned())?;
+                Ok((entry.id, function.name, function.arguments))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return tool_calls_response(calls);
     }
     let content = match message.content {
         Some(serde_json::Value::String(text)) => text,
@@ -948,7 +995,7 @@ mod tests {
         );
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools[0]["function"]["name"], "guest_read_file");
-        assert_eq!(body["parallel_tool_calls"], false);
+        assert!(body.get("parallel_tool_calls").is_none());
         assert!(messages.iter().all(|value| {
             matches!(
                 value["role"].as_str(),
@@ -1056,12 +1103,86 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_provider_tool_calls_in_one_turn() {
-        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"one","arguments":"{}"}},{"id":"call-2","type":"function","function":{"name":"two","arguments":"{}"}}]}}]}"#;
-
+    fn accepts_several_tool_calls_in_one_step_within_limits() {
+        let json = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"one","arguments":"{}"}},{"type":"function","function":{"name":"two","arguments":"{\"path\":\"a\"}"}}]}}]}"#;
+        let ModelResponse::ToolCalls(calls) = parse_chat_response(json).unwrap() else {
+            panic!("expected several tool calls");
+        };
+        assert_eq!(calls.len(), 2);
         assert_eq!(
-            parse_chat_response(json).unwrap_err(),
-            "provider returned multiple tool calls; one call per turn is required"
+            (calls[0].id.as_str(), calls[0].name.as_str()),
+            ("call-1", "one")
+        );
+        // A missing id gets a distinct one from its position.
+        assert_eq!(
+            (calls[1].id.as_str(), calls[1].name.as_str()),
+            ("call-2", "two")
+        );
+
+        let duplicate = json.replace(
+            r#"{"type":"function","function":{"name":"two""#,
+            r#"{"id":"call-1","type":"function","function":{"name":"two""#,
+        );
+        assert!(
+            parse_chat_response(&duplicate)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+
+        let many = (0..=MAX_TOOL_CALLS_PER_STEP)
+            .map(|index| format!(r#"{{"id":"c{index}","type":"function","function":{{"name":"t","arguments":"{{}}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"choices":[{{"message":{{"tool_calls":[{many}]}}}}]}}"#);
+        assert!(parse_chat_response(&json).unwrap_err().contains("at most"));
+    }
+
+    #[test]
+    fn calls_from_one_step_are_sent_as_one_assistant_message() {
+        use crate::agent::{ConversationMessage, ToolResult};
+        let call = |id: &str| ToolCall::new(id, "read_file", Default::default());
+        let result = |id: &str| ToolResult {
+            id: id.to_owned(),
+            name: "read_file".to_owned(),
+            content: "x".to_owned(),
+            is_error: false,
+        };
+        let request = ModelRequest {
+            system_prompt: String::new(),
+            prompt: "go".to_owned(),
+            tool_results: Vec::new(),
+            tools: Vec::new(),
+            conversation: Vec::new(),
+            route: crate::agent::RouteRequest::default(),
+            current_turn: vec![
+                ConversationMessage::new("user", "go"),
+                ConversationMessage::assistant_tool_call(&call("a")),
+                ConversationMessage::assistant_tool_call(&call("b")),
+                ConversationMessage::tool_result(&result("a")),
+                ConversationMessage::tool_result(&result("b")),
+                ConversationMessage::assistant_tool_call(&call("c")),
+                ConversationMessage::tool_result(&result("c")),
+            ],
+        };
+        let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "openai/gpt-4o-mini");
+        let body = build_request_body(&config, &request);
+        let roles = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "tool", "assistant", "tool"]
+        );
+        assert_eq!(
+            body["messages"][1]["tool_calls"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            body["messages"][4]["tool_calls"].as_array().unwrap().len(),
+            1
         );
     }
 
@@ -1201,7 +1322,7 @@ mod tests {
         let (result, _) = stream(&[
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"a"}},{"index":1,"function":{"name":"b"}}]}}]}"#,
         ]);
-        assert!(result.unwrap_err().contains("multiple tool calls"));
+        assert!(matches!(result.unwrap(), ModelResponse::ToolCalls(calls) if calls.len() == 2));
         let big = format!(
             r#"{{"choices":[{{"delta":{{"content":"{}"}}}}]}}"#,
             "a".repeat(64)

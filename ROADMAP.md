@@ -246,7 +246,10 @@ before-and-after benchmark numbers.
    `.gitignore`, skip dependency and build directories, and say when they
    stop at their cap.
 3. Parallel tool calls: accept several calls per step; run read-only tools
-   concurrently and guarded tools in order.
+   concurrently and guarded tools in order. (Several calls per step are
+   accepted, up to 16, and run in order; OpenRouter requests no longer
+   force one call per step. Running read-only tools concurrently is open:
+   tools share non-`Send` workspace state.)
 4. ~~Budgets instead of a step count: default about 50 steps per turn with a
    token and wall-clock budget, set in config~~. `limits` in the user
    configuration sets steps, tool calls, turn time, and context size; the

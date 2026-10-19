@@ -29,6 +29,8 @@ pub struct ProcessModel {
 const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_PROCESS_STDERR_BYTES: usize = 16 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Tool calls accepted from one step, as for provider models.
+const MAX_PROCESS_TOOL_CALLS: usize = 16;
 
 impl ProcessModel {
     pub fn new(program: impl Into<PathBuf>) -> Self {
@@ -144,7 +146,7 @@ impl ProcessModel {
         });
 
         let deadline = Instant::now() + self.timeout;
-        let mut response = None;
+        let mut calls: Vec<ToolCall> = Vec::new();
         let mut text = String::new();
 
         loop {
@@ -188,10 +190,17 @@ impl ProcessModel {
                     name,
                     arguments,
                 } => {
-                    if response.is_some() {
-                        return Err(ModelError::new("model emitted more than one response"));
+                    if calls.len() >= MAX_PROCESS_TOOL_CALLS {
+                        return Err(ModelError::new(format!(
+                            "model emitted more than {MAX_PROCESS_TOOL_CALLS} tool calls in one step"
+                        )));
                     }
-                    response = Some(ModelResponse::ToolCall(ToolCall::new(id, name, arguments)));
+                    if calls.iter().any(|call| call.id == id) {
+                        return Err(ModelError::new(format!(
+                            "model emitted duplicate tool call id '{id}'"
+                        )));
+                    }
+                    calls.push(ToolCall::new(id, name, arguments));
                 }
                 ProcessModelEvent::Error { message } => {
                     return Err(ModelError::new(message));
@@ -213,9 +222,12 @@ impl ProcessModel {
             }));
         }
 
-        response
-            .or_else(|| (!text.is_empty()).then_some(ModelResponse::Text(text)))
-            .ok_or_else(|| ModelError::new("model process emitted no response"))
+        match calls.len() {
+            0 if !text.is_empty() => Ok(ModelResponse::Text(text)),
+            0 => Err(ModelError::new("model process emitted no response")),
+            1 => Ok(ModelResponse::ToolCall(calls.remove(0))),
+            _ => Ok(ModelResponse::ToolCalls(calls)),
+        }
     }
 }
 

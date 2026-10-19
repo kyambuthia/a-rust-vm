@@ -23,11 +23,13 @@ pub struct ModelRequest {
     pub route: RouteRequest,
 }
 
-/// A model response can either complete the turn or request a tool.
+/// A model response can either complete the turn or request tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelResponse {
     Text(String),
     ToolCall(ToolCall),
+    /// Several calls from one step, run in order.
+    ToolCalls(Vec<ToolCall>),
 }
 
 /// The routing profile requested by an agent turn.

@@ -56,6 +56,15 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// Per-turn bookkeeping shared by the tool calls of every step.
+struct BatchState<'a> {
+    tool_results: &'a mut Vec<ToolResult>,
+    turn_context: &'a mut Vec<ConversationMessage>,
+    last_call: &'a mut Option<(String, String)>,
+    executed: &'a mut Vec<String>,
+    tool_calls: &'a mut usize,
+}
+
 /// A bounded model-tool execution loop.
 pub struct Agent<M> {
     model: M,
@@ -342,7 +351,7 @@ where
                 emit(AgentEvent::Usage(usage));
             }
 
-            match response {
+            let calls = match response {
                 ModelResponse::Text(content) => {
                     turn_context.push(ConversationMessage::new("assistant", content.clone()));
                     // Streamed text already went out as deltas; an empty
@@ -353,53 +362,100 @@ where
                     emit(AgentEvent::Done);
                     return Ok(TurnEnd::Answered);
                 }
-                ModelResponse::ToolCall(call) => {
-                    if tool_calls >= self.max_tool_calls {
-                        return Err(AgentError::ToolCallLimitExceeded {
-                            limit: self.max_tool_calls,
-                        });
-                    }
-                    let canonical = canonical_arguments(&call.arguments);
-                    if let Some((last_name, last_args)) = last_call.as_ref()
-                        && last_name == &call.name
-                        && last_args == &canonical
-                    {
-                        emit(AgentEvent::RepeatedToolCall {
-                            tool: call.name.clone(),
-                            count: 2,
-                        });
-                        emit(AgentEvent::Done);
-                        return Ok(TurnEnd::RepeatedToolCall);
-                    }
-                    emit(AgentEvent::ToolCall(call.clone()));
-                    let mut result = self.execute_with_approval(&call, approve, &mut *emit);
-                    if let std::borrow::Cow::Owned(redacted) = self.redactor.redact(&result.content)
-                    {
-                        result.content = redacted;
-                    }
-                    tool_results.push(result.clone());
-                    turn_context.push(ConversationMessage::assistant_tool_call(&call));
-                    turn_context.push(ConversationMessage::tool_result(&result));
-                    emit(AgentEvent::ToolResult(result));
-                    tool_calls += 1;
-                    let key = format!("{} {canonical}", call.name);
-                    executed.push(key);
-                    last_call = Some((call.name.clone(), canonical));
-                    for period in 2..=3 {
-                        let len = executed.len();
-                        if len >= period * 2
-                            && executed[len - period..] == executed[len - period * 2..len - period]
-                        {
-                            return Err(AgentError::PatternLoopDetected { period });
-                        }
-                    }
-                }
+                ModelResponse::ToolCall(call) => vec![call],
+                ModelResponse::ToolCalls(calls) => calls,
+            };
+            let mut state = BatchState {
+                tool_results: &mut tool_results,
+                turn_context: &mut *turn_context,
+                last_call: &mut last_call,
+                executed: &mut executed,
+                tool_calls: &mut tool_calls,
+            };
+            if let Some(end) = self.run_tool_batch(calls, &mut state, approve, &mut *emit)? {
+                return Ok(end);
             }
         }
 
         Err(AgentError::StepLimitExceeded {
             limit: self.max_steps,
         })
+    }
+
+    /// Run the tool calls of one model step in order. Every call that ran is
+    /// recorded as one assistant message per call followed by the results,
+    /// so the history never holds a call without its result, even when a
+    /// guard stops the batch part way. Returns how the turn ended, if it did.
+    fn run_tool_batch<F, A>(
+        &mut self,
+        calls: Vec<ToolCall>,
+        state: &mut BatchState<'_>,
+        approve: &mut F,
+        emit: &mut A,
+    ) -> Result<Option<TurnEnd>, AgentError>
+    where
+        F: FnMut(&PermissionRequest) -> PermissionDecision,
+        A: FnMut(AgentEvent),
+    {
+        let mut ran: Vec<(ToolCall, ToolResult)> = Vec::new();
+        let outcome = (|| {
+            if calls.is_empty() {
+                return Err(AgentError::Model(super::ModelError::new(
+                    "model returned an empty tool call list",
+                )));
+            }
+            for call in calls {
+                if *state.tool_calls >= self.max_tool_calls {
+                    return Err(AgentError::ToolCallLimitExceeded {
+                        limit: self.max_tool_calls,
+                    });
+                }
+                let canonical = canonical_arguments(&call.arguments);
+                if let Some((last_name, last_args)) = state.last_call.as_ref()
+                    && last_name == &call.name
+                    && last_args == &canonical
+                {
+                    emit(AgentEvent::RepeatedToolCall {
+                        tool: call.name.clone(),
+                        count: 2,
+                    });
+                    emit(AgentEvent::Done);
+                    return Ok(Some(TurnEnd::RepeatedToolCall));
+                }
+                emit(AgentEvent::ToolCall(call.clone()));
+                let mut result = self.execute_with_approval(&call, approve, &mut *emit);
+                if let std::borrow::Cow::Owned(redacted) = self.redactor.redact(&result.content) {
+                    result.content = redacted;
+                }
+                state.tool_results.push(result.clone());
+                emit(AgentEvent::ToolResult(result.clone()));
+                ran.push((call.clone(), result));
+                *state.tool_calls += 1;
+                state.executed.push(format!("{} {canonical}", call.name));
+                *state.last_call = Some((call.name.clone(), canonical));
+                for period in 2..=3 {
+                    let executed = &state.executed;
+                    let len = executed.len();
+                    if len >= period * 2
+                        && executed[len - period..] == executed[len - period * 2..len - period]
+                    {
+                        return Err(AgentError::PatternLoopDetected { period });
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        for (call, _) in &ran {
+            state
+                .turn_context
+                .push(ConversationMessage::assistant_tool_call(call));
+        }
+        for (_, result) in &ran {
+            state
+                .turn_context
+                .push(ConversationMessage::tool_result(result));
+        }
+        outcome
     }
 
     fn execute_with_approval<F, A>(

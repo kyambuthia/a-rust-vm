@@ -360,6 +360,9 @@ Supported response events are:
 {"type":"done"}
 ```
 
+A step may emit up to 16 `tool_call` events with distinct ids; they run in
+order, each under the usual approval rules, before the next request.
+
 The process is launched directly without a shell. Keep credentials in the
 model bridge's protected credential store or environment, never in this
 repository or in command arguments.
