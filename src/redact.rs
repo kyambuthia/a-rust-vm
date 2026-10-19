@@ -175,7 +175,9 @@ fn redact_token_prefixes(text: &str) -> Option<String> {
         let matched = boundary
             .then(|| {
                 TOKEN_PREFIXES.iter().find_map(|(prefix, minimum)| {
-                    if !text[index..].starts_with(prefix) {
+                    // Compare bytes: `index` walks bytes and may sit inside
+                    // a multi-byte character, where slicing `text` panics.
+                    if !bytes[index..].starts_with(prefix.as_bytes()) {
                         return None;
                     }
                     let body = bytes[index + prefix.len()..]
@@ -328,6 +330,42 @@ mod tests {
 
     fn redact(text: &str) -> String {
         Redactor::new().redact(text).into_owned()
+    }
+
+    #[test]
+    fn multibyte_text_never_panics_and_secrets_stay_hidden() {
+        let secrets = [
+            "sk-or-v1-0123456789abcdef0123",
+            "ghp_0123456789abcdefghij0123",
+            "AKIAABCDEFGHIJKLMNOP",
+            "Bearer abcdefghijklmnop0123",
+            "DB_PASSWORD=hunter22hunter",
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        ];
+        let fillers = ["·", "é", "日本", "🦀", "a·b", "\u{200d}"];
+        let mut redactor = Redactor::new();
+        redactor.add_literal("literal·secret");
+        for secret in secrets {
+            for filler in fillers {
+                for split in 0..=filler.len() {
+                    let Some((left, right)) = filler
+                        .is_char_boundary(split)
+                        .then(|| filler.split_at(split))
+                    else {
+                        continue;
+                    };
+                    let text = format!("{left}{filler} {secret} {right}{filler}·");
+                    let output = redactor.redact(&text);
+                    assert!(output.contains(REDACTED), "{text:?} -> {output:?}");
+                    let glued = format!("{filler}{secret}{filler}literal·secret");
+                    let output = redactor.redact(&glued);
+                    assert!(!output.contains("literal·secret"), "{glued:?}");
+                }
+            }
+        }
+        // The shape that crashed `read_file` on README.md.
+        let readme = "`[usage] 2 model steps · 2,291 in (1,925 cached) · 91 out · $0.000085`";
+        assert_eq!(redactor.redact(readme), readme);
     }
 
     #[test]
