@@ -24,6 +24,9 @@ final assistant response, and the expected tool errors in recovery and denial
 cases. The result JSON includes hashes of expected and actual files, but lives
 under ignored `target/` rather than in the repository.
 
+This baseline predates task records. Current benchmark results use schema 2
+and also require a valid task record with a checkpoint to the saved session.
+
 This run checks the CLI, tool loop, permission path, and benchmark grader with
 prewritten model decisions. It does not measure autonomous model reasoning.
 The scripted model reports no token or provider cost usage; its wall time is

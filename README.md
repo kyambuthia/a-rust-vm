@@ -44,7 +44,8 @@ cargo run -- coding-demo
 
 The 12-case disposable CLI benchmark runs scripted model decisions through the real
 `arvm ask` binary, then checks workspace file contents and unexpected extra
-files. It needs no provider key and writes a content-free JSON summary under
+files. It also requires a replay-validated task record and matching saved
+session checkpoint. It needs no provider key and writes a content-free JSON summary under
 the ignored `target/` directory:
 
 ```bash

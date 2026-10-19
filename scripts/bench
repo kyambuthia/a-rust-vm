@@ -18,7 +18,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA = 1
+SCHEMA = 2
 
 
 def call(name, **arguments):
@@ -361,12 +361,31 @@ def run_case(case, mode, binary, timeout):
             env["A_RVM_MODEL_ARGS"] = "--model"
             env["A_RVM_BENCH_STAGES"] = json.dumps(case["stages"])
             env["A_RVM_BENCH_MODEL_LOG"] = str(base / "model_calls.txt")
-        command = [str(binary), "ask", "--json", "--session", "bench"]
+        command = [str(binary), "ask", "--json", "--task", "bench"]
         for rule in case.get("rules", []):
             command.extend(["--rule", rule])
         command.extend(["--rule", "allow write_file", case["prompt"]])
         returncode, stdout, stderr, seconds, timed_out = run_process(
             command, env, workspace, timeout
+        )
+        task_returncode, task_stdout, _, _, _ = run_process(
+            [str(binary), "task", "show", "bench", "--json"], env, workspace, timeout
+        )
+        try:
+            task = json.loads(task_stdout) if task_returncode == 0 else {}
+            session = json.loads((base / "state/sessions/bench.json").read_bytes())
+        except (OSError, ValueError):
+            task = {}
+            session = {}
+        checkpoint = task.get("checkpoint") or {}
+        task_record_valid = (
+            task_returncode == 0
+            and task.get("spec", {}).get("id") == "bench"
+            and task.get("spec", {}).get("prompt") == case["prompt"]
+            and task.get("status") == "completed"
+            and checkpoint.get("session_id") == "bench"
+            and checkpoint.get("completed_turns") == 1
+            and len(session.get("turns", [])) == 1
         )
         events = []
         for line in stdout.decode("utf-8", errors="replace").splitlines():
@@ -420,12 +439,15 @@ def run_case(case, mode, binary, timeout):
                 and expected_error_seen
                 and not unexpected_errors
                 and not any(event.get("type") == "error" for event in events)
+                and task_record_valid
             ),
             "exit_code": returncode,
             "timed_out": timed_out,
             "elapsed_ms": round(seconds * 1000),
             "model_steps": model_steps,
             "assistant_answered": assistant_answered,
+            "task_status": task.get("status"),
+            "task_record_valid": task_record_valid,
             "tool_calls": sum(event.get("type") == "tool_call" for event in events),
             "approval_requests": sum(
                 event.get("type") == "permission_requested" for event in events
