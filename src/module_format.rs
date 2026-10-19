@@ -17,7 +17,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use crate::module::{Function, Module, ModuleError, Op, OwnedValue};
+use crate::module::{Function, Import, Module, ModuleError, Op, OwnedValue};
 
 pub const MAX_MODULE_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -30,6 +30,8 @@ struct ModuleImage {
     input_count: usize,
     #[serde(default)]
     constants: Vec<OwnedValue>,
+    #[serde(default)]
+    imports: Vec<Import>,
     functions: Vec<FunctionImage>,
 }
 
@@ -74,12 +76,13 @@ pub fn parse_module(source: &[u8]) -> Result<Module, ModuleSourceError> {
         .into_iter()
         .map(|function| Function::new(function.arity, function.locals, function.code))
         .collect();
-    Module::with_values(
+    Module::with_imports(
         image.version,
         functions,
         image.entry,
         image.constants,
         image.input_count,
+        image.imports,
     )
     .map_err(ModuleSourceError::Invalid)
 }

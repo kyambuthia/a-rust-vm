@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use crate::module::{Function, MODULE_VERSION, Module, Op, OwnedValue};
+use crate::module::{Function, Import, MODULE_VERSION, Module, Op, OwnedValue};
 use crate::module_format::MAX_MODULE_SOURCE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +91,8 @@ pub fn assemble_module(source: &str) -> Result<Module, AssemblyError> {
     let mut input_count = None;
     let mut constants = Vec::new();
     let mut constant_names = BTreeMap::new();
+    let mut imports = Vec::new();
+    let mut import_names = BTreeMap::new();
     let mut functions: Vec<SourceFunction> = Vec::new();
     let mut function_names = BTreeMap::new();
     let mut current: Option<SourceFunction> = None;
@@ -152,6 +154,18 @@ pub fn assemble_module(source: &str) -> Result<Module, AssemblyError> {
                     code: Vec::new(),
                 });
             }
+            ["import", name, arity] => {
+                if import_names
+                    .insert((*name).to_owned(), imports.len())
+                    .is_some()
+                {
+                    return Err(AssemblyError::at(line_number, "duplicate import name"));
+                }
+                imports.push(Import {
+                    name: (*name).to_owned(),
+                    arity: number(arity, line_number, "import arity")?,
+                });
+            }
             ["const", name, ..] if identifier(name) => {
                 if constant_names.contains_key(*name) {
                     return Err(AssemblyError::at(line_number, "duplicate constant name"));
@@ -178,7 +192,7 @@ pub fn assemble_module(source: &str) -> Result<Module, AssemblyError> {
             _ => {
                 return Err(AssemblyError::at(
                     line_number,
-                    "expected entry, inputs, const, or fn declaration",
+                    "expected entry, inputs, const, import, or fn declaration",
                 ));
             }
         }
@@ -221,6 +235,11 @@ pub fn assemble_module(source: &str) -> Result<Module, AssemblyError> {
                 ("call", Some(name)) => Op::Call(*function_names.get(name).ok_or_else(|| {
                     AssemblyError::at(*line, format!("unknown function '{name}'"))
                 })?),
+                ("import", Some(name)) => {
+                    Op::Import(*import_names.get(name).ok_or_else(|| {
+                        AssemblyError::at(*line, format!("unknown import '{name}'"))
+                    })?)
+                }
                 ("add", None) => Op::Add,
                 ("sub", None) => Op::Sub,
                 ("mul", None) => Op::Mul,
@@ -246,12 +265,13 @@ pub fn assemble_module(source: &str) -> Result<Module, AssemblyError> {
         }
         compiled.push(Function::new(function.arity, function.locals, code));
     }
-    Module::with_values(
+    Module::with_imports(
         MODULE_VERSION,
         compiled,
         entry,
         constants,
         input_count.unwrap_or(0),
+        imports,
     )
     .map_err(|e| {
         let line = e

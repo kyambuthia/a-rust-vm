@@ -1,6 +1,8 @@
 //! Load and run validated module VM images from files or standard input.
 
+use serde::Deserialize;
 use std::{
+    collections::BTreeSet,
     fmt,
     fs::File,
     io::{self, Read},
@@ -13,7 +15,15 @@ use a_rust_vm::{
 };
 
 const MAX_MODULE_INPUT_BYTES: usize = 8 * 1024 * 1024;
-const USAGE: &str = "usage: arvm module check <file|->\n       arvm module run <file|-> [--input <file|->] [--heap-bytes <n>]";
+const USAGE: &str = "usage: arvm module check <file|->\n       arvm module run <file|-> [--input <file|->] [--import-replies <file|->] [--heap-bytes <n>]";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportReply {
+    name: String,
+    arguments: Vec<OwnedValue>,
+    result: OwnedValue,
+}
 
 #[derive(Debug)]
 pub(crate) struct ModuleCommandError {
@@ -79,6 +89,7 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
     }
     let mut source_path = None;
     let mut input_path = None;
+    let mut replies_path = None;
     let mut heap_limit = MAX_MODULE_HEAP_BYTES;
     let mut heap_limit_set = false;
     let mut index = 1;
@@ -87,6 +98,15 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
             "--input" if command == "run" && input_path.is_none() => {
                 index += 1;
                 input_path = Some(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| ModuleCommandError::input(USAGE))?
+                        .as_str(),
+                );
+            }
+            "--import-replies" if command == "run" && replies_path.is_none() => {
+                index += 1;
+                replies_path = Some(
                     arguments
                         .get(index)
                         .ok_or_else(|| ModuleCommandError::input(USAGE))?
@@ -115,9 +135,14 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
         index += 1;
     }
     let source_path = source_path.ok_or_else(|| ModuleCommandError::input(USAGE))?;
-    if source_path == "-" && input_path == Some("-") {
+    if [Some(source_path), input_path, replies_path]
+        .into_iter()
+        .filter(|path| *path == Some("-"))
+        .count()
+        > 1
+    {
         return Err(ModuleCommandError::input(
-            "module and input cannot both use standard input",
+            "only one module, input, or import replies file can use standard input",
         ));
     }
     let source = read_limited(source_path, MAX_MODULE_SOURCE_BYTES)?;
@@ -152,11 +177,51 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
             .map_err(|error| ModuleCommandError::input(format!("invalid input JSON: {error}")))?,
         None => Vec::new(),
     };
-    let mut vm = ModuleVm::with_inputs(&module, inputs, heap_limit)
+    let replies: Vec<ImportReply> = match replies_path {
+        Some(path) => serde_json::from_slice(&read_limited(path, MAX_MODULE_INPUT_BYTES)?)
+            .map_err(|error| {
+                ModuleCommandError::input(format!("invalid import replies JSON: {error}"))
+            })?,
+        None => Vec::new(),
+    };
+    let grants: Vec<String> = replies
+        .iter()
+        .map(|reply| reply.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut vm = ModuleVm::with_inputs_and_imports(&module, inputs, heap_limit, &grants)
         .map_err(|error| ModuleCommandError::input(format!("invalid module input: {error}")))?;
-    let value = vm
-        .run()
-        .map_err(|error| ModuleCommandError::runtime(format!("module VM error: {error}")))?;
+    let mut next_reply = 0;
+    while vm.result().is_none() {
+        vm.step()
+            .map_err(|error| ModuleCommandError::runtime(format!("module VM error: {error}")))?;
+        if let Some(request) = vm
+            .pending_import()
+            .map_err(|error| ModuleCommandError::runtime(format!("module VM error: {error}")))?
+        {
+            let reply = replies.get(next_reply).ok_or_else(|| {
+                ModuleCommandError::runtime(format!("no reply for import '{}'", request.name))
+            })?;
+            if reply.name != request.name || reply.arguments != request.arguments {
+                return Err(ModuleCommandError::runtime(format!(
+                    "import reply {next_reply} does not match request '{}'",
+                    request.name
+                )));
+            }
+            vm.resume_import(&reply.result).map_err(|error| {
+                ModuleCommandError::runtime(format!("invalid import result: {error}"))
+            })?;
+            next_reply += 1;
+        }
+    }
+    if next_reply != replies.len() {
+        return Err(ModuleCommandError::input(format!(
+            "{} unused import replies",
+            replies.len() - next_reply
+        )));
+    }
+    let value = vm.result().expect("loop stopped at a result");
     let result = vm
         .resolve(value)
         .map_err(|error| ModuleCommandError::runtime(format!("cannot resolve result: {error}")))?;

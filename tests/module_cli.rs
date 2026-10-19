@@ -79,3 +79,55 @@ fn module_command_runs_text_assembly() {
     assert_eq!(value["result"]["integer"], 42);
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn module_command_replays_only_matching_import_responses() {
+    let directory = std::env::temp_dir().join(format!("arvm-module-replay-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("program.arvm");
+    let replies = directory.join("replies.json");
+    fs::write(&source, "entry main\nimport math.double 1\nfn main 0 0\n const 21\n import math.double\n return\nend\n").unwrap();
+    fs::write(
+        &replies,
+        r#"[{"name":"math.double","arguments":[{"integer":21}],"result":{"integer":42}}]"#,
+    )
+    .unwrap();
+    let denied = Command::new(env!("CARGO_BIN_EXE_arvm"))
+        .args(["module", "run", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("ImportDenied"));
+    let run = Command::new(env!("CARGO_BIN_EXE_arvm"))
+        .args([
+            "module",
+            "run",
+            source.to_str().unwrap(),
+            "--import-replies",
+            replies.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    let output: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(output["result"]["integer"], 42);
+    assert_eq!(output["steps"], 3);
+    fs::write(
+        &replies,
+        r#"[{"name":"math.double","arguments":[{"integer":20}],"result":{"integer":42}}]"#,
+    )
+    .unwrap();
+    let mismatch = Command::new(env!("CARGO_BIN_EXE_arvm"))
+        .args([
+            "module",
+            "run",
+            source.to_str().unwrap(),
+            "--import-replies",
+            replies.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("does not match"));
+    fs::remove_dir_all(directory).unwrap();
+}

@@ -3,7 +3,13 @@
 //! The legacy assembly VM remains available through crate::program. A module
 //! is validated as a whole before its instructions can be executed.
 
-use std::{cell::Cell, collections::BTreeMap, fmt, mem::size_of, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    mem::size_of,
+    rc::Rc,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -151,7 +157,16 @@ pub enum Op {
     Jump(usize),
     JumpIfZero(usize),
     Call(usize),
+    Import(usize),
     Return,
+}
+
+/// A named host operation declared by a module. The host must grant it before use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Import {
+    pub name: String,
+    pub arity: usize,
 }
 
 /// A function body and its fixed local-slot layout.
@@ -192,6 +207,7 @@ pub struct Module {
     entry: usize,
     constants: Vec<OwnedValue>,
     input_count: usize,
+    imports: Vec<Import>,
     max_operand_stack: Vec<usize>,
 }
 
@@ -246,6 +262,17 @@ impl Module {
         constants: Vec<OwnedValue>,
         input_count: usize,
     ) -> Result<Self, ModuleError> {
+        Self::with_imports(version, functions, entry, constants, input_count, vec![])
+    }
+
+    pub fn with_imports(
+        version: u16,
+        functions: Vec<Function>,
+        entry: usize,
+        constants: Vec<OwnedValue>,
+        input_count: usize,
+        imports: Vec<Import>,
+    ) -> Result<Self, ModuleError> {
         if version != MODULE_VERSION {
             return Err(ModuleError::new(
                 None,
@@ -279,6 +306,27 @@ impl Module {
         }
         if constants.len() > MAX_MODULE_CONSTANTS {
             return Err(ModuleError::new(None, None, "too many constants"));
+        }
+        if imports.len() > MAX_FUNCTIONS {
+            return Err(ModuleError::new(None, None, "too many imports"));
+        }
+        let mut import_names = BTreeSet::new();
+        for import in &imports {
+            if import.name.is_empty()
+                || import.name.len() > 128
+                || !import
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+                || import.arity > MAX_OPERAND_STACK
+                || !import_names.insert(&import.name)
+            {
+                return Err(ModuleError::new(
+                    None,
+                    None,
+                    "invalid or duplicate import declaration",
+                ));
+            }
         }
         let mut constant_bytes = 0usize;
         for (index, value) in constants.iter().enumerate() {
@@ -368,6 +416,13 @@ impl Module {
                             format!("function {target} is missing"),
                         ));
                     }
+                    Op::Import(target) if *target >= imports.len() => {
+                        return Err(ModuleError::new(
+                            Some(function_index),
+                            Some(ip),
+                            format!("import {target} is missing"),
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -377,7 +432,13 @@ impl Module {
             .iter()
             .enumerate()
             .map(|(index, function)| {
-                validate_function(index, function, &functions, &mut validation_visits)
+                validate_function(
+                    index,
+                    function,
+                    &functions,
+                    &imports,
+                    &mut validation_visits,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -386,6 +447,7 @@ impl Module {
             entry,
             constants,
             input_count,
+            imports,
             max_operand_stack,
         })
     }
@@ -408,6 +470,10 @@ impl Module {
 
     pub fn input_count(&self) -> usize {
         self.input_count
+    }
+
+    pub fn imports(&self) -> &[Import] {
+        &self.imports
     }
 
     pub fn max_operand_stack(&self, function: usize) -> Option<usize> {
@@ -452,6 +518,7 @@ fn validate_function(
     index: usize,
     function: &Function,
     functions: &[Function],
+    imports: &[Import],
     visits_remaining: &mut usize,
 ) -> Result<usize, ModuleError> {
     // At a control-flow join, local initialization is the intersection of
@@ -508,6 +575,7 @@ fn validate_function(
             | Op::MapGet => 2,
             Op::MapInsert => 3,
             Op::Call(target) => functions[target].arity,
+            Op::Import(target) => imports[target].arity,
         };
         if depth < required {
             return Err(ModuleError::new(
@@ -552,7 +620,7 @@ fn validate_function(
             | Op::MapGet => depth - 1,
             Op::MapInsert => depth - 2,
             Op::ListLen => depth,
-            Op::Call(_) => depth - required + 1,
+            Op::Call(_) | Op::Import(_) => depth - required + 1,
             Op::Jump(_) | Op::Return => depth,
         };
         max_stack = max_stack.max(next_depth);
@@ -604,6 +672,9 @@ pub enum ModuleVmError {
     CallFrameLimit,
     LiveSlotLimit,
     StepLimit,
+    ImportDenied,
+    ImportPending,
+    NoPendingImport,
 }
 
 impl fmt::Display for ModuleVmError {
@@ -620,6 +691,13 @@ pub struct ModuleStep {
     pub instruction_pointer: usize,
     pub instruction: Op,
     pub result: Option<Value>,
+}
+
+/// A host request emitted at an import instruction. Arguments are copies of guest values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRequest {
+    pub name: String,
+    pub arguments: Vec<OwnedValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,6 +727,8 @@ pub struct ModuleVm<'a> {
     inputs: Vec<Value>,
     heap_bytes: Rc<Cell<usize>>,
     heap_limit: usize,
+    granted_imports: BTreeSet<String>,
+    pending_import: Option<usize>,
 }
 
 impl<'a> ModuleVm<'a> {
@@ -667,6 +747,8 @@ impl<'a> ModuleVm<'a> {
             inputs: Vec::new(),
             heap_bytes: Rc::new(Cell::new(0)),
             heap_limit: MAX_MODULE_HEAP_BYTES,
+            granted_imports: BTreeSet::new(),
+            pending_import: None,
         }
     }
 
@@ -676,6 +758,16 @@ impl<'a> ModuleVm<'a> {
         inputs: Vec<OwnedValue>,
         heap_limit: usize,
     ) -> Result<Self, ModuleVmError> {
+        Self::with_inputs_and_imports(module, inputs, heap_limit, &[])
+    }
+
+    /// Construct a VM with exact-name import grants supplied by its host.
+    pub fn with_inputs_and_imports(
+        module: &'a Module,
+        inputs: Vec<OwnedValue>,
+        heap_limit: usize,
+        granted_imports: &[String],
+    ) -> Result<Self, ModuleVmError> {
         if inputs.len() != module.input_count {
             return Err(ModuleVmError::InputCountMismatch);
         }
@@ -684,6 +776,7 @@ impl<'a> ModuleVm<'a> {
         }
         let mut vm = Self::new(module);
         vm.heap_limit = heap_limit;
+        vm.granted_imports = granted_imports.iter().cloned().collect();
         let mut charge = 0usize;
         for input in &inputs {
             charge = charge
@@ -696,6 +789,45 @@ impl<'a> ModuleVm<'a> {
             vm.inputs.push(value);
         }
         Ok(vm)
+    }
+
+    /// Return the request awaiting a host result, if execution is suspended.
+    pub fn pending_import(&self) -> Result<Option<ImportRequest>, ModuleVmError> {
+        let Some(import_index) = self.pending_import else {
+            return Ok(None);
+        };
+        let import = &self.module.imports[import_index];
+        let stack = &self.frames.last().expect("pending VM has a frame").stack;
+        let arguments = stack[stack.len() - import.arity..]
+            .iter()
+            .cloned()
+            .map(|value| self.resolve(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ImportRequest {
+            name: import.name.clone(),
+            arguments,
+        }))
+    }
+
+    /// Complete a suspended import with a host-supplied value. Failed limits leave it pending.
+    pub fn resume_import(&mut self, result: &OwnedValue) -> Result<(), ModuleVmError> {
+        let index = self.pending_import.ok_or(ModuleVmError::NoPendingImport)?;
+        let arity = self.module.imports[index].arity;
+        let frame = self.frames.last().expect("pending VM has a frame");
+        if arity == 0
+            && (frame.stack.len() >= MAX_OPERAND_STACK || self.live_slots() >= MAX_LIVE_SLOTS)
+        {
+            return Err(ModuleVmError::OperandStackLimit);
+        }
+        self.reserve_heap(value_charge(result, 0)?)?;
+        let value = self.import(result);
+        let frame = self.frames.last_mut().expect("pending VM has a frame");
+        frame.stack.truncate(frame.stack.len() - arity);
+        frame.stack.push(value);
+        frame.ip += 1;
+        self.steps += 1;
+        self.pending_import = None;
+        Ok(())
     }
 
     pub fn result(&self) -> Option<Value> {
@@ -843,6 +975,9 @@ impl<'a> ModuleVm<'a> {
     }
 
     pub fn step(&mut self) -> Result<ModuleStep, ModuleVmError> {
+        if self.pending_import.is_some() {
+            return Err(ModuleVmError::ImportPending);
+        }
         if self.result.is_some() {
             return Err(ModuleVmError::AlreadyFinished);
         }
@@ -985,6 +1120,19 @@ impl<'a> ModuleVm<'a> {
                     ip: 0,
                     locals,
                     stack: Vec::new(),
+                });
+            }
+            Op::Import(target) => {
+                let import = &self.module.imports[target];
+                if !self.granted_imports.contains(&import.name) {
+                    return Err(ModuleVmError::ImportDenied);
+                }
+                self.pending_import = Some(target);
+                return Ok(ModuleStep {
+                    function,
+                    instruction_pointer,
+                    instruction,
+                    result: None,
                 });
             }
             Op::Return => {
@@ -1536,7 +1684,7 @@ mod tests {
     fn validation_has_an_explicit_work_budget() {
         let functions = vec![function(0, 0, vec![Op::Const(1), Op::Return])];
         let mut visits = 0;
-        let error = validate_function(0, &functions[0], &functions, &mut visits).unwrap_err();
+        let error = validate_function(0, &functions[0], &functions, &[], &mut visits).unwrap_err();
         assert!(error.message.contains("visit limit"));
     }
 
