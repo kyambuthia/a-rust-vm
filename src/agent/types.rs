@@ -129,7 +129,7 @@ fn group_digits(value: u64) -> String {
 }
 
 /// Events emitted by one agent turn.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     UserMessage {

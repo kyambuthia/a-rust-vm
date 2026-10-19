@@ -172,6 +172,12 @@ After each turn `arvm` prints what it cost, for example
 `/usage` in the REPL shows the session total, and `ask --json` emits a
 `usage` event per model step with the provider and first-token time.
 
+Sessions record every turn: the prompt, each answer, tool call, tool result,
+permission request, and usage figure, plus the exact model context so a
+resumed session continues where it stopped. `arvm agent --session <id>` and
+`arvm ask --session <id> <prompt>` resume (or start) a session saved under the
+state directory; files are written owner-only.
+
 Optional limits: `OPENROUTER_MAX_TOKENS` (128-32768, default 8192) and
 `OPENROUTER_TIMEOUT_SECS` (1-600, default 120). Invalid values are errors.
 

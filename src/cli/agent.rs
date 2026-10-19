@@ -5,11 +5,10 @@ use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_rust_vm::agent::{
-    Agent, AgentEvent, ConversationMessage, ModelCapabilities, ModelMode, ModelRouter,
-    ProcessModel, RouteRequest, load_project_instructions, system_prompt_with_instructions,
-    system_prompt_with_skills,
+    Agent, AgentEvent, ModelCapabilities, ModelMode, ModelRouter, ProcessModel, RouteRequest,
+    load_project_instructions, system_prompt_with_instructions, system_prompt_with_skills,
 };
-use a_rust_vm::session::{Session, SessionStore};
+use a_rust_vm::session::{Session, SessionStore, TurnRecord};
 use a_rust_vm::workspace::coding_tool_registry_with_options;
 
 use super::config::load_config_or_exit;
@@ -192,25 +191,45 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     agent.set_permission_policy(policy);
     let mut route = agent.route_request().clone();
     let session_id = extract_session_id(user_arguments);
+    let store = SessionStore::new(session_directory());
     if let Some((prompt, json)) = parse_one_shot_args(user_arguments) {
         let permission = extract_one_shot_permission(user_arguments);
-        run_one_shot_agent(&mut agent, &prompt, json, permission);
+        // `ask --session <id>` continues (or starts) a saved session.
+        let session = session_id.as_ref().map(|id| {
+            let session = match store.load(id) {
+                Ok(existing) => existing,
+                Err(error) if error.is_not_found() => {
+                    Session::new(id.clone()).unwrap_or_else(|error| {
+                        eprintln!("[session] {error}");
+                        std::process::exit(2);
+                    })
+                }
+                Err(error) => {
+                    eprintln!("[session] cannot resume {id}: {error}");
+                    std::process::exit(2);
+                }
+            };
+            agent.set_conversation(session.resume_conversation());
+            session
+        });
+        run_one_shot_agent(
+            &mut agent,
+            &prompt,
+            json,
+            permission,
+            session.map(|s| (&store, s)),
+        );
         return;
     }
-    let store = SessionStore::new(session_directory());
     let mut session = match &session_id {
         Some(id) => match store.load(id) {
             Ok(existing) => {
                 println!(
-                    "[session] resumed {id} ({} messages)",
-                    existing.messages.len()
+                    "[session] resumed {id} ({} messages, {} recorded turns)",
+                    existing.messages.len(),
+                    existing.turns.len()
                 );
-                let conversation = existing
-                    .messages
-                    .iter()
-                    .map(|message| ConversationMessage::new(&message.role, &message.content))
-                    .collect::<Vec<_>>();
-                agent.set_conversation(conversation);
+                agent.set_conversation(existing.resume_conversation());
                 existing
             }
             Err(error) => {
@@ -318,6 +337,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         let mut reply = String::new();
         let mut turn_usage = a_rust_vm::agent::Usage::default();
         let mut turn_steps = 0usize;
+        let mut record = TurnRecord::new(prompt);
         if let Err(error) = agent.run_streaming_with_approval(
             prompt,
             |request| {
@@ -334,43 +354,47 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
                     }
                 }
             },
-            |event| match event {
-                AgentEvent::AssistantDelta { content } => {
-                    reply.push_str(&content);
-                    print!("{content}");
-                    io::stdout().flush().expect("stdout should be writable");
-                }
-                AgentEvent::AssistantText { content } => {
-                    reply.push_str(&content);
-                    print!("{content}");
-                }
-                AgentEvent::ToolCall(call) => print!("\n[tool] {}\n", call.name),
-                AgentEvent::ToolResult(result) => {
-                    session.push("tool", format!("{}: {}", result.name, result.content));
-                    println!("[tool result] {}", result.content);
-                }
-                AgentEvent::PermissionRequested(request) => {
-                    println!("[permission] {}", request.description)
-                }
-                AgentEvent::RepeatedToolCall { tool, count } => {
-                    println!("[agent] repeated tool call: {tool} (x{count})")
-                }
-                AgentEvent::Error { message } => println!("[error] {message}"),
-                AgentEvent::Cancelled => println!("\n[agent] cancelled"),
-                AgentEvent::Done => {
-                    if !reply.is_empty() {
-                        session.push("assistant", std::mem::take(&mut reply));
+            |event| {
+                record.record(&event);
+                match event {
+                    AgentEvent::AssistantDelta { content } => {
+                        reply.push_str(&content);
+                        print!("{content}");
+                        io::stdout().flush().expect("stdout should be writable");
                     }
+                    AgentEvent::AssistantText { content } => {
+                        reply.push_str(&content);
+                        print!("{content}");
+                    }
+                    AgentEvent::ToolCall(call) => print!("\n[tool] {}\n", call.name),
+                    AgentEvent::ToolResult(result) => {
+                        session.push("tool", format!("{}: {}", result.name, result.content));
+                        println!("[tool result] {}", result.content);
+                    }
+                    AgentEvent::PermissionRequested(request) => {
+                        println!("[permission] {}", request.description)
+                    }
+                    AgentEvent::RepeatedToolCall { tool, count } => {
+                        println!("[agent] repeated tool call: {tool} (x{count})")
+                    }
+                    AgentEvent::Error { message } => println!("[error] {message}"),
+                    AgentEvent::Cancelled => println!("\n[agent] cancelled"),
+                    AgentEvent::Done => {
+                        if !reply.is_empty() {
+                            session.push("assistant", std::mem::take(&mut reply));
+                        }
+                    }
+                    AgentEvent::Usage(usage) => {
+                        turn_usage.accumulate(&usage);
+                        turn_steps += 1;
+                    }
+                    AgentEvent::UserMessage { .. } => {}
                 }
-                AgentEvent::Usage(usage) => {
-                    turn_usage.accumulate(&usage);
-                    turn_steps += 1;
-                }
-                AgentEvent::UserMessage { .. } => {}
             },
         ) {
             eprintln!("\n[agent error] {error}");
         }
+        session.finish_turn(record, agent.conversation());
         if turn_steps > 0 {
             println!("\n[usage] {}", usage_line(turn_steps, &turn_usage));
             session_usage.accumulate(&turn_usage);
@@ -488,7 +512,9 @@ fn run_one_shot_agent(
     prompt: &str,
     json: bool,
     permission: OneShotPermission,
+    mut session: Option<(&SessionStore, Session)>,
 ) {
+    let mut record = TurnRecord::new(prompt);
     let mut total = a_rust_vm::agent::Usage::default();
     let mut steps = 0usize;
     let result = agent.run_streaming_with_approval(
@@ -500,6 +526,7 @@ fn run_one_shot_agent(
             },
         },
         |event| {
+            record.record(&event);
             if let AgentEvent::Usage(usage) = &event {
                 total.accumulate(usage);
                 steps += 1;
@@ -531,6 +558,30 @@ fn run_one_shot_agent(
     );
     if !json && steps > 0 {
         eprintln!("\n[usage] {}", usage_line(steps, &total));
+    }
+    if let Err(error) = &result {
+        record.record(&AgentEvent::Error {
+            message: error.to_string(),
+        });
+    }
+    if let Some((store, session)) = session.as_mut() {
+        session.push("user", prompt);
+        let answer = record
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::AssistantText { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !answer.is_empty() {
+            session.push("assistant", answer);
+        }
+        session.finish_turn(record, agent.conversation());
+        if let Err(error) = store.save(session) {
+            eprintln!("[session] cannot save: {error}");
+        }
     }
     if let Err(error) = result {
         if json {
