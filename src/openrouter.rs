@@ -274,6 +274,7 @@ impl OpenRouterConfig {
 #[derive(Clone)]
 pub struct OpenRouterModel {
     inner: Arc<Inner>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct Inner {
@@ -300,6 +301,7 @@ impl OpenRouterModel {
             .map_err(|error| sanitize_error(&format!("failed to build http client: {error}")))?;
         Ok(Self {
             inner: Arc::new(Inner { client, config }),
+            cancel: None,
         })
     }
 
@@ -371,6 +373,10 @@ impl OpenRouterModel {
 }
 
 impl Model for OpenRouterModel {
+    fn set_cancel_token(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
     fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = self.build_request_body(request);
         let response = self.send(&body)?;
@@ -392,9 +398,16 @@ impl Model for OpenRouterModel {
         body["stream_options"] = serde_json::json!({"include_usage": true});
         let response = self.send(&body)?;
         let api_key = self.inner.config.api_key.clone();
+        let cancel = self.cancel.clone();
+        let cancelled = move || {
+            cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
+        };
         parse_sse_stream(
             std::io::BufReader::new(response),
             MAX_STREAM_BYTES,
+            &cancelled,
             &mut |event| match event {
                 ModelStreamEvent::TextDelta { content } => emit(ModelStreamEvent::TextDelta {
                     content: redact_secret(&content, &api_key),
@@ -422,6 +435,7 @@ struct PartialToolCall {
 fn parse_sse_stream(
     mut reader: impl BufRead,
     max_bytes: usize,
+    cancelled: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(ModelStreamEvent),
 ) -> Result<ModelResponse, String> {
     let mut text = String::new();
@@ -431,6 +445,9 @@ fn parse_sse_stream(
     let mut total = 0usize;
     let mut line = Vec::new();
     loop {
+        if cancelled() {
+            return Err("response cancelled".to_owned());
+        }
         line.clear();
         let read = (&mut reader)
             .take(MAX_STREAM_LINE_BYTES as u64 + 1)
@@ -1112,6 +1129,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_stream_stops_before_reading_further() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let mut deltas = 0;
+        let result = parse_sse_stream(
+            std::io::Cursor::new(body),
+            MAX_STREAM_BYTES,
+            &|| true,
+            &mut |_| deltas += 1,
+        );
+        assert_eq!(result.unwrap_err(), "response cancelled");
+        assert_eq!(deltas, 0);
+    }
+
+    #[test]
     fn long_text_is_cut_with_a_visible_marker() {
         assert_eq!(bounded_text("héllo", 5), "héllo");
         assert_eq!(
@@ -1259,11 +1290,16 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let mut usage = None;
-        let result = parse_sse_stream(std::io::Cursor::new(body), MAX_STREAM_BYTES, &mut |event| {
-            if let ModelStreamEvent::Usage(reported) = event {
-                usage = Some(reported);
-            }
-        });
+        let result = parse_sse_stream(
+            std::io::Cursor::new(body),
+            MAX_STREAM_BYTES,
+            &|| false,
+            &mut |event| {
+                if let ModelStreamEvent::Usage(reported) = event {
+                    usage = Some(reported);
+                }
+            },
+        );
         assert_eq!(result.unwrap(), ModelResponse::Text("hi".to_owned()));
         let usage = usage.unwrap();
         assert_eq!(usage.input_tokens, 1200);
@@ -1283,6 +1319,7 @@ mod tests {
         let result = parse_sse_stream(
             std::io::Cursor::new(format!(": OPENROUTER PROCESSING\n\n{body}data: [DONE]\n\n")),
             MAX_STREAM_BYTES,
+            &|| false,
             &mut |event| match event {
                 ModelStreamEvent::TextDelta { content } => deltas.push(content),
                 ModelStreamEvent::Usage(_) => {}
@@ -1348,6 +1385,7 @@ mod tests {
         let result = parse_sse_stream(
             std::io::Cursor::new(format!("data: {big}\n\n")),
             32,
+            &|| false,
             &mut |_| {},
         );
         assert_eq!(result.unwrap_err(), "provider response is too large");

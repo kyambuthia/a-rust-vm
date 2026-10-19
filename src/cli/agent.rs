@@ -195,6 +195,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         limits,
     };
     agent.set_permission_policy(policy);
+    super::interrupt::install(agent.cancel_token());
     let mut route = agent.route_request().clone();
     let session_id = extract_session_id(user_arguments);
     let store = SessionStore::new(session_directory());
@@ -344,6 +345,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         let mut turn_usage = a_rust_vm::agent::Usage::default();
         let mut turn_steps = 0usize;
         let mut record = TurnRecord::new(prompt);
+        let turn = super::interrupt::TurnGuard::begin(&agent.cancel_token());
         if let Err(error) = agent.run_streaming_with_approval(
             prompt,
             |request| {
@@ -400,6 +402,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         ) {
             eprintln!("\n[agent error] {error}");
         }
+        drop(turn);
         session.finish_turn(record, agent.conversation());
         if turn_steps > 0 {
             println!("\n[usage] {}", usage_line(turn_steps, &turn_usage));
@@ -532,6 +535,7 @@ fn run_one_shot_agent(
     let mut record = TurnRecord::new(prompt);
     let mut total = a_rust_vm::agent::Usage::default();
     let mut steps = 0usize;
+    let turn = super::interrupt::TurnGuard::begin(&agent.cancel_token());
     let result = agent.run_streaming_with_approval(
         prompt,
         |request| match permission {
@@ -560,7 +564,11 @@ fn run_one_shot_agent(
                 AgentEvent::ToolCall(call) => println!("\n[tool] {}\n", call.name),
                 AgentEvent::ToolResult(result) => println!("\n[tool result] {}\n", result.content),
                 AgentEvent::PermissionRequested(request) => {
-                    println!("\n[permission denied] {}\n", request.description)
+                    let decision = match permission {
+                        OneShotPermission::Auto => "approved (--auto)",
+                        OneShotPermission::Deny => "denied (use --auto or a rule to allow)",
+                    };
+                    println!("\n[permission {decision}] {}\n", request.description)
                 }
                 AgentEvent::RepeatedToolCall { tool, count } => {
                     println!("\n[agent] repeated tool call: {tool} (x{count})\n")
@@ -571,6 +579,7 @@ fn run_one_shot_agent(
             }
         },
     );
+    drop(turn);
     if !json && steps > 0 {
         eprintln!("\n[usage] {}", usage_line(steps, &total));
     }

@@ -819,3 +819,25 @@ fn a_batch_cut_short_keeps_only_the_calls_that_ran() {
     assert_eq!(calls, results, "every recorded call has its result");
     assert!(!calls.contains(&"b"));
 }
+
+#[test]
+fn a_model_error_after_cancellation_ends_the_turn_as_cancelled() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct CancelledMidResponse(Arc<AtomicBool>);
+    impl Model for CancelledMidResponse {
+        fn respond(&mut self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+            self.0.store(true, Ordering::Release);
+            Err(ModelError::new("response cancelled"))
+        }
+        fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
+            self.0 = cancel;
+        }
+    }
+    let mut agent = Agent::new(
+        CancelledMidResponse(Arc::new(AtomicBool::new(false))),
+        vm_tool_registry().unwrap(),
+    );
+    let events = agent.run("hi").unwrap();
+    assert!(events.contains(&AgentEvent::Cancelled), "{events:?}");
+}

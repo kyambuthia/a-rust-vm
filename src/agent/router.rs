@@ -220,6 +220,12 @@ impl ModelRouter {
 }
 
 impl Model for ModelRouter {
+    fn set_cancel_token(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        for entry in self.models.values_mut() {
+            entry.model.set_cancel_token(cancel.clone());
+        }
+    }
+
     fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let candidates = self.candidate_names(&request.route);
         if candidates.is_empty() {

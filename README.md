@@ -172,6 +172,10 @@ After each turn `arvm` prints what it cost, for example
 `/usage` in the REPL shows the session total, and `ask --json` emits a
 `usage` event per model step with the provider and first-token time.
 
+Ctrl-C during a turn cancels it: a running command and its children are
+stopped, a streaming answer ends at its next chunk, and the session keeps
+going. A second Ctrl-C in the same turn, or Ctrl-C at the prompt, quits.
+
 Sessions record every turn: the prompt, each answer, tool call, tool result,
 permission request, and usage figure, plus the exact model context so a
 resumed session continues where it stopped. `arvm agent --session <id>` and

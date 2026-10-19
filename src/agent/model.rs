@@ -97,6 +97,10 @@ impl Model for Box<dyn Model> {
         self.as_mut().respond(request)
     }
 
+    fn set_cancel_token(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.as_mut().set_cancel_token(cancel);
+    }
+
     fn respond_stream(
         &mut self,
         request: &ModelRequest,
@@ -131,6 +135,9 @@ impl std::error::Error for ModelError {}
 /// Provider-neutral model interface.
 pub trait Model {
     fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError>;
+
+    /// Receive the turn's cancel flag, so a long response can stop early.
+    fn set_cancel_token(&mut self, _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 
     fn respond_stream(
         &mut self,

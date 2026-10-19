@@ -24,11 +24,14 @@ pub struct ProcessModel {
     arguments: Vec<String>,
     working_directory: Option<PathBuf>,
     timeout: Duration,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_PROCESS_STDERR_BYTES: usize = 16 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How often a waiting response checks for cancellation.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Tool calls accepted from one step, as for provider models.
 const MAX_PROCESS_TOOL_CALLS: usize = 16;
 
@@ -39,6 +42,7 @@ impl ProcessModel {
             arguments: Vec::new(),
             working_directory: None,
             timeout: DEFAULT_PROCESS_TIMEOUT,
+            cancel: None,
         }
     }
 
@@ -154,13 +158,19 @@ impl ProcessModel {
             if remaining.is_zero() {
                 return Err(ModelError::new("model process timed out"));
             }
-            let line = match line_rx.recv_timeout(remaining) {
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
+            {
+                // Dropping the guard kills the child.
+                return Err(ModelError::new("model process cancelled"));
+            }
+            let line = match line_rx.recv_timeout(remaining.min(CANCEL_POLL_INTERVAL)) {
                 Ok(Ok(Some(line))) => line,
                 Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(Err(error)) => return Err(ModelError::new(error)),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(ModelError::new("model process timed out"));
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
             };
             if line.trim().is_empty() {
                 continue;
@@ -284,6 +294,10 @@ impl Drop for ChildGuard {
 }
 
 impl Model for ProcessModel {
+    fn set_cancel_token(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
     fn respond(&mut self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let mut ignored = |_event: ModelStreamEvent| {};
         self.run_stream(request, &mut ignored)

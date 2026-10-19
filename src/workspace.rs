@@ -824,6 +824,7 @@ fn short_diff(line: usize, old: &str, new: &str) -> String {
 struct RunCommandTool {
     workspace: SharedWorkspace,
     env_passthrough: Vec<String>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RunCommandTool {
@@ -831,6 +832,7 @@ impl RunCommandTool {
         Self {
             workspace,
             env_passthrough,
+            cancel: None,
         }
     }
 }
@@ -870,8 +872,17 @@ impl Tool for RunCommandTool {
         let command = required_text(arguments, "command")?;
         reject_dangerous_command(command)?;
         let workspace = self.workspace.borrow();
-        let output = shell_command(command, workspace.root(), &self.env_passthrough)?;
+        let output = shell_command(
+            command,
+            workspace.root(),
+            &self.env_passthrough,
+            self.cancel.as_deref(),
+        )?;
         Ok(format_command_output(&output))
+    }
+
+    fn set_cancel_token(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(cancel);
     }
 }
 
@@ -880,8 +891,15 @@ fn shell_command(
     command: &str,
     directory: &Path,
     env_passthrough: &[String],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<std::process::Output, ToolError> {
-    shell_command_with_timeout(command, directory, env_passthrough, MAX_COMMAND_RUNTIME)
+    shell_command_with_timeout(
+        command,
+        directory,
+        env_passthrough,
+        MAX_COMMAND_RUNTIME,
+        cancel,
+    )
 }
 
 #[cfg(any(unix, windows))]
@@ -890,6 +908,7 @@ fn shell_command_with_timeout(
     directory: &Path,
     env_passthrough: &[String],
     timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<std::process::Output, ToolError> {
     #[cfg(unix)]
     let mut process = Command::new("sh");
@@ -923,6 +942,12 @@ fn shell_command_with_timeout(
     let deadline = Instant::now() + timeout;
     let group = child.id();
     let status = loop {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+            crate::command_env::kill_process_group(group);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::new("command cancelled"));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(COMMAND_POLL_INTERVAL),
@@ -984,6 +1009,7 @@ fn shell_command(
     _command: &str,
     _directory: &Path,
     _env_passthrough: &[String],
+    _cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<std::process::Output, ToolError> {
     Err(ToolError::new(
         "command execution is unavailable on this target",
@@ -1422,6 +1448,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancelling_stops_a_running_command_and_its_children() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = test_root("cancel-command");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            flag.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let error = super::shell_command_with_timeout(
+            "sleep 20 & sleep 20",
+            &root,
+            &[],
+            std::time::Duration::from_secs(20),
+            Some(&cancel),
+        )
+        .unwrap_err();
+        setter.join().unwrap();
+        assert_eq!(error.message, "command cancelled");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn writes_and_edits_keep_permissions_and_leave_no_temporary_files() {
         use std::os::unix::fs::PermissionsExt;
         let root = test_root("atomic");
@@ -1614,6 +1667,7 @@ mod tests {
             &root,
             &[],
             std::time::Duration::from_millis(100),
+            None,
         )
         .unwrap_err();
 
@@ -1631,6 +1685,7 @@ mod tests {
             &root,
             &[],
             std::time::Duration::from_secs(10),
+            None,
         )
         .unwrap();
         assert!(String::from_utf8_lossy(&output.stdout).contains("started"));
@@ -1642,6 +1697,7 @@ mod tests {
             &root,
             &[],
             std::time::Duration::from_millis(200),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeded"));
@@ -1660,6 +1716,7 @@ mod tests {
             &root,
             &[],
             std::time::Duration::from_secs(10),
+            None,
         )
         .unwrap();
         let printed = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1670,6 +1727,7 @@ mod tests {
             &root,
             &["A_RVM_TEST_SECRET_TOKEN".to_owned()],
             std::time::Duration::from_secs(10),
+            None,
         )
         .unwrap();
         assert!(String::from_utf8_lossy(&output.stdout).contains("hunter2"));

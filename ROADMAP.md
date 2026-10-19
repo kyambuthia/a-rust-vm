@@ -271,8 +271,9 @@ Q1 baseline; read-only exploration triggers no approval prompts.
 
 ### U3: Terminal that stays out of the way
 
-1. Ctrl-C cancels the running turn and keeps the session; a second Ctrl-C
-   exits.
+1. ~~Ctrl-C cancels the running turn and keeps the session; a second Ctrl-C
+   exits~~. A SIGINT handler (no new dependency) sets the cancel flag;
+   commands, the OpenRouter stream, and process models watch it.
 2. Line editing, multiline input, and history per workspace. The standard
    library cannot do raw terminal input, so this is the one place a small,
    audited dependency (or a minimal `termios` binding) is justified; record

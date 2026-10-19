@@ -307,6 +307,7 @@ where
         let mut executed: Vec<String> = Vec::new();
         let mut tool_calls: usize = 0;
         let deadline = Instant::now() + self.turn_timeout;
+        self.model.set_cancel_token(self.cancel.clone());
 
         for _ in 0..self.max_steps {
             if self.cancel.load(Ordering::Acquire) {
@@ -343,8 +344,17 @@ where
                     })
             } else {
                 self.model.respond(&request)
-            }
-            .map_err(AgentError::Model)?;
+            };
+            // A response stopped by cancellation ends the turn as cancelled,
+            // not as a model failure.
+            let response = match response {
+                Err(_) if self.cancel.load(Ordering::Acquire) => {
+                    emit(AgentEvent::Cancelled);
+                    emit(AgentEvent::Done);
+                    return Ok(TurnEnd::Cancelled);
+                }
+                other => other.map_err(AgentError::Model)?,
+            };
             if let Some(mut usage) = step_usage {
                 usage.latency_ms = started.elapsed().as_millis() as u64;
                 usage.first_token_ms = first_token_ms;
