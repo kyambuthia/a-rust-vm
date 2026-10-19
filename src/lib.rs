@@ -14,6 +14,7 @@ pub mod content_store;
 pub mod control_plane;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod control_plane_store;
+pub mod file_walk;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod format_readers;
 pub mod guest_tools;

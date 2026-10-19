@@ -230,6 +230,7 @@ pub fn workspace_tool_registry_with_options(
     registry.register(ListFilesTool::new(workspace.clone()))?;
     registry.register(ReadFileTool::new(workspace.clone()))?;
     registry.register(SearchFilesTool::new(workspace.clone()))?;
+    registry.register(FindFilesTool::new(workspace.clone()))?;
     registry.register(WriteFileTool::new(workspace.clone()))?;
     registry.register(EditFileTool::new(workspace.clone()))?;
     registry.register(RunCommandTool::new(workspace, env_passthrough.to_vec()))?;
@@ -303,7 +304,11 @@ impl Tool for ListFilesTool {
                 if file_type.is_symlink() {
                     return None;
                 }
-                if is_ignored_directory_name(entry.file_name().to_str()) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(crate::file_walk::is_skipped_directory)
+                {
                     return None;
                 }
                 let kind = if file_type.is_dir() { "dir" } else { "file" };
@@ -382,7 +387,9 @@ impl Tool for SearchFilesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "search_files",
-            "Search text files below a workspace path.",
+            "Find lines containing a literal string in text files below a workspace path \
+             (default: the root). Results are path:line:text in path order; .gitignore'd, \
+             binary, and dependency or build directories are skipped.",
             r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}"#,
         )
     }
@@ -393,14 +400,93 @@ impl Tool for SearchFilesTool {
         let requested = optional_text(arguments, "path").unwrap_or(".");
         let workspace = self.workspace.borrow();
         let root = workspace.resolve(requested, false)?;
-        let mut matches = Vec::new();
-        search_directory(&workspace, &root, pattern, &mut matches)?;
-
-        if matches.is_empty() {
-            Ok("(no matches)".to_owned())
-        } else {
-            Ok(matches.join("\n"))
+        if !root.is_dir() {
+            return Err(ToolError::new(format!("not a directory: {requested}")));
         }
+        let (matches, truncated) = search_files(&workspace, &root, pattern)?;
+        if matches.is_empty() {
+            return Ok("(no matches)".to_owned());
+        }
+        let mut output = matches.join("\n");
+        if truncated {
+            output.push_str(&format!(
+                "\n[stopped at {MAX_SEARCH_RESULTS} matches; narrow the pattern or path]"
+            ));
+        }
+        Ok(output)
+    }
+}
+
+struct FindFilesTool {
+    workspace: SharedWorkspace,
+}
+
+impl FindFilesTool {
+    fn new(workspace: SharedWorkspace) -> Self {
+        Self { workspace }
+    }
+}
+
+impl Tool for FindFilesTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "find_files",
+            "List workspace files whose path matches a glob, in path order. `*` and `?` \
+             stay within one directory and `**` spans directories (`src/**/*.rs`); a \
+             pattern without `/` matches file names at any depth (`*.toml`). \
+             .gitignore'd and dependency or build directories are skipped.",
+            r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}"#,
+        )
+    }
+
+    fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
+        ensure_arguments(arguments, &["pattern", "path"])?;
+        let pattern = required_text(arguments, "pattern")?.trim_start_matches("./");
+        let requested = optional_text(arguments, "path").unwrap_or(".");
+        let workspace = self.workspace.borrow();
+        let start = workspace.resolve(requested, false)?;
+        if !start.is_dir() {
+            return Err(ToolError::new(format!("not a directory: {requested}")));
+        }
+        let rules = crate::file_walk::IgnoreRules::load(workspace.root());
+        let by_name = !pattern.contains('/');
+        let mut found = Vec::new();
+        let mut truncated = false;
+        crate::file_walk::walk_files(workspace.root(), &start, &rules, &mut |file| {
+            let below_start = file
+                .path
+                .strip_prefix(&start)
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let subject = if by_name {
+                below_start
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            } else {
+                below_start
+            };
+            if crate::file_walk::glob_matches(pattern, &subject) {
+                if found.len() >= MAX_FIND_RESULTS {
+                    truncated = true;
+                    return false;
+                }
+                found.push(workspace.relative(&file.path));
+            }
+            true
+        })
+        .map_err(|error| ToolError::new(format!("cannot list '{requested}': {error}")))?;
+        if found.is_empty() {
+            return Ok("(no files)".to_owned());
+        }
+        let mut output = found.join("\n");
+        if truncated {
+            output.push_str(&format!(
+                "\n[stopped at {MAX_FIND_RESULTS} files; narrow the pattern or path]"
+            ));
+        }
+        Ok(output)
     }
 }
 
@@ -909,71 +995,56 @@ fn bounded_text(bytes: &[u8]) -> String {
     text
 }
 
-fn search_directory(
-    workspace: &Workspace,
-    directory: &Path,
-    pattern: &str,
-    matches: &mut Vec<String>,
-) -> Result<(), ToolError> {
-    if matches.len() >= MAX_SEARCH_RESULTS {
-        return Ok(());
-    }
+/// Longest line shown in a search result before it is cut.
+const MAX_SEARCH_LINE_CHARS: usize = 300;
+/// Files listed by `find_files` before the list is cut.
+const MAX_FIND_RESULTS: usize = 200;
 
-    let entries = fs::read_dir(directory).map_err(|error| {
-        ToolError::new(format!("cannot search '{}': {error}", directory.display()))
-    })?;
-    for entry in entries.filter_map(Result::ok) {
-        if matches.len() >= MAX_SEARCH_RESULTS {
-            break;
-        }
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => continue,
+/// Matching lines below `start`, in path order, as `path:line:text`.
+/// Binary, oversized, ignored, and non-UTF-8 files are skipped.
+fn search_files(
+    workspace: &Workspace,
+    start: &Path,
+    pattern: &str,
+) -> Result<(Vec<String>, bool), ToolError> {
+    let rules = crate::file_walk::IgnoreRules::load(workspace.root());
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    crate::file_walk::walk_files(workspace.root(), start, &rules, &mut |file| {
+        let Ok(metadata) = fs::metadata(&file.path) else {
+            return true;
         };
-        if file_type.is_symlink() {
-            continue;
+        if metadata.len() > MAX_FILE_BYTES as u64 {
+            return true;
         }
-        if file_type.is_dir() {
-            if is_ignored_directory_name(entry.file_name().to_str()) {
+        let Ok(bytes) = fs::read(&file.path) else {
+            return true;
+        };
+        if bytes.contains(&0) {
+            return true;
+        }
+        let Ok(contents) = String::from_utf8(bytes) else {
+            return true;
+        };
+        let relative = workspace.relative(&file.path);
+        for (line_number, line) in contents.lines().enumerate() {
+            if !line.contains(pattern) {
                 continue;
             }
-            search_directory(workspace, &path, pattern, matches)?;
-            continue;
-        }
-        let metadata = match entry.metadata() {
-            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES as u64 => metadata,
-            _ => continue,
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        let Ok(contents) = String::from_utf8(bytes) else {
-            continue;
-        };
-        for (line_number, line) in contents.lines().enumerate() {
-            if line.contains(pattern) {
-                matches.push(format!(
-                    "{}:{}:{}",
-                    workspace.relative(&path),
-                    line_number + 1,
-                    line
-                ));
-                if matches.len() >= MAX_SEARCH_RESULTS {
-                    break;
-                }
+            if matches.len() >= MAX_SEARCH_RESULTS {
+                truncated = true;
+                return false;
             }
+            let shown = match line.char_indices().nth(MAX_SEARCH_LINE_CHARS) {
+                Some((end, _)) => format!("{}... [line cut]", &line[..end]),
+                None => line.to_owned(),
+            };
+            matches.push(format!("{relative}:{}:{shown}", line_number + 1));
         }
-    }
-    Ok(())
-}
-
-fn is_ignored_directory_name(name: Option<&str>) -> bool {
-    matches!(name, Some(".git" | "target" | ".arvm"))
+        true
+    })
+    .map_err(|error| ToolError::new(format!("cannot search '{}': {error}", start.display())))?;
+    Ok((matches, truncated))
 }
 
 #[cfg(test)]
@@ -1128,6 +1199,99 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn call(
+        registry: &mut crate::agent::ToolRegistry,
+        tool: &str,
+        pairs: &[(&str, &str)],
+    ) -> crate::agent::ToolResult {
+        let arguments = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), ToolValue::Text((*value).to_owned())))
+            .collect();
+        registry.execute(&ToolCall::new("call-1", tool, arguments))
+    }
+
+    fn write_tree(root: &std::path::Path, files: &[(&str, &[u8])]) {
+        for (file, content) in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+
+    #[test]
+    fn find_files_matches_globs_in_path_order() {
+        let root = test_root("find");
+        write_tree(
+            &root,
+            &[
+                ("Cargo.toml", b"x"),
+                ("src/main.rs", b"x"),
+                ("src/cli/mod.rs", b"x"),
+                ("src/cli/notes.md", b"x"),
+                ("gen/out.rs", b"x"),
+                ("node_modules/m/index.rs", b"x"),
+                (".gitignore", b"gen/\n"),
+            ],
+        );
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        let by_name = call(&mut registry, "find_files", &[("pattern", "*.rs")]);
+        assert_eq!(by_name.content, "src/cli/mod.rs\nsrc/main.rs");
+        let by_path = call(&mut registry, "find_files", &[("pattern", "src/*.rs")]);
+        assert_eq!(by_path.content, "src/main.rs");
+        let deep = call(&mut registry, "find_files", &[("pattern", "**/*.md")]);
+        assert_eq!(deep.content, "src/cli/notes.md");
+        let scoped = call(
+            &mut registry,
+            "find_files",
+            &[("pattern", "*.rs"), ("path", "src/cli")],
+        );
+        assert_eq!(scoped.content, "src/cli/mod.rs");
+        let none = call(&mut registry, "find_files", &[("pattern", "*.py")]);
+        assert_eq!(none.content, "(no files)");
+        let escape = call(
+            &mut registry,
+            "find_files",
+            &[("pattern", "*"), ("path", "/etc")],
+        );
+        assert!(escape.is_error, "{}", escape.content);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_skips_binary_and_ignored_files_and_reports_truncation() {
+        let root = test_root("search-quality");
+        let many = "hit\n".repeat(150);
+        let long_line = format!("hit {}", "y".repeat(1_000));
+        write_tree(
+            &root,
+            &[
+                ("b.txt", b"hit two\n"),
+                ("a.txt", b"hit one\n"),
+                ("blob.bin", b"hit\0binary"),
+                ("logs/x.log", b"hit log\n"),
+                (".gitignore", b"*.log\n"),
+                ("long.txt", long_line.as_bytes()),
+            ],
+        );
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        let result = call(&mut registry, "search_files", &[("pattern", "hit")]);
+        let lines = result.content.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "a.txt:1:hit one");
+        assert_eq!(lines[1], "b.txt:1:hit two");
+        assert!(lines[2].starts_with("long.txt:1:hit ") && lines[2].ends_with("[line cut]"));
+        assert_eq!(lines.len(), 3, "{}", result.content);
+
+        write_tree(&root, &[("c.txt", many.as_bytes())]);
+        let capped = call(&mut registry, "search_files", &[("pattern", "hit")]);
+        assert!(capped.content.ends_with("narrow the pattern or path]"));
+        assert_eq!(
+            capped.content.lines().count(),
+            super::MAX_SEARCH_RESULTS + 1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn edit_file_replaces_unique_text_and_reports_a_diff() {
         let root = test_root("edit");
@@ -1256,7 +1420,7 @@ mod tests {
         assert!(request.description.contains("new.txt"));
 
         let coding = coding_tool_registry(&root).unwrap();
-        assert_eq!(coding.specs().len(), 13);
+        assert_eq!(coding.specs().len(), 14);
         std::fs::remove_dir_all(root).unwrap();
     }
 

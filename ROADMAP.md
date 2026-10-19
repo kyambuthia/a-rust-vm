@@ -240,8 +240,11 @@ before-and-after benchmark numbers.
    return a short diff; same approval and path rules as `write_file`~~.
    `replace_all` covers repeated strings; `write_file` rules also govern it.
 2. `read_file` with line ranges and line numbers (done: `offset`/`limit`
-   return numbered lines and reach into files up to 16 MB); a `glob` tool;
-   `search` that skips `.gitignore`d and binary files and caps results.
+   return numbered lines and reach into files up to 16 MB); ~~a `glob` tool;
+   `search` that skips `.gitignore`d and binary files and caps results~~.
+   `find_files` matches globs; both walk in path order, honour the root
+   `.gitignore`, skip dependency and build directories, and say when they
+   stop at their cap.
 3. Parallel tool calls: accept several calls per step; run read-only tools
    concurrently and guarded tools in order.
 4. ~~Budgets instead of a step count: default about 50 steps per turn with a
