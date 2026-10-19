@@ -47,6 +47,9 @@ cargo build --target wasm32-unknown-unknown --lib
 node --input-type=module --check < web/main.js
 ```
 
+`scripts/verify.sh` runs all of these plus clippy and `git diff --check`,
+stopping at the first failure.
+
 For frontend changes, also confirm that the local preview serves `web/`, its
 stylesheet, its module, and the generated Wasm artifact without HTTP errors.
 When browser testing is requested, exercise the primary interaction and check
