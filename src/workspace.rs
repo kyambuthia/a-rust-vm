@@ -562,7 +562,7 @@ impl Tool for WriteFileTool {
                 "cannot write a directory: {requested}"
             )));
         }
-        fs::write(&path, content)
+        write_atomically(&path, content.as_bytes())
             .map_err(|error| ToolError::new(format!("cannot write '{requested}': {error}")))?;
         Ok(format!("wrote {} bytes to {requested}", content.len()))
     }
@@ -654,7 +654,7 @@ impl Tool for EditFileTool {
                 "edited file would exceed the {MAX_FILE_BYTES} byte limit"
             )));
         }
-        fs::write(&path, &updated)
+        write_atomically(&path, updated.as_bytes())
             .map_err(|error| ToolError::new(format!("cannot write '{requested}': {error}")))?;
 
         let count = if replace_all { starts.len() } else { 1 };
@@ -664,6 +664,42 @@ impl Tool for EditFileTool {
             short_diff(line_number_at(&content, first), old, new)
         ))
     }
+}
+
+/// Replace `path` with `bytes` through a temporary sibling and a rename, so
+/// a crash or full disk never leaves a half-written file. An existing
+/// file keeps its permissions.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = parent.join(format!(
+        ".{name}.arvm-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
+            }
+            Ok(())
+        })
+        .and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Read a workspace file that must be bounded, UTF-8 text.
@@ -1381,6 +1417,35 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "w\ny\nw\n"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_and_edits_keep_permissions_and_leave_no_temporary_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_root("atomic");
+        let script = root.join("run.sh");
+        std::fs::write(&script, "echo one\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        let edited = edit(&mut registry, "run.sh", "one", "two", None);
+        assert!(!edited.is_error, "{}", edited.content);
+        let written = call(
+            &mut registry,
+            "write_file",
+            &[("path", "run.sh"), ("content", "echo three\n")],
+        );
+        assert!(!written.is_error, "{}", written.content);
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "echo three\n");
+        let leftovers = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
