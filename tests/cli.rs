@@ -149,6 +149,62 @@ fn task_commands_list_and_show_saved_record() {
 }
 
 #[test]
+fn one_shot_task_records_checkpoint_and_rejects_reuse() {
+    let fixture = Fixture::new("task-run");
+    let model = fixture.model(&[r#"{"type":"text","text":"done"}"#], "unused");
+
+    let output = fixture.ask(&model, &["--json", "--task", "task-1", "inspect", "it"]);
+    assert!(output.status.success(), "{output:?}");
+    let task: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/tasks/task-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(task["status"], "completed");
+    assert_eq!(task["spec"]["prompt"], "inspect it");
+    assert_eq!(task["checkpoint"]["session_id"], "task-1");
+    assert_eq!(task["checkpoint"]["completed_turns"], 1);
+    assert_eq!(task["events"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        fixture.session("task-1")["turns"].as_array().unwrap().len(),
+        1
+    );
+    let mode = fs::metadata(fixture.root.join("state/tasks/task-1.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let reused = fixture.ask(&model, &["--task", "task-1", "again"]);
+    assert_eq!(reused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&reused.stderr).contains("already exists"));
+    assert_eq!(
+        fixture.session("task-1")["turns"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn one_shot_task_records_model_failure() {
+    let fixture = Fixture::new("task-fail");
+    let missing_model = fixture.root.join("missing-model");
+
+    let output = fixture.ask(&missing_model, &["--json", "--task", "failed-1", "go"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let task: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/tasks/failed-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(task["status"], "failed");
+    assert_eq!(task["checkpoint"]["completed_turns"], 1);
+    assert_eq!(
+        fixture.session("failed-1")["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn edit_file_with_auto_changes_the_file_and_records_the_session() {
     let fixture = Fixture::new("edit");
     fixture.write("a.txt", "say hello\n");

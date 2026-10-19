@@ -4,16 +4,20 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use a_rust_vm::agent::{
     Agent, AgentEvent, ModelCapabilities, ModelMode, ModelRouter, ProcessModel, RouteRequest,
     load_project_instructions, system_prompt_with_instructions, system_prompt_with_skills,
 };
 use a_rust_vm::session::{Session, SessionStore, TurnRecord};
+use a_rust_vm::task::{TaskBudget, TaskCheckpoint, TaskEventKind, TaskRecord, TaskSpec};
+use a_rust_vm::task_store::{TaskStore, TaskStoreError};
 use a_rust_vm::workspace::coding_tool_registry_with_options;
 
 use super::config::load_config_or_exit;
 use super::mcp::register_mcp_tools;
-use super::paths::{session_directory, working_directory};
+use super::paths::{session_directory, task_directory, working_directory};
 use super::permission::merged_permission_policy;
 use super::skill::{extract_skill_names, load_requested_skills};
 
@@ -198,11 +202,28 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     super::interrupt::install(agent.cancel_token());
     let mut route = agent.route_request().clone();
     let session_id = extract_session_id(user_arguments);
+    let task_id = extract_task_id(user_arguments);
+    if user_arguments.iter().any(|argument| argument == "--task") && task_id.is_none() {
+        eprintln!("[task] --task requires an id");
+        std::process::exit(2);
+    }
     let store = SessionStore::new(session_directory());
     if let Some((prompt, json)) = parse_one_shot_args(user_arguments) {
         let permission = extract_one_shot_permission(user_arguments);
+        if task_id.is_some() && session_id.is_some() {
+            eprintln!("[task] --task uses its id as the session id; omit --session");
+            std::process::exit(2);
+        }
+        let task_store = TaskStore::new(task_directory());
+        let task = task_id.as_ref().map(|id| {
+            new_one_shot_task(&task_store, &store, id, &working_directory, &prompt, limits)
+                .unwrap_or_else(|error| {
+                    eprintln!("[task] {error}");
+                    std::process::exit(2);
+                })
+        });
         // `ask --session <id>` continues (or starts) a saved session.
-        let session = session_id.as_ref().map(|id| {
+        let session = session_id.as_ref().or(task_id.as_ref()).map(|id| {
             let session = match store.load(id) {
                 Ok(existing) => existing,
                 Err(error) if error.is_not_found() => {
@@ -225,8 +246,13 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             json,
             permission,
             session.map(|s| (&store, s)),
+            task.map(|record| (&task_store, record)),
         );
         return;
+    }
+    if task_id.is_some() {
+        eprintln!("[task] --task requires a one-shot prompt");
+        std::process::exit(2);
     }
     let mut session = match &session_id {
         Some(id) => match store.load(id) {
@@ -473,6 +499,7 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
     let mut skip_next = false;
     for argument in arguments {
         if argument == "--session"
+            || argument == "--task"
             || argument == "--rule"
             || argument == "--skill"
             || argument == "--workspace-dir"
@@ -509,6 +536,61 @@ fn extract_session_id(arguments: &[String]) -> Option<String> {
         .windows(2)
         .find(|window| window[0] == "--session")
         .map(|window| window[1].clone())
+}
+
+fn extract_task_id(arguments: &[String]) -> Option<String> {
+    arguments
+        .windows(2)
+        .find(|window| window[0] == "--task")
+        .map(|window| window[1].clone())
+}
+
+fn new_one_shot_task(
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    id: &str,
+    working_directory: &std::path::Path,
+    prompt: &str,
+    limits: a_rust_vm::config::ResolvedLimits,
+) -> Result<TaskRecord, String> {
+    TaskRecord::validate_id(id).map_err(|error| error.to_string())?;
+    Session::new(id).map_err(|error| error.to_string())?;
+    match task_store.load(id) {
+        Ok(_) => return Err(format!("task '{id}' already exists")),
+        Err(TaskStoreError::NotFound { .. }) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    match session_store.load(id) {
+        Ok(_) => return Err(format!("session '{id}' already exists")),
+        Err(error) if error.is_not_found() => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let canonical = working_directory
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve workspace: {error}"))?;
+    let path = canonical
+        .to_str()
+        .ok_or("workspace path is not valid UTF-8")?;
+    let workspace_id = format!("sha256:{:x}", Sha256::digest(path.as_bytes()));
+    let mut task = TaskRecord::new(TaskSpec {
+        id: id.to_owned(),
+        owner: "local".to_owned(),
+        workspace_id,
+        prompt: prompt.to_owned(),
+        input_version_ids: Vec::new(),
+        budget: TaskBudget {
+            max_model_steps: u32::try_from(limits.max_steps)
+                .map_err(|_| "model step budget exceeds task limit")?,
+            max_tool_calls: u32::try_from(limits.max_tool_calls)
+                .map_err(|_| "tool call budget exceeds task limit")?,
+            timeout_seconds: limits.turn_timeout_secs,
+        },
+    })
+    .map_err(|error| error.to_string())?;
+    task.append(TaskEventKind::Started)
+        .map_err(|error| error.to_string())?;
+    task_store.save(&task).map_err(|error| error.to_string())?;
+    Ok(task)
 }
 
 /// Read an approval answer: `y`/`yes` allows; anything else denies, and
@@ -555,6 +637,7 @@ fn run_one_shot_agent(
     json: bool,
     permission: OneShotPermission,
     mut session: Option<(&SessionStore, Session)>,
+    mut task: Option<(&TaskStore, TaskRecord)>,
 ) {
     let mut record = TurnRecord::new(prompt);
     let mut total = a_rust_vm::agent::Usage::default();
@@ -618,6 +701,16 @@ fn run_one_shot_agent(
             message: error.to_string(),
         });
     }
+    let cancelled = record
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Cancelled));
+    let repeated_call = record
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::RepeatedToolCall { .. }));
+    let mut checkpoint = None;
+    let mut session_save_error = None;
     if let Some((store, session)) = session.as_mut() {
         session.push("user", prompt);
         let answer = record
@@ -633,9 +726,60 @@ fn run_one_shot_agent(
             session.push("assistant", answer);
         }
         session.finish_turn(record, agent.conversation());
-        if let Err(error) = store.save(session) {
-            eprintln!("[session] cannot save: {error}");
+        match store.save(session) {
+            Ok(()) => match u32::try_from(session.turns.len()) {
+                Ok(completed_turns) => {
+                    checkpoint = Some(TaskCheckpoint {
+                        session_id: session.id.clone(),
+                        completed_turns,
+                    })
+                }
+                Err(_) => {
+                    session_save_error =
+                        Some("session turn count exceeds task checkpoint limit".to_owned());
+                }
+            },
+            Err(error) => {
+                eprintln!("[session] cannot save: {error}");
+                session_save_error = Some(error.to_string());
+            }
         }
+    }
+    if let Some((store, task)) = task.as_mut() {
+        if let Some(checkpoint) = checkpoint {
+            task.append(TaskEventKind::Checkpointed { checkpoint })
+                .unwrap_or_else(|error| {
+                    eprintln!("[task] cannot checkpoint: {error}");
+                    std::process::exit(1);
+                });
+        }
+        let outcome = if let Some(error) = &session_save_error {
+            TaskEventKind::Failed {
+                reason: format!("cannot save session: {error}"),
+            }
+        } else if let Err(error) = &result {
+            TaskEventKind::Failed {
+                reason: error.to_string(),
+            }
+        } else if cancelled {
+            TaskEventKind::Cancelled
+        } else if repeated_call {
+            TaskEventKind::Failed {
+                reason: "repeated tool call without an answer".to_owned(),
+            }
+        } else {
+            TaskEventKind::Completed {
+                output_version_ids: Vec::new(),
+            }
+        };
+        task.append(outcome).unwrap_or_else(|error| {
+            eprintln!("[task] cannot record outcome: {error}");
+            std::process::exit(1);
+        });
+        store.save(task).unwrap_or_else(|error| {
+            eprintln!("[task] cannot save outcome: {error}");
+            std::process::exit(1);
+        });
     }
     if let Err(error) = result {
         if json {
@@ -644,6 +788,9 @@ fn run_one_shot_agent(
         } else {
             eprintln!("\n[agent error] {error}\n");
         }
+        std::process::exit(1);
+    }
+    if session_save_error.is_some() && task.is_some() {
         std::process::exit(1);
     }
     if !json {
