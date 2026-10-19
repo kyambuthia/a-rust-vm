@@ -215,11 +215,22 @@ impl PermissionPolicy {
     /// Return the effect of the first rule matching a typed target, or
     /// `Ask` when none matches.
     pub fn decide_target(&self, tool: &str, kind: TargetKind, target: &str) -> PermissionEffect {
+        self.matching_effect(tool, kind, target)
+            .unwrap_or(PermissionEffect::Ask)
+    }
+
+    /// The effect of the first matching rule, or `None` when no rule
+    /// matches, so callers can tell an explicit `ask` from the default.
+    pub fn matching_effect(
+        &self,
+        tool: &str,
+        kind: TargetKind,
+        target: &str,
+    ) -> Option<PermissionEffect> {
         self.rules
             .iter()
             .find(|rule| rule.matches_target(tool, kind, target))
             .map(|rule| rule.effect)
-            .unwrap_or(PermissionEffect::Ask)
     }
 }
 

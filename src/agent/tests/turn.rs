@@ -663,3 +663,72 @@ fn trimmed_history_keeps_a_stable_start_and_never_opens_with_a_tool_result() {
     );
     assert_eq!(kept.len(), 2);
 }
+
+#[cfg(unix)]
+#[test]
+fn read_only_commands_skip_prompts_unless_a_rule_speaks() {
+    let root =
+        std::env::temp_dir().join(format!("a-rust-vm-agent-read-only-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+    let command = |id: &str, text: &str| {
+        ModelResponse::ToolCall(ToolCall::new(
+            id,
+            "run_command",
+            [("command".to_owned(), ToolValue::Text(text.to_owned()))]
+                .into_iter()
+                .collect(),
+        ))
+    };
+    let run = |rules: &[&str], text: &str| {
+        let model = ScriptedModel::new([
+            command("run-1", text),
+            ModelResponse::Text("done".to_owned()),
+        ]);
+        let policy = crate::permissions::PermissionPolicy::with_rules(
+            rules
+                .iter()
+                .map(|rule| crate::permissions::parse_permission_rule(rule).unwrap())
+                .collect(),
+        );
+        let mut agent = Agent::new(
+            model,
+            crate::workspace::workspace_tool_registry(&root).unwrap(),
+        )
+        .with_permission_policy(policy);
+        let mut prompts = 0;
+        let events = agent
+            .run_with_approval("go", |_| {
+                prompts += 1;
+                PermissionDecision::Deny {
+                    reason: "declined".to_owned(),
+                }
+            })
+            .unwrap();
+        let output = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult(result) => Some(result.content.clone()),
+                _ => None,
+            })
+            .unwrap();
+        (prompts, output)
+    };
+
+    let (prompts, output) = run(&[], "cat notes.txt");
+    assert_eq!(prompts, 0);
+    assert!(output.contains("hello"), "{output}");
+
+    // Not read-only: asks as before.
+    let (prompts, output) = run(&[], "touch made.txt");
+    assert_eq!((prompts, output.as_str()), (1, "declined"));
+    assert!(!root.join("made.txt").exists());
+
+    // An explicit ask rule restores the prompt; a deny rule refuses.
+    let (prompts, _) = run(&["ask run_command"], "cat notes.txt");
+    assert_eq!(prompts, 1);
+    let (prompts, output) = run(&["deny run_command:cat"], "cat notes.txt");
+    assert_eq!(prompts, 0);
+    assert!(output.contains("permission rule denies"), "{output}");
+    std::fs::remove_dir_all(root).unwrap();
+}

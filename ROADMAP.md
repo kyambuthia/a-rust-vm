@@ -256,9 +256,12 @@ before-and-after benchmark numbers.
    older turns into a summary (fast model) when near the limit.
 6. Retained tool results: long output is truncated in context with an id;
    `read_tool_result <id> [range]` fetches the rest.
-7. Read-only commands without prompts: a built-in allow set (`git status`,
+7. ~~Read-only commands without prompts: a built-in allow set (`git status`,
    `git diff`, `git log`, `ls`, `cat`, `rg`) that still passes the dangerous-
-   command and metacharacter checks.
+   command and metacharacter checks~~. `src/read_only_commands.rs` also
+   refuses flags that run programs or write files, paths that resolve
+   outside the workspace, and git in repositories whose config can run a
+   program. Rules are checked first, so `ask run_command` restores prompts.
 
 Exit: the benchmark's success rate rises and tokens per task fall against the
 Q1 baseline; read-only exploration triggers no approval prompts.

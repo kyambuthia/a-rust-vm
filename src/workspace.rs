@@ -791,6 +791,18 @@ impl Tool for RunCommandTool {
         })
     }
 
+    fn preapproved(&self, arguments: &ToolArguments) -> bool {
+        let Some(command) = optional_text(arguments, "command") else {
+            return false;
+        };
+        arguments.len() == 1
+            && reject_dangerous_command(command).is_ok()
+            && crate::read_only_commands::is_read_only_command(
+                command,
+                self.workspace.borrow().root(),
+            )
+    }
+
     fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
         ensure_arguments(arguments, &["command"])?;
         let command = required_text(arguments, "command")?;

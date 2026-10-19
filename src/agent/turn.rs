@@ -418,9 +418,10 @@ where
         };
 
         let (kind, target) = rule_target(call);
-        let effect = self
+        let rule_effect = self
             .permission_policy
-            .decide_target(&call.name, kind, &target);
+            .matching_effect(&call.name, kind, &target);
+        let effect = rule_effect.unwrap_or(PermissionEffect::Ask);
         // Deny rules win over anything remembered earlier in the session.
         if effect == PermissionEffect::Deny {
             return ToolResult {
@@ -430,8 +431,11 @@ where
                 is_error: true,
             };
         }
+        // A preapproved call (such as a read-only command) skips the prompt
+        // only when no rule spoke, so an explicit `ask` rule still asks.
         if effect == PermissionEffect::Allow
             || self.session_approvals.is_allowed(&call.name, &target)
+            || (rule_effect.is_none() && self.tools.is_preapproved(call))
         {
             return self.tools.execute(call);
         }

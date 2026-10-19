@@ -248,6 +248,15 @@ outcome more cautious:
   redirects. A `deny` or `ask` rule matches any command in such a line, so
   `deny run_command:rm` also blocks `ls; /bin/rm -rf x`.
 - `deny` rules override approvals remembered earlier in the session.
+- Read-only commands run without a prompt when no rule matches them:
+  `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `stat`, `du`, `diff`, `grep`,
+  `rg`, and `git status|diff|log|show|blame|ls-files|rev-parse|grep`. A
+  command qualifies only as one plain command (no `;`, pipes, redirects,
+  quotes, globs, or `$`), without flags that run programs or write files
+  (`rg --pre`, `git diff --output`, `tail -f`, ...), and with every path
+  inside the workspace. `git` qualifies only while the repository's own
+  config sets nothing that can run a program. Add `ask run_command` to be
+  asked for every command again.
 - A `write_file` rule also governs `edit_file`, so `deny write_file:secrets`
   blocks edits too; an `edit_file` rule covers edits only.
 

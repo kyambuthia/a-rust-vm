@@ -38,6 +38,12 @@ pub trait Tool {
         None
     }
 
+    /// Whether a guarded call is harmless enough to run without asking when
+    /// no permission rule decides it. Rules are still checked first.
+    fn preapproved(&self, _arguments: &ToolArguments) -> bool {
+        false
+    }
+
     fn set_cancel_token(&mut self, _cancel: Arc<AtomicBool>) {}
 }
 
@@ -112,6 +118,12 @@ impl ToolRegistry {
                 is_error: true,
             },
         }
+    }
+
+    pub fn is_preapproved(&self, call: &ToolCall) -> bool {
+        self.tools
+            .get(&call.name)
+            .is_some_and(|tool| tool.preapproved(&call.arguments))
     }
 
     pub fn permission_request(&self, call: &ToolCall) -> Option<PermissionRequest> {
