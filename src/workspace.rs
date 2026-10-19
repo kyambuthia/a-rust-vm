@@ -25,7 +25,9 @@ fn sanitize_permission_component(value: &str) -> String {
 const MAX_FILE_BYTES: usize = 128 * 1024;
 const MAX_SEARCH_RESULTS: usize = 100;
 /// Command output kept from each stream: the start and the end.
+#[cfg(any(unix, windows))]
 const COMMAND_OUTPUT_HEAD_BYTES: usize = 4 * 1024;
+#[cfg(any(unix, windows))]
 const COMMAND_OUTPUT_TAIL_BYTES: usize = 12 * 1024;
 #[cfg(any(unix, windows))]
 const MAX_COMMAND_RUNTIME: Duration = Duration::from_secs(30);
@@ -992,6 +994,7 @@ fn bounded_pipe_output(pipe: impl Read) -> Vec<u8> {
     capture_head_and_tail(pipe, COMMAND_OUTPUT_HEAD_BYTES, COMMAND_OUTPUT_TAIL_BYTES)
 }
 
+#[cfg(any(unix, windows))]
 /// Keep the first `head` and last `tail` bytes of a stream, with a note of
 /// how much was skipped between them. Failures and summaries usually come
 /// at the end of build and test output, so the tail matters most.
