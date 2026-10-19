@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const TASK_SCHEMA_VERSION: u32 = 1;
+pub const TASK_SCHEMA_VERSION: u32 = 2;
 const MAX_EVENTS: usize = 512;
 const MAX_PLAN_STEPS: usize = 128;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -54,6 +54,7 @@ pub struct TaskCheckpoint {
 pub enum TaskStatus {
     Pending,
     Running,
+    Paused,
     WaitingApproval,
     Completed,
     Failed,
@@ -64,6 +65,8 @@ pub enum TaskStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskEventKind {
     Started,
+    Resumed,
+    Paused,
     PlanUpdated { plan: TaskPlan },
     Checkpointed { checkpoint: TaskCheckpoint },
     ApprovalRequested { request_id: String },
@@ -216,10 +219,18 @@ impl TaskRecord {
         }
         let stored: Self =
             serde_json::from_slice(bytes).map_err(|error| TaskError::Decode(error.to_string()))?;
-        if stored.schema_version != TASK_SCHEMA_VERSION {
+        if !matches!(stored.schema_version, 1 | TASK_SCHEMA_VERSION) {
             return Err(TaskError::UnsupportedSchema {
                 actual: stored.schema_version,
             });
+        }
+        if stored.schema_version == 1
+            && stored
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, TaskEventKind::Paused | TaskEventKind::Resumed))
+        {
+            return Err(TaskError::InvalidRecord);
         }
         let mut replayed = Self::new(stored.spec.clone())?;
         for event in &stored.events {
@@ -228,10 +239,12 @@ impl TaskRecord {
                 return Err(TaskError::InvalidRecord);
             }
         }
-        if replayed != stored {
+        let mut expected = stored;
+        expected.schema_version = TASK_SCHEMA_VERSION;
+        if replayed != expected {
             return Err(TaskError::InvalidRecord);
         }
-        Ok(stored)
+        Ok(expected)
     }
 
     fn transition(&self, kind: &TaskEventKind) -> Result<NextState, TaskError> {
@@ -243,6 +256,17 @@ impl TaskRecord {
         };
         match (self.status, kind) {
             (TaskStatus::Pending, TaskEventKind::Started) => next.status = TaskStatus::Running,
+            (TaskStatus::Paused, TaskEventKind::Resumed) => next.status = TaskStatus::Running,
+            (TaskStatus::Running, TaskEventKind::Paused) => {
+                if self.checkpoint.is_none()
+                    || !self.events.last().is_some_and(|event| {
+                        matches!(event.kind, TaskEventKind::Checkpointed { .. })
+                    })
+                {
+                    return Err(TaskError::InvalidField("pause checkpoint"));
+                }
+                next.status = TaskStatus::Paused;
+            }
             (TaskStatus::Running, TaskEventKind::PlanUpdated { plan }) => {
                 if plan.steps.is_empty() || plan.steps.len() > MAX_PLAN_STEPS {
                     return Err(TaskError::InvalidField("plan steps"));
@@ -316,6 +340,8 @@ impl TaskEventKind {
     fn name(&self) -> &'static str {
         match self {
             Self::Started => "started",
+            Self::Resumed => "resumed",
+            Self::Paused => "paused",
             Self::PlanUpdated { .. } => "plan_updated",
             Self::Checkpointed { .. } => "checkpointed",
             Self::ApprovalRequested { .. } => "approval_requested",
@@ -418,6 +444,76 @@ mod tests {
         assert_eq!(TaskRecord::restore(&encoded).unwrap(), task);
         assert_eq!(task.status(), TaskStatus::Completed);
         assert_eq!(task.events().len(), 4);
+    }
+
+    #[test]
+    fn pause_requires_a_checkpoint_and_can_resume() {
+        let mut task = TaskRecord::new(spec()).unwrap();
+        task.append(TaskEventKind::Started).unwrap();
+        assert_eq!(
+            task.append(TaskEventKind::Paused),
+            Err(TaskError::InvalidField("pause checkpoint"))
+        );
+        task.append(TaskEventKind::Checkpointed {
+            checkpoint: TaskCheckpoint {
+                session_id: "task-1".to_owned(),
+                completed_turns: 1,
+            },
+        })
+        .unwrap();
+        task.append(TaskEventKind::Paused).unwrap();
+        assert_eq!(task.status(), TaskStatus::Paused);
+        assert_eq!(
+            task.append(TaskEventKind::Completed {
+                output_version_ids: vec![],
+            }),
+            Err(TaskError::InvalidTransition {
+                status: TaskStatus::Paused,
+                event: "completed",
+            })
+        );
+        task.append(TaskEventKind::Resumed).unwrap();
+        task.append(TaskEventKind::Checkpointed {
+            checkpoint: TaskCheckpoint {
+                session_id: "task-1".to_owned(),
+                completed_turns: 2,
+            },
+        })
+        .unwrap();
+        task.append(TaskEventKind::Completed {
+            output_version_ids: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            TaskRecord::restore(&serde_json::to_vec(&task).unwrap()).unwrap(),
+            task
+        );
+    }
+
+    #[test]
+    fn version_one_records_migrate_without_losing_history() {
+        let mut task = TaskRecord::new(spec()).unwrap();
+        task.append(TaskEventKind::Started).unwrap();
+        let mut old = serde_json::to_value(&task).unwrap();
+        old["schema_version"] = serde_json::json!(1);
+        assert_eq!(
+            TaskRecord::restore(&serde_json::to_vec(&old).unwrap()).unwrap(),
+            task
+        );
+        task.append(TaskEventKind::Checkpointed {
+            checkpoint: TaskCheckpoint {
+                session_id: "task-1".to_owned(),
+                completed_turns: 1,
+            },
+        })
+        .unwrap();
+        task.append(TaskEventKind::Paused).unwrap();
+        let mut invalid_old = serde_json::to_value(&task).unwrap();
+        invalid_old["schema_version"] = serde_json::json!(1);
+        assert_eq!(
+            TaskRecord::restore(&serde_json::to_vec(&invalid_old).unwrap()),
+            Err(TaskError::InvalidRecord)
+        );
     }
 
     #[test]
