@@ -42,7 +42,7 @@ cargo run -- coding-demo
 
 ## Measure agent task completion
 
-The disposable CLI benchmark runs scripted model decisions through the real
+The 12-case disposable CLI benchmark runs scripted model decisions through the real
 `arvm ask` binary, then checks workspace file contents and unexpected extra
 files. It needs no provider key and writes a content-free JSON summary under
 the ignored `target/` directory:
@@ -50,6 +50,10 @@ the ignored `target/` directory:
 ```bash
 scripts/bench --mode scripted --output target/bench/baseline.json
 ```
+
+Use `--case <id>` to run one case; `scripts/bench --help` lists the IDs.
+The checker compares exact file bytes, so a semantically correct alternative
+format may still score as a failure in live mode.
 
 To run the same tasks with a real model, explicitly select live mode and pin
 the OpenRouter model. This makes provider requests and incurs their cost. The

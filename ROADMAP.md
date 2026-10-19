@@ -232,9 +232,11 @@ token streams, and `/usage` shows tokens, cache hits, and cost.
    M1.1-M1.2. (Started: `tests/cli.rs` covers edits, rules, read-only
    commands, `.git` writes, redaction, batched calls, and Ctrl-C with a
    POSIX `sh` model. A scripted MCP server is still open.)
-3. `scripts/bench`: ten fixed coding tasks in throwaway repositories (fix a
-   failing test, rename across files, add a CLI flag, ...) run against a real
-   model on demand, reporting success, steps, tokens, cache hits, and time.
+3. `scripts/bench`: twelve fixed coding, document/data, recovery, and policy
+   tasks in throwaway workspaces, run against a scripted model in CI and a
+   pinned real model on demand, reporting success, steps, tokens, cache hits,
+   and time. (Scripted suite is in CI; a pinned live-model baseline remains
+   to be recorded on demand.)
 
 Exit: CI runs the scripted suite, and every U2/U3 commit body can quote
 before-and-after benchmark numbers.

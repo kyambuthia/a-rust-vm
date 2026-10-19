@@ -57,9 +57,8 @@ focused test. Move to the next milestone only after its exit gate passes.
 milestone can compare task completion and cost against it. All scripted
 authorization and interruption cases pass.
 
-In progress: `scripts/bench` has four disposable cases and records a scripted
-baseline. The full 12-case set and an explicitly requested live-model baseline
-are still open.
+In progress: `scripts/bench` has 12 disposable cases and runs the scripted
+suite in CI. An explicitly requested live-model baseline is still open.
 
 ### G1. Make a task durable and reviewable
 

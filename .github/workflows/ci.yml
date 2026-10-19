@@ -40,6 +40,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Scripted agent benchmark
+        run: scripts/bench --mode scripted --output target/bench/ci.json
+
       - name: Wasm build
         run: cargo build --target wasm32-unknown-unknown --lib
 
