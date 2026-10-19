@@ -226,7 +226,9 @@ token streams, and `/usage` shows tokens, cache hits, and cost.
    record per turn and the exact model context; `ask --session` resumes.
 2. `tests/` integration suite that drives the real `arvm` binary with a
    scripted model and scripted MCP server, like the manual checks used for
-   M1.1-M1.2.
+   M1.1-M1.2. (Started: `tests/cli.rs` covers edits, rules, read-only
+   commands, `.git` writes, redaction, batched calls, and Ctrl-C with a
+   POSIX `sh` model. A scripted MCP server is still open.)
 3. `scripts/bench`: ten fixed coding tasks in throwaway repositories (fix a
    failing test, rename across files, add a CLI flag, ...) run against a real
    model on demand, reporting success, steps, tokens, cache hits, and time.
