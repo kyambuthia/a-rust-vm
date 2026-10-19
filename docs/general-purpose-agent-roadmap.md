@@ -79,6 +79,10 @@ still open.
 client without repeating a material effect. Its final answer links to the
 exact output versions and verification events.
 
+In progress: `src/task.rs` defines a versioned, replay-validated task record
+with plans, checkpoints, approval states, and terminal outcomes. Persistence
+and CLI/browser wiring remain open.
+
 ### G2. Execute useful work inside real boundaries
 
 1. Implement the accepted runner contract: declared inputs, resource limits,

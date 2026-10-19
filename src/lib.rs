@@ -35,6 +35,7 @@ pub mod runtime;
 pub mod session;
 pub mod session_snapshot;
 pub mod skills;
+pub mod task;
 pub mod workspace;
 
 #[cfg(not(target_arch = "wasm32"))]
