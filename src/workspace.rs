@@ -24,7 +24,9 @@ fn sanitize_permission_component(value: &str) -> String {
 
 const MAX_FILE_BYTES: usize = 128 * 1024;
 const MAX_SEARCH_RESULTS: usize = 100;
-const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+/// Command output kept from each stream: the start and the end.
+const COMMAND_OUTPUT_HEAD_BYTES: usize = 4 * 1024;
+const COMMAND_OUTPUT_TAIL_BYTES: usize = 12 * 1024;
 #[cfg(any(unix, windows))]
 const MAX_COMMAND_RUNTIME: Duration = Duration::from_secs(30);
 #[cfg(any(unix, windows))]
@@ -986,22 +988,40 @@ fn shell_command_with_timeout(
 }
 
 #[cfg(any(unix, windows))]
-fn bounded_pipe_output(mut pipe: impl Read) -> Vec<u8> {
-    let mut captured = Vec::new();
+fn bounded_pipe_output(pipe: impl Read) -> Vec<u8> {
+    capture_head_and_tail(pipe, COMMAND_OUTPUT_HEAD_BYTES, COMMAND_OUTPUT_TAIL_BYTES)
+}
+
+/// Keep the first `head` and last `tail` bytes of a stream, with a note of
+/// how much was skipped between them. Failures and summaries usually come
+/// at the end of build and test output, so the tail matters most.
+fn capture_head_and_tail(mut pipe: impl Read, head: usize, tail: usize) -> Vec<u8> {
+    let mut first = Vec::new();
+    let mut last = std::collections::VecDeque::with_capacity(tail);
+    let mut skipped = 0usize;
     let mut buffer = [0u8; 4096];
     loop {
-        match pipe.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(bytes) => {
-                if captured.len() < MAX_COMMAND_OUTPUT_BYTES {
-                    let remaining = MAX_COMMAND_OUTPUT_BYTES - captured.len();
-                    captured.extend_from_slice(&buffer[..bytes.min(remaining)]);
-                }
+        let bytes = match pipe.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(bytes) => &buffer[..bytes],
+        };
+        let into_head = bytes.len().min(head - first.len());
+        first.extend_from_slice(&bytes[..into_head]);
+        for &byte in &bytes[into_head..] {
+            if last.len() == tail {
+                last.pop_front();
+                skipped += 1;
             }
-            Err(_) => break,
+            last.push_back(byte);
         }
     }
-    captured
+    if skipped > 0 {
+        first.extend_from_slice(
+            format!("\n[... {skipped} bytes of output omitted ...]\n").as_bytes(),
+        );
+    }
+    first.extend(last);
+    first
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1086,13 +1106,7 @@ fn format_command_output(output: &std::process::Output) -> String {
 }
 
 fn bounded_text(bytes: &[u8]) -> String {
-    let truncated = bytes.len() > MAX_COMMAND_OUTPUT_BYTES;
-    let end = bytes.len().min(MAX_COMMAND_OUTPUT_BYTES);
-    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    if truncated {
-        text.push_str("\n[output truncated]");
-    }
-    text
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Longest line shown in a search result before it is cut.
@@ -1654,6 +1668,44 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("stdout:\nhello"));
         assert!(result.content.contains("exit_code=0"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_output_keeps_its_start_and_end_with_a_note() {
+        let input = (0..10_000).map(|n| format!("{n}\n")).collect::<String>();
+        let kept = super::capture_head_and_tail(input.as_bytes(), 10, 20);
+        let text = String::from_utf8(kept).unwrap();
+        assert!(text.starts_with("0\n1\n2\n3\n4\n"), "{text}");
+        assert!(text.ends_with("9997\n9998\n9999\n"), "{text}");
+        let skipped = input.len() - 30;
+        assert!(text.contains(&format!("[... {skipped} bytes of output omitted ...]")));
+        // Short output passes through unchanged.
+        assert_eq!(super::capture_head_and_tail(&b"hi\n"[..], 10, 20), b"hi\n");
+        assert_eq!(
+            super::capture_head_and_tail(&b"0123456789abc"[..], 10, 20),
+            b"0123456789abc"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_test_output_shows_the_end() {
+        let root = test_root("command-tail");
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        let result = call(
+            &mut registry,
+            "run_command",
+            &[("command", "seq 1 20000; echo FINAL-FAILURE >&2; exit 3")],
+        );
+        assert!(
+            result.content.contains("bytes of output omitted"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("20000\n"));
+        assert!(result.content.contains("FINAL-FAILURE"));
+        assert!(result.content.ends_with("exit_code=3"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
