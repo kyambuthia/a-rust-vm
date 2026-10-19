@@ -192,6 +192,32 @@ impl Workspace {
         Ok(resolved)
     }
 
+    /// Resolve a path the agent wants to write. Paths inside a `.git`
+    /// directory are refused: hooks and config there run programs, so a
+    /// write could become command execution on the next git command.
+    fn resolve_for_write(
+        &self,
+        requested: &str,
+        allow_missing: bool,
+    ) -> Result<PathBuf, ToolError> {
+        let path = self.resolve(requested, allow_missing)?;
+        let base = std::iter::once(&self.root)
+            .chain(&self.additional)
+            .find(|base| path.starts_with(base))
+            .unwrap_or(&self.root);
+        let inside_git = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .components()
+            .any(|component| component.as_os_str() == ".git");
+        if inside_git {
+            return Err(ToolError::new(format!(
+                "refusing to write inside .git: {requested}; use git commands instead"
+            )));
+        }
+        Ok(path)
+    }
+
     fn relative(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
@@ -530,7 +556,7 @@ impl Tool for WriteFileTool {
         }
 
         let workspace = self.workspace.borrow();
-        let path = workspace.resolve(requested, true)?;
+        let path = workspace.resolve_for_write(requested, true)?;
         if path.exists() && path.is_dir() {
             return Err(ToolError::new(format!(
                 "cannot write a directory: {requested}"
@@ -594,7 +620,7 @@ impl Tool for EditFileTool {
         }
 
         let workspace = self.workspace.borrow();
-        let path = workspace.resolve(requested, false)?;
+        let path = workspace.resolve_for_write(requested, false)?;
         let content = read_bounded_text(&path, requested)?;
         let starts = content
             .match_indices(old)
@@ -1355,6 +1381,59 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "w\ny\nw\n"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_and_edits_inside_git_are_refused() {
+        let root = test_root("git-write");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        for path in [".git/hooks/pre-commit", "./.git/config", "sub/.git/config"] {
+            let write = call(
+                &mut registry,
+                "write_file",
+                &[("path", path), ("content", "#!/bin/sh\nrun-me\n")],
+            );
+            assert!(
+                write.is_error && write.content.contains(".git"),
+                "{path}: {}",
+                write.content
+            );
+        }
+        assert!(!root.join(".git/hooks/pre-commit").exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join(".git/hooks"), root.join("hooks")).unwrap();
+            let through_link = call(
+                &mut registry,
+                "write_file",
+                &[("path", "hooks/pre-commit"), ("content", "run-me")],
+            );
+            assert!(through_link.is_error, "{}", through_link.content);
+            assert!(!root.join(".git/hooks/pre-commit").exists());
+        }
+        let edited = edit(
+            &mut registry,
+            ".git/config",
+            "[core]",
+            "[core]\n\tfsmonitor = x",
+            None,
+        );
+        assert!(edited.is_error, "{}", edited.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/config")).unwrap(),
+            "[core]\n"
+        );
+        // Similar names outside .git are fine.
+        let ignore = call(
+            &mut registry,
+            "write_file",
+            &[("path", ".gitignore"), ("content", "target/\n")],
+        );
+        assert!(!ignore.is_error, "{}", ignore.content);
         std::fs::remove_dir_all(root).unwrap();
     }
 

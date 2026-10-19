@@ -257,6 +257,8 @@ outcome more cautious:
   inside the workspace. `git` qualifies only while the repository's own
   config sets nothing that can run a program. Add `ask run_command` to be
   asked for every command again.
+- `write_file` and `edit_file` never write inside a `.git` directory, even
+  through a symlink: hooks and config there run programs.
 - A `write_file` rule also governs `edit_file`, so `deny write_file:secrets`
   blocks edits too; an `edit_file` rule covers edits only.
 
