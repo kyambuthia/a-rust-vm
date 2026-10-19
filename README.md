@@ -40,6 +40,32 @@ To exercise the coding-agent tools against this workspace:
 cargo run -- coding-demo
 ```
 
+## Measure agent task completion
+
+The disposable CLI benchmark runs scripted model decisions through the real
+`arvm ask` binary, then checks workspace file contents and unexpected extra
+files. It needs no provider key and writes a content-free JSON summary under
+the ignored `target/` directory:
+
+```bash
+scripts/bench --mode scripted --output target/bench/baseline.json
+```
+
+To run the same tasks with a real model, explicitly select live mode and pin
+the OpenRouter model. This makes provider requests and incurs their cost. The
+benchmark permits workspace file edits through a rule, while other guarded
+tools stay subject to one-shot denial. Each case runs in its own temporary
+workspace and state directory.
+
+```bash
+OPENROUTER_API_KEY=... OPENROUTER_MODEL=... \
+  scripts/bench --mode live --output target/bench/live.json
+```
+
+The summary records completion, model steps, tool calls, elapsed time, usage
+reported by the provider, and hashes of expected and actual output files. It
+does not retain prompts, tool output, session transcripts, or credentials.
+
 ## Run the browser agent
 
 Build the Wasm runtime and start the local browser host:

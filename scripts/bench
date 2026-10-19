@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Run disposable, outcome-graded agent tasks against arvm ask.
+
+The scripted mode needs no provider or credentials. Live mode uses the native
+OpenRouter adapter and incurs provider usage only when explicitly selected.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SCHEMA = 1
+
+
+def call(name, **arguments):
+    return {"name": name, "arguments": arguments}
+
+
+CASES = [
+    {
+        "id": "coding_fix_operator",
+        "category": "coding",
+        "prompt": "Fix the add function in calc.py so it returns the sum. Change only that file.",
+        "files": {"calc.py": "def add(a, b):\n    return a - b\n"},
+        "expected": {"calc.py": "def add(a, b):\n    return a + b\n"},
+        "stages": [[call("edit_file", path="calc.py", old_string="a - b", new_string="a + b")]],
+    },
+    {
+        "id": "document_summary",
+        "category": "document_data",
+        "prompt": (
+            "Read notes.txt and write summary.md with exactly two bullet points: "
+            "'- Release: Friday' and '- Owner: Maya'."
+        ),
+        "files": {"notes.txt": "Release: Friday\nOwner: Maya\n"},
+        "expected": {"summary.md": "- Release: Friday\n- Owner: Maya\n"},
+        "stages": [
+            [call("read_file", path="notes.txt")],
+            [call("write_file", path="summary.md", content="- Release: Friday\n- Owner: Maya\n")],
+        ],
+    },
+    {
+        "id": "recover_missing_file",
+        "category": "recovery",
+        "prompt": (
+            "Find the project identifier in the workspace and write it to result.txt. "
+            "If a guessed path is absent, inspect the available file instead."
+        ),
+        "files": {"project.txt": "project_id=ARVM-42\n"},
+        "expected": {"result.txt": "ARVM-42\n"},
+        "required_error_tool": "read_file",
+        "stages": [
+            [call("read_file", path="missing.txt")],
+            [call("read_file", path="project.txt")],
+            [call("write_file", path="result.txt", content="ARVM-42\n")],
+        ],
+    },
+    {
+        "id": "deny_protected_edit",
+        "category": "policy",
+        "prompt": "Change secret.txt to 'changed'. Follow the workspace permission decision.",
+        "files": {"secret.txt": "original\n"},
+        "expected": {"secret.txt": "original\n"},
+        "rules": ["deny write_file:secret.txt"],
+        "required_error_tool": "edit_file",
+        "stages": [
+            [call("edit_file", path="secret.txt", old_string="original", new_string="changed")]
+        ],
+    },
+]
+
+
+def scripted_model():
+    request = json.load(sys.stdin)
+    with open(os.environ["A_RVM_BENCH_MODEL_LOG"], "ab") as log:
+        log.write(b"step\n")
+    stages = json.loads(os.environ["A_RVM_BENCH_STAGES"])
+    seen = set()
+    for message in request.get("current_turn", []):
+        tool = message.get("tool_call")
+        if tool and tool.get("id", "").startswith("bench-"):
+            seen.add(tool["id"].split("-")[1])
+    index = len(seen)
+    if index < len(stages):
+        for position, tool in enumerate(stages[index]):
+            print(
+                json.dumps(
+                    {
+                        "type": "tool_call",
+                        "id": f"bench-{index}-{position}",
+                        "name": tool["name"],
+                        "arguments": tool["arguments"],
+                    }
+                )
+            )
+    else:
+        print(json.dumps({"type": "text", "text": "Task complete; check the tool results."}))
+    print('{"type":"done"}')
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def workspace_files(workspace):
+    files = {}
+    symlinks = []
+    for directory, names, filenames in os.walk(workspace, followlinks=False):
+        for name in names + filenames:
+            path = Path(directory) / name
+            relative = path.relative_to(workspace).as_posix()
+            if path.is_symlink():
+                symlinks.append(relative)
+            elif path.is_file():
+                files[relative] = path.read_bytes()
+    return files, symlinks
+
+
+def run_process(command, env, cwd, timeout):
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+        timed_out = True
+    return process.returncode, stdout, stderr, time.monotonic() - started, timed_out
+
+
+def run_case(case, mode, binary, timeout):
+    with tempfile.TemporaryDirectory(prefix="arvm-bench-") as temporary:
+        base = Path(temporary)
+        workspace = base / "workspace"
+        workspace.mkdir()
+        for name, content in case["files"].items():
+            path = workspace / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        env = os.environ.copy()
+        env["A_RVM_STATE_DIR"] = str(base / "state")
+        env["A_RVM_CONFIG_DIR"] = str(base / "config")
+        env.pop("A_RVM_MODEL_PROGRAM", None)
+        env.pop("A_RVM_MODEL_ARGS", None)
+        if mode == "scripted":
+            env.pop("OPENROUTER_API_KEY", None)
+            env["A_RVM_MODEL_PROGRAM"] = str(Path(__file__).resolve())
+            env["A_RVM_MODEL_ARGS"] = "--model"
+            env["A_RVM_BENCH_STAGES"] = json.dumps(case["stages"])
+            env["A_RVM_BENCH_MODEL_LOG"] = str(base / "model_calls.txt")
+        command = [str(binary), "ask", "--json", "--session", "bench"]
+        for rule in case.get("rules", []):
+            command.extend(["--rule", rule])
+        command.extend(["--rule", "allow write_file", case["prompt"]])
+        returncode, stdout, stderr, seconds, timed_out = run_process(
+            command, env, workspace, timeout
+        )
+        events = []
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        results = [event for event in events if event.get("type") == "tool_result"]
+        tool_errors = [event for event in results if event.get("is_error")]
+        actual_files, symlinks = workspace_files(workspace)
+        expected_files = {
+            **{name: content.encode("utf-8") for name, content in case["files"].items()},
+            **{name: content.encode("utf-8") for name, content in case["expected"].items()},
+        }
+        files = {}
+        for name, expected in expected_files.items():
+            actual = actual_files.get(name)
+            files[name] = {
+                "matches": actual == expected,
+                "expected_sha256": digest(expected),
+                "actual_sha256": digest(actual) if actual is not None else None,
+            }
+        unexpected_paths = sorted(set(actual_files) - set(expected_files)) + symlinks
+        required_error = case.get("required_error_tool")
+        expected_error_seen = mode == "live" or required_error is None or any(
+            event.get("name") == required_error for event in tool_errors
+        )
+        unexpected_errors = (
+            [event.get("name") for event in tool_errors if event.get("name") != required_error]
+            if mode == "scripted"
+            else []
+        )
+        usage = [event for event in events if event.get("type") == "usage"]
+        model_log = base / "model_calls.txt"
+        model_steps = (
+            model_log.read_bytes().count(b"step\n") if model_log.is_file() else len(usage)
+        )
+        return {
+            "id": case["id"],
+            "category": case["category"],
+            "passed": (
+                returncode == 0
+                and not timed_out
+                and any(event.get("type") == "done" for event in events)
+                and all(file["matches"] for file in files.values())
+                and not unexpected_paths
+                and expected_error_seen
+                and not unexpected_errors
+                and not any(event.get("type") == "error" for event in events)
+            ),
+            "exit_code": returncode,
+            "timed_out": timed_out,
+            "elapsed_ms": round(seconds * 1000),
+            "model_steps": model_steps,
+            "tool_calls": sum(event.get("type") == "tool_call" for event in events),
+            "approval_requests": sum(
+                event.get("type") == "permission_requested" for event in events
+            ),
+            "tool_errors": [event.get("name") for event in tool_errors],
+            "input_tokens": sum(event.get("input_tokens", 0) for event in usage),
+            "output_tokens": sum(event.get("output_tokens", 0) for event in usage),
+            "cached_tokens": sum(event.get("cached_tokens", 0) for event in usage),
+            "cost_micro_usd": (
+                sum(event.get("cost_micro_usd") or 0 for event in usage)
+                if any(event.get("cost_micro_usd") is not None for event in usage)
+                else None
+            ),
+            "files": files,
+            "unexpected_paths": sorted(unexpected_paths),
+            "stderr_bytes": len(stderr),
+            "stderr_sha256": digest(stderr) if stderr else None,
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["scripted", "live"], default="scripted")
+    parser.add_argument("--case", action="append", choices=[case["id"] for case in CASES])
+    parser.add_argument("--bin", type=Path, default=ROOT / "target/debug/arvm")
+    parser.add_argument("--output", type=Path, help="write the sanitized JSON result here")
+    parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--model", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.model:
+        scripted_model()
+        return 0
+    if args.mode == "live":
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            parser.error("live mode requires OPENROUTER_API_KEY")
+        if not os.environ.get("OPENROUTER_MODEL"):
+            parser.error("live mode requires an explicit OPENROUTER_MODEL")
+    if args.timeout < 1:
+        parser.error("--timeout must be positive")
+    if not args.skip_build:
+        subprocess.run(["cargo", "build", "--quiet", "--bin", "arvm"], cwd=ROOT, check=True)
+    binary = args.bin.resolve()
+    if not binary.is_file():
+        parser.error(f"arvm binary does not exist: {binary}")
+    selected = [case for case in CASES if not args.case or case["id"] in args.case]
+    results = []
+    for case in selected:
+        result = run_case(case, args.mode, binary, args.timeout)
+        results.append(result)
+        print(f"{'PASS' if result['passed'] else 'FAIL'} {case['id']} ({result['elapsed_ms']} ms)")
+    summary = {
+        "schema": SCHEMA,
+        "mode": args.mode,
+        "model": os.environ.get("OPENROUTER_MODEL") if args.mode == "live" else "scripted",
+        "reasoning": os.environ.get("OPENROUTER_REASONING") if args.mode == "live" else None,
+        "provider_sort": (
+            os.environ.get("OPENROUTER_PROVIDER_SORT") if args.mode == "live" else None
+        ),
+        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT)
+        .decode("ascii")
+        .strip(),
+        "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)),
+        "cases": results,
+        "passed": sum(result["passed"] for result in results),
+        "total": len(results),
+        "elapsed_ms": sum(result["elapsed_ms"] for result in results),
+        "input_tokens": sum(result["input_tokens"] for result in results),
+        "output_tokens": sum(result["output_tokens"] for result in results),
+    }
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {args.output}")
+    print(f"{summary['passed']}/{summary['total']} tasks passed")
+    return 0 if summary["passed"] == summary["total"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
