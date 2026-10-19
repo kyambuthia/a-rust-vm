@@ -173,7 +173,31 @@ After each turn `arvm` prints what it cost, for example
 `usage` event per model step with the provider and first-token time.
 
 Optional limits: `OPENROUTER_MAX_TOKENS` (128-32768, default 8192) and
-`OPENROUTER_TIMEOUT_SECS` (1-600, default 120).
+`OPENROUTER_TIMEOUT_SECS` (1-600, default 120). Invalid values are errors.
+
+The same settings can live in the user configuration (not the workspace
+one, since the base URL receives your API key); environment variables
+override them:
+
+```json
+{
+  "model": {
+    "name": "deepseek/deepseek-v4-flash",
+    "fast": "openai/gpt-5.4-mini",
+    "strong": "anthropic/claude-haiku-4.5",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "reasoning": "low",
+    "providerSort": "throughput",
+    "maxTokens": 8192,
+    "timeoutSecs": 120
+  }
+}
+```
+
+`/fast` and `/strong` in the REPL switch to those models
+(`OPENROUTER_FAST_MODEL` and `OPENROUTER_STRONG_MODEL` override them).
+`baseUrl` accepts any OpenAI-compatible endpoint over `https://`, or plain
+`http://` on localhost for a local model server.
 
 The hosted browser service must load its OpenRouter key from an AWS-managed
 secret or server process environment and must call the provider from the

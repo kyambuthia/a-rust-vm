@@ -10,7 +10,7 @@ use crate::agent::{
     ConversationMessage, Model, ModelError, ModelRequest, ModelResponse, ModelStreamEvent, ToolCall,
 };
 
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RETRIES: u32 = 2;
@@ -42,6 +42,8 @@ pub struct OpenRouterConfig {
     /// How OpenRouter orders the providers serving the model: `price`,
     /// `throughput`, or `latency`. `None` uses OpenRouter's default.
     pub provider_sort: Option<String>,
+    /// OpenAI-compatible API base; requests go to `<base>/chat/completions`.
+    pub base_url: String,
 }
 
 /// Parse `OPENROUTER_PROVIDER_SORT`; `default` sends no preference.
@@ -92,56 +94,161 @@ impl ReasoningEffort {
     }
 }
 
+/// Model settings from the user configuration file (`"model": {...}`).
+/// Environment variables override each field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ModelSettings {
+    /// Default model (`OPENROUTER_MODEL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Model for `/fast` (`OPENROUTER_FAST_MODEL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<String>,
+    /// Model for `/strong` (`OPENROUTER_STRONG_MODEL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong: Option<String>,
+    /// OpenAI-compatible API base (`OPENROUTER_BASE_URL`), for example a
+    /// local server at `http://127.0.0.1:8000/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_sort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl ModelSettings {
+    /// Check every set field, so a bad file fails when it is loaded.
+    pub fn validate(&self) -> Result<(), String> {
+        OpenRouterConfig::resolve(
+            &|name| (name == "OPENROUTER_API_KEY").then(|| "validation".to_owned()),
+            self,
+        )?;
+        let names = [&self.name, &self.fast, &self.strong];
+        if names
+            .into_iter()
+            .flatten()
+            .any(|model| model.trim().is_empty())
+        {
+            return Err("model names must not be empty".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Accept `https://` bases, and plain `http://` only for this machine, so the
+/// API key never crosses the network unencrypted.
+pub fn validate_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+        .iter()
+        .any(|prefix| {
+            trimmed == *prefix
+                || trimmed
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('/'))
+        });
+    let secure = trimmed
+        .strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'));
+    if secure || local {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(format!(
+            "model base URL must use https:// (or http:// on localhost), not '{value}'"
+        ))
+    }
+}
+
 impl OpenRouterConfig {
     pub fn from_env() -> Result<Self, String> {
-        let api_key = env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "OPENROUTER_API_KEY is not set".to_owned())?;
-        let model = env::var("OPENROUTER_MODEL")
-            .ok()
+        Self::from_env_and(&ModelSettings::default())
+    }
+
+    /// Environment variables first, then `settings`, then defaults.
+    pub fn from_env_and(settings: &ModelSettings) -> Result<Self, String> {
+        Self::resolve(&|name| env::var(name).ok(), settings)
+    }
+
+    /// Resolve every field from `var` (an environment lookup), `settings`,
+    /// and defaults. Set but invalid values are errors, not silent defaults.
+    pub fn resolve(
+        var: &dyn Fn(&str) -> Option<String>,
+        settings: &ModelSettings,
+    ) -> Result<Self, String> {
+        let get = |name: &str| var(name).filter(|value| !value.trim().is_empty());
+        let api_key =
+            get("OPENROUTER_API_KEY").ok_or_else(|| "OPENROUTER_API_KEY is not set".to_owned())?;
+        let model = get("OPENROUTER_MODEL")
+            .or_else(|| settings.name.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
-        let site_url = env::var("OPENROUTER_SITE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| Some("https://asiliano.online".to_owned()));
-        let site_title = env::var("OPENROUTER_SITE_TITLE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| Some("A/RVM".to_owned()));
-        let timeout = env::var("OPENROUTER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| (1..=MAX_TIMEOUT_SECS).contains(value))
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
-        let max_tokens = env::var("OPENROUTER_MAX_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| (128..=MAX_MAX_TOKENS).contains(value))
+        let site_url =
+            get("OPENROUTER_SITE_URL").or_else(|| Some("https://asiliano.online".to_owned()));
+        let site_title = get("OPENROUTER_SITE_TITLE").or_else(|| Some("A/RVM".to_owned()));
+        let timeout_secs = match get("OPENROUTER_TIMEOUT_SECS") {
+            Some(value) => Some(value.trim().parse::<u64>().map_err(|_| {
+                format!("OPENROUTER_TIMEOUT_SECS must be a number of seconds, not '{value}'")
+            })?),
+            None => settings.timeout_secs,
+        }
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        if !(1..=MAX_TIMEOUT_SECS).contains(&timeout_secs) {
+            return Err(format!(
+                "model timeout must be 1-{MAX_TIMEOUT_SECS} seconds"
+            ));
+        }
+        let max_tokens =
+            match get("OPENROUTER_MAX_TOKENS") {
+                Some(value) => Some(value.trim().parse::<u32>().map_err(|_| {
+                    format!("OPENROUTER_MAX_TOKENS must be a number, not '{value}'")
+                })?),
+                None => settings.max_tokens,
+            }
             .unwrap_or(DEFAULT_MAX_TOKENS);
-        let reasoning = match env::var("OPENROUTER_REASONING") {
-            Ok(value) if !value.trim().is_empty() => ReasoningEffort::parse(&value)?,
-            _ => Some(ReasoningEffort::Low),
+        if !(128..=MAX_MAX_TOKENS).contains(&max_tokens) {
+            return Err(format!("model max tokens must be 128-{MAX_MAX_TOKENS}"));
+        }
+        let reasoning = match get("OPENROUTER_REASONING").or_else(|| settings.reasoning.clone()) {
+            Some(value) => ReasoningEffort::parse(&value)?,
+            None => Some(ReasoningEffort::Low),
         };
         // OpenRouter's default favours price; for interactive use, measured
         // throughput routing finished turns about twice as fast.
-        let provider_sort = match env::var("OPENROUTER_PROVIDER_SORT") {
-            Ok(value) if !value.trim().is_empty() => parse_provider_sort(&value)?,
-            _ => Some("throughput".to_owned()),
+        let provider_sort =
+            match get("OPENROUTER_PROVIDER_SORT").or_else(|| settings.provider_sort.clone()) {
+                Some(value) => parse_provider_sort(&value)?,
+                None => Some("throughput".to_owned()),
+            };
+        let base_url = match get("OPENROUTER_BASE_URL").or_else(|| settings.base_url.clone()) {
+            Some(value) => validate_base_url(&value)?,
+            None => DEFAULT_BASE_URL.to_owned(),
         };
         Ok(Self {
             api_key,
             model,
             site_url,
             site_title,
-            timeout,
+            timeout: Duration::from_secs(timeout_secs),
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_tokens,
             reasoning,
             provider_sort,
+            base_url,
         })
+    }
+
+    /// The same settings for another model, for fast and strong routes.
+    pub fn for_model(&self, model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            ..self.clone()
+        }
     }
 
     pub fn with_api_key_for_test(api_key: impl Into<String>, model: impl Into<String>) -> Self {
@@ -155,6 +262,7 @@ impl OpenRouterConfig {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning: Some(ReasoningEffort::Low),
             provider_sort: None,
+            base_url: DEFAULT_BASE_URL.to_owned(),
         }
     }
 }
@@ -213,7 +321,7 @@ impl OpenRouterModel {
             let mut http_request = self
                 .inner
                 .client
-                .post(OPENROUTER_URL)
+                .post(format!("{}/chat/completions", self.inner.config.base_url))
                 .header(
                     "Authorization",
                     format!("Bearer {}", self.inner.config.api_key),
@@ -1183,6 +1291,107 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "system rules");
     }
 
+    fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn environment_overrides_settings_which_override_defaults() {
+        let settings = ModelSettings {
+            name: Some("settings/model".to_owned()),
+            base_url: Some("http://127.0.0.1:8000/v1/".to_owned()),
+            max_tokens: Some(1024),
+            reasoning: Some("none".to_owned()),
+            ..Default::default()
+        };
+        let key = environment(&[("OPENROUTER_API_KEY", "sk-or-test")]);
+        let config = OpenRouterConfig::resolve(&key, &settings).unwrap();
+        assert_eq!(config.model, "settings/model");
+        assert_eq!(config.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(config.max_tokens, 1024);
+        assert_eq!(config.reasoning, Some(ReasoningEffort::Disabled));
+        assert_eq!(config.provider_sort.as_deref(), Some("throughput"));
+
+        let overridden = environment(&[
+            ("OPENROUTER_API_KEY", "sk-or-test"),
+            ("OPENROUTER_MODEL", "env/model"),
+            ("OPENROUTER_MAX_TOKENS", "2048"),
+        ]);
+        let config = OpenRouterConfig::resolve(&overridden, &settings).unwrap();
+        assert_eq!(config.model, "env/model");
+        assert_eq!(config.max_tokens, 2048);
+        assert_eq!(config.for_model("fast/model").model, "fast/model");
+
+        let defaults = OpenRouterConfig::resolve(&key, &ModelSettings::default()).unwrap();
+        assert_eq!(defaults.base_url, DEFAULT_BASE_URL);
+        assert_eq!(defaults.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn invalid_model_settings_are_errors() {
+        let key = environment(&[("OPENROUTER_API_KEY", "sk-or-test")]);
+        for (settings, expected) in [
+            (
+                ModelSettings {
+                    base_url: Some("http://example.com/v1".to_owned()),
+                    ..Default::default()
+                },
+                "https://",
+            ),
+            (
+                ModelSettings {
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+                "timeout",
+            ),
+            (
+                ModelSettings {
+                    max_tokens: Some(64),
+                    ..Default::default()
+                },
+                "max tokens",
+            ),
+            (
+                ModelSettings {
+                    reasoning: Some("max".to_owned()),
+                    ..Default::default()
+                },
+                "OPENROUTER_REASONING",
+            ),
+        ] {
+            let error = OpenRouterConfig::resolve(&key, &settings).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(settings.validate().is_err());
+        }
+        let bad_env = environment(&[
+            ("OPENROUTER_API_KEY", "sk-or-test"),
+            ("OPENROUTER_TIMEOUT_SECS", "soon"),
+        ]);
+        assert!(OpenRouterConfig::resolve(&bad_env, &ModelSettings::default()).is_err());
+        assert!(validate_base_url("https://openrouter.ai/api/v1").is_ok());
+        assert!(validate_base_url("http://localhost:11434/v1").is_ok());
+        assert!(validate_base_url("http://localhost.evil.com/v1").is_err());
+        assert!(validate_base_url("https:///path").is_err());
+        assert!(
+            ModelSettings {
+                fast: Some(" ".to_owned()),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
     #[test]
     fn timeout_is_bounded() {
         let config = OpenRouterConfig::with_api_key_for_test("sk-or-test", "openai/gpt-4o-mini");
@@ -1201,6 +1410,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning: None,
             provider_sort: None,
+            base_url: DEFAULT_BASE_URL.to_owned(),
         };
         assert!(OpenRouterModel::from_config(config).is_err());
     }

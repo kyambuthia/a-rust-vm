@@ -50,6 +50,10 @@ pub struct ArvmConfig {
     /// see, beyond the default allow list. User configuration only.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+    /// Model, routes, provider base URL, and limits. User configuration
+    /// only: the base URL receives the API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<crate::openrouter::ModelSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +111,17 @@ impl ArvmConfig {
                 "envPassthrough is only allowed in the user configuration, \
                  so a project cannot read your environment",
             ));
+        }
+        if let Some(model) = &self.model {
+            if scope == ConfigScope::Workspace {
+                return Err(ConfigError::new(
+                    "model settings are only allowed in the user configuration, \
+                     so a project cannot redirect your API key or pick your model",
+                ));
+            }
+            model
+                .validate()
+                .map_err(|error| ConfigError::new(format!("invalid model settings: {error}")))?;
         }
         if let Some(name) = self
             .env_passthrough
@@ -213,6 +228,15 @@ impl LoadedConfig {
     /// tighten a user's allow rule but never loosen it.
     pub fn sources(&self) -> [&ConfigSource; 2] {
         [&self.workspace, &self.user]
+    }
+
+    /// Model settings from the user configuration.
+    pub fn model_settings(&self) -> crate::openrouter::ModelSettings {
+        self.user
+            .config
+            .as_ref()
+            .and_then(|config| config.model.clone())
+            .unwrap_or_default()
     }
 
     /// Extra environment variable names from the user configuration.
@@ -384,6 +408,22 @@ mod tests {
         let error =
             ArvmConfig::parse(br#"{"envPassthrough":["A-B"]}"#, ConfigScope::User).unwrap_err();
         assert!(error.message.contains("invalid envPassthrough name 'A-B'"));
+    }
+
+    #[test]
+    fn model_settings_are_user_only_and_validated() {
+        let bytes = br#"{"model":{"name":"deepseek/deepseek-v4-flash","fast":"x/fast","baseUrl":"https://example.com/v1"}}"#;
+        let user = ArvmConfig::parse(bytes, ConfigScope::User).unwrap();
+        assert_eq!(user.model.unwrap().fast.as_deref(), Some("x/fast"));
+        let error = ArvmConfig::parse(bytes, ConfigScope::Workspace).unwrap_err();
+        assert!(error.message.contains("cannot redirect your API key"));
+        for bad in [
+            &br#"{"model":{"baseUrl":"http://evil.example/v1"}}"#[..],
+            br#"{"model":{"maxTokens":5}}"#,
+            br#"{"model":{"modle":"x"}}"#,
+        ] {
+            assert!(ArvmConfig::parse(bad, ConfigScope::User).is_err());
+        }
     }
 
     #[test]

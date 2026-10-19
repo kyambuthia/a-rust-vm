@@ -39,18 +39,81 @@ fn select_model_backend(has_program: bool, has_openrouter_key: bool) -> ModelBac
     }
 }
 
-/// Build the model for this run and the name it is routed under.
-fn build_model(
+/// The default, fast, and strong model names for an OpenRouter run:
+/// environment first, then the user configuration, then the default model.
+fn route_models(
+    default: &str,
+    settings: &a_rust_vm::openrouter::ModelSettings,
+    var: impl Fn(&str) -> Option<String>,
+) -> (String, String) {
+    let pick = |name: &str, configured: &Option<String>| {
+        var(name)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| configured.clone())
+            .unwrap_or_else(|| default.to_owned())
+    };
+    (
+        pick("OPENROUTER_FAST_MODEL", &settings.fast),
+        pick("OPENROUTER_STRONG_MODEL", &settings.strong),
+    )
+}
+
+/// Build a router with default, fast, and strong routes. Returns the router
+/// and the default model's name.
+fn build_router(
+    backend: ModelBackend,
+    working_directory: &std::path::Path,
+    settings: &a_rust_vm::openrouter::ModelSettings,
+) -> (ModelRouter, String) {
+    let mut router = ModelRouter::new();
+    let (default, fast, strong) = if backend == ModelBackend::OpenRouter {
+        let base = a_rust_vm::openrouter::OpenRouterConfig::from_env_and(settings).unwrap_or_else(
+            |error| {
+                eprintln!("[model] {error}");
+                std::process::exit(2);
+            },
+        );
+        let (fast, strong) = route_models(&base.model, settings, |name| env::var(name).ok());
+        let mut registered = Vec::<String>::new();
+        for name in [&base.model, &fast, &strong] {
+            if registered.contains(name) {
+                continue;
+            }
+            let model = a_rust_vm::openrouter::OpenRouterModel::from_config(base.for_model(name))
+                .unwrap_or_else(|error| {
+                    eprintln!("[model] {error}");
+                    std::process::exit(2);
+                });
+            router
+                .register_model(name, ModelCapabilities::STREAMING_TOOLS, model)
+                .expect("model route should register");
+            registered.push(name.clone());
+        }
+        (base.model.clone(), fast, strong)
+    } else {
+        let (name, model) = build_process_model(backend, working_directory);
+        router
+            .register_model(&name, ModelCapabilities::STREAMING_TOOLS, model)
+            .expect("model route should register");
+        (name.clone(), name.clone(), name)
+    };
+    router
+        .set_default(&default)
+        .expect("default model route should exist");
+    router
+        .set_fast(&fast)
+        .expect("fast model route should exist");
+    router
+        .set_strong(&strong)
+        .expect("strong model route should exist");
+    (router, default)
+}
+
+/// Build a process-backed model and the name it is routed under.
+fn build_process_model(
     backend: ModelBackend,
     working_directory: &std::path::Path,
 ) -> (String, Box<dyn a_rust_vm::agent::Model>) {
-    if backend == ModelBackend::OpenRouter {
-        let model = a_rust_vm::openrouter::OpenRouterModel::from_env().unwrap_or_else(|error| {
-            eprintln!("[model] {error}");
-            std::process::exit(2);
-        });
-        return (model.model_name().to_owned(), Box::new(model));
-    }
     let program = match backend {
         ModelBackend::Program => env::var_os("A_RVM_MODEL_PROGRAM").unwrap_or_default(),
         _ => env::current_exe()
@@ -86,20 +149,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     let working_directory = working_directory();
     let config = load_config_or_exit();
     let additional_directories = extract_workspace_directories(user_arguments);
-    let (model_name, model) = build_model(backend, &working_directory);
-    let mut router = ModelRouter::new();
-    router
-        .register_model(&model_name, ModelCapabilities::STREAMING_TOOLS, model)
-        .expect("model route should register");
-    router
-        .set_default(&model_name)
-        .expect("default model route should exist");
-    router
-        .set_fast(&model_name)
-        .expect("fast model route should exist");
-    router
-        .set_strong(&model_name)
-        .expect("strong model route should exist");
+    let (router, model_name) = build_router(backend, &working_directory, &config.model_settings());
     let mut registry = coding_tool_registry_with_options(
         &working_directory,
         &additional_directories,
@@ -573,6 +623,23 @@ mod tests {
                 "x".to_owned()
             ]),
             Some(("do x".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn fast_and_strong_routes_fall_back_to_the_default_model() {
+        let settings = a_rust_vm::openrouter::ModelSettings {
+            fast: Some("config/fast".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            route_models("main", &settings, |_| None),
+            ("config/fast".to_owned(), "main".to_owned())
+        );
+        let env = |name: &str| (name == "OPENROUTER_STRONG_MODEL").then(|| "env/strong".to_owned());
+        assert_eq!(
+            route_models("main", &settings, env),
+            ("config/fast".to_owned(), "env/strong".to_owned())
         );
     }
 

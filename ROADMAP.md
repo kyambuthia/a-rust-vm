@@ -190,7 +190,7 @@ Exit: a scripted model that runs `env`, `cat ~/.local/state/a-rust-vm/...`
 as another user, and `sleep 100 &` learns no secret, reads no file, and leaves
 no process behind.
 
-### U1: Native fast model path (in progress)
+### U1: Native fast model path (done)
 
 1. ~~Run the OpenRouter adapter in process for `arvm agent|ask` whenever a key
    is configured, with one reused HTTP client; keep the process bridge only as
@@ -211,8 +211,9 @@ no process behind.
    turns; Anthropic models get `cache_control` markers. Measured with Haiku
    4.5 and an 8k-token prompt: step 2 read 8,065 tokens from cache, cost
    9x less, and answered in 0.9 s instead of 4.3 s.
-5. Model settings in `config.json`: default and fast model, OpenAI-compatible
-   base URL (so local servers work), and request timeout.
+5. ~~Model settings in `config.json`: default and fast model, OpenAI-compatible
+   base URL (so local servers work), and request timeout~~. User
+   configuration only; `/fast` and `/strong` now switch real routes.
 
 Exit: on the same task, steps cost provider latency plus <= 50 ms, the first
 token streams, and `/usage` shows tokens, cache hits, and cost.

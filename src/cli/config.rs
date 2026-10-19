@@ -64,9 +64,28 @@ fn describe_source(source: &ConfigSource) -> String {
         return text;
     };
     text.push('\n');
-    if config.rules.is_empty() && config.mcp_servers.is_empty() && config.env_passthrough.is_empty()
+    if config.rules.is_empty()
+        && config.mcp_servers.is_empty()
+        && config.env_passthrough.is_empty()
+        && config.model.is_none()
     {
         text.push_str("  (empty)\n");
+    }
+    if let Some(model) = &config.model {
+        let fields = serde_json::to_value(model).expect("model settings are serializable");
+        let summary = fields
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .map(|(key, value)| match value.as_str() {
+                        Some(text) => format!("{key}={text}"),
+                        None => format!("{key}={value}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        text.push_str(&format!("  model {summary}\n"));
     }
     for rule in &config.rules {
         text.push_str(&format!("  rule {rule}\n"));
@@ -132,5 +151,20 @@ mod tests {
             config: Some(ArvmConfig::default()),
         };
         assert_eq!(describe_source(&empty), "user /u/config.json\n  (empty)\n");
+        let with_model = ConfigSource {
+            scope: ConfigScope::User,
+            path: "/u/config.json".into(),
+            config: Some(
+                ArvmConfig::parse(
+                    br#"{"model":{"name":"m/x","maxTokens":2048}}"#,
+                    ConfigScope::User,
+                )
+                .unwrap(),
+            ),
+        };
+        assert_eq!(
+            describe_source(&with_model),
+            "user /u/config.json\n  model maxTokens=2048 name=m/x\n"
+        );
     }
 }
