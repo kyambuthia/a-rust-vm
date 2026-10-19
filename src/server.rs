@@ -763,15 +763,25 @@ struct HttpRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
-    let mut reader = BufReader::new(
+    let reader = BufReader::new(
         stream
             .try_clone()
             .map_err(|e| format!("failed to clone connection: {e}"))?,
     );
+    parse_request(reader)
+}
+
+/// Parse one HTTP/1.x request. Framing that proxies may read differently
+/// (Transfer-Encoding, repeated or malformed Content-Length, whitespace in
+/// header names) is refused rather than guessed, and no line may grow past
+/// the header limit before its newline arrives.
+fn parse_request(mut reader: impl BufRead) -> Result<HttpRequest, String> {
     let mut header_bytes = Vec::new();
     loop {
         let mut line = Vec::new();
-        reader
+        let remaining = MAX_REQUEST_HEADER_BYTES.saturating_sub(header_bytes.len());
+        (&mut reader)
+            .take(remaining as u64 + 1)
             .read_until(b'\n', &mut line)
             .map_err(|e| format!("failed to read request: {e}"))?;
         if line.is_empty() {
@@ -780,6 +790,9 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         header_bytes.extend_from_slice(&line);
         if header_bytes.len() > MAX_REQUEST_HEADER_BYTES {
             return Err("request headers are too large".to_owned());
+        }
+        if !line.ends_with(b"\n") {
+            return Err("request ended before headers".to_owned());
         }
         if header_bytes.ends_with(b"\r\n\r\n") || header_bytes.ends_with(b"\n\n") {
             break;
@@ -804,15 +817,33 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         .unwrap_or_default()
         .to_owned();
     let mut headers = BTreeMap::new();
+    let mut content_lengths = 0;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return Err("malformed header name".to_owned());
         }
+        let name = name.to_ascii_lowercase();
+        if name == "transfer-encoding" {
+            return Err("transfer-encoding is not supported".to_owned());
+        }
+        if name == "content-length" {
+            content_lengths += 1;
+        }
+        headers.insert(name, value.trim().to_owned());
+    }
+    if content_lengths > 1 {
+        return Err("content-length is repeated".to_owned());
     }
     let content_length = match headers.get("content-length") {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| "content-length is invalid".to_owned())?,
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value
+                .parse::<usize>()
+                .map_err(|_| "content-length is invalid".to_owned())?
+        }
+        Some(_) => return Err("content-length is invalid".to_owned()),
         None => 0,
     };
     if content_length > MAX_REQUEST_BODY_BYTES {
@@ -1733,6 +1764,91 @@ mod tests {
         assert_eq!(sheet.format, "csv");
         assert_eq!(sheet.columns[1].numeric, 1);
         assert!(super::import_uploaded_document(&session, "../plan.docx").is_err());
+    }
+
+    #[test]
+    fn requests_parse_with_bodies_and_query_strings() {
+        let raw = "POST /api/agent?x=1 HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nOrigin: http://o\r\n\r\nhello";
+        let request = super::parse_request(std::io::Cursor::new(raw)).unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/api/agent");
+        assert_eq!(request.body, b"hello");
+        assert_eq!(request.headers["origin"], "http://o");
+    }
+
+    #[test]
+    fn ambiguous_framing_and_oversized_lines_are_refused() {
+        let parse = |raw: &[u8]| super::parse_request(std::io::Cursor::new(raw.to_vec()));
+        for (raw, expected) in [
+            (
+                &b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..],
+                "transfer-encoding",
+            ),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+                "repeated",
+            ),
+            (b"POST / HTTP/1.1\r\nContent-Length: +1\r\n\r\na", "invalid"),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length : 1\r\n\r\na",
+                "malformed header",
+            ),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n",
+                "too large",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: a", "ended before headers"),
+        ] {
+            let error = parse(raw).err().unwrap_or_default();
+            assert!(error.contains(expected), "{raw:?}: {error}");
+        }
+
+        // A header line with no newline stops at the limit instead of
+        // growing without bound.
+        struct Endless;
+        impl std::io::Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'a');
+                Ok(buffer.len())
+            }
+        }
+        let error = super::parse_request(std::io::BufReader::new(Endless))
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn generated_request_bytes_never_panic_the_parser() {
+        // Deterministic pseudo-random inputs built from request fragments.
+        let fragments: [&[u8]; 12] = [
+            b"GET ",
+            b"POST ",
+            b"/api/agent",
+            b" HTTP/1.1",
+            b"\r\n",
+            b"\n",
+            b"Content-Length: 3",
+            b"Cookie: arvm_anon=x",
+            b":",
+            b"\xff\xfe",
+            b"\r\n\r\n",
+            b"abc",
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..5_000 {
+            let mut input = Vec::new();
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let parts = (seed % 12) as usize + 1;
+            let mut state = seed;
+            for _ in 0..parts {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                input.extend_from_slice(fragments[(state >> 33) as usize % fragments.len()]);
+            }
+            let _ = super::parse_request(std::io::Cursor::new(input));
+        }
     }
 
     #[test]
