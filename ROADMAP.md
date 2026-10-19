@@ -1,15 +1,12 @@
 # A/RVM Roadmap
 
-For the broader autonomous-agent path beyond the coding-agent milestones,
-see [docs/general-purpose-agent-roadmap.md](docs/general-purpose-agent-roadmap.md).
-
 ## Product target
 
 A/RVM is a terminal-first, LLM-powered coding agent whose distinctive runtime
 is an inspectable, deterministic Rust virtual machine. The same agent runtime
 serves three clients: the native CLI (`arvm`), the browser workspace
-(`arvm serve` + Wasm), and editors (ACP). The VM, debugger, small language,
-and LLVM work remain first-class features, not demos.
+(`arvm serve` + Wasm), and editors (ACP). The VM, debugger, language runtime,
+and LLVM work remain first-class features.
 
 `ARCHITECTURE.md` describes the longer-term browser-workspace model
 (artifacts, control plane, runners). This roadmap is the delivery plan that
@@ -337,8 +334,9 @@ add reach rather than making the core loop faster or safer.
   as a CLI tool with bounded child budgets.
 - **M3 Replay:** `arvm session replay <id>` on top of the Q1 recording
   contract; corrupt-session recovery and `--no-save`.
-- **M4 Language:** locals, call frames, a small source language compiled to
-  validated bytecode, `compile_source` and source-level trace tools.
+- **M4 Language/runtime:** versioned modules and bytecode, structured values,
+  managed memory, functions and closures, capability-gated imports, and
+  source-level debugging for substantial guest programs.
 - **M5 Protocol:** ACP over stdio, a versioned HTTP API shared with the
   browser, and a JavaScript SDK.
 - **M6 Operations:** shared session store and HTTP edge hardening, LLVM

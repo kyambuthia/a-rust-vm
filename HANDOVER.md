@@ -14,8 +14,7 @@ roadmap in small, verified slices.
   1. `AGENTS.md` (binding working/commit/verification discipline)
   2. `ROADMAP.md` (product target, parity matrix, delivery order)
   3. `ARCHITECTURE.md` (planes, trust boundaries, delivery order)
-  4. `docs/next-direction.md` (most recent decision and slice plan)
-  5. `docs/agent-loop-hardening.md` and the `docs/adr/` set for design context
+  4. The relevant implementation and tests in `src/`, `web/`, and `tests/`
 - Work only inside this repository. Never touch unrelated projects.
 
 ## How work runs on this machine
@@ -69,25 +68,23 @@ Landed capabilities (last known green count: 218 lib + 16 CLI tests):
 ## Working method (one slice at a time)
 
 1. `git status --short` and `git log --oneline -8` first.
-2. Read the smallest relevant slice of `ROADMAP.md`, `ARCHITECTURE.md`, and the
-   previous decision in `docs/next-direction.md`.
+2. Read the smallest relevant slice of `ROADMAP.md`, `ARCHITECTURE.md`, and
+   the implementation and tests for the affected behavior.
 3. Pick ONE small vertical slice that is testable and keeps the product
    coherent. Follow the milestone order in `ROADMAP.md`: S1 (close the
    leaks), U1 (native fast model path), Q1 (benchmark harness), U2 (tools),
    U3 (terminal), S2 (sandbox), with Q2 quality slices in between. State in
    the commit body which roadmap budget or baseline number the slice moves.
-4. Update `docs/next-direction.md` with the decision and explicit out-of-scope,
-   commit it as `docs: update next roadmap decision`.
-5. Implement the slice with focused tests (parsing/pure helpers at minimum).
-6. Run, from the repo root:
+4. Implement the slice with focused tests (parsing/pure helpers at minimum).
+5. Run, from the repo root:
    - `cargo fmt -- --check`
    - `cargo test`
    - `cargo build --target wasm32-unknown-unknown --lib`
    - `node --input-type=module --check < web/main.js`
-7. `git diff --check`, stage only named files, inspect the staged diff, and
+6. `git diff --check`, stage only named files, inspect the staged diff, and
    create one conventional commit (`feat:`, `fix:`, `refactor:`, `docs:`,
    `test:`, `build:`, `chore:`), imperative subject <= 72 chars.
-8. Rebuild/restart the tmux `arvm` server if it is running and `src/`
+7. Rebuild/restart the tmux `arvm` server if it is running and `src/`
    changed, then report:
    decision, commit hash(es), checks, and known limitation.
 
