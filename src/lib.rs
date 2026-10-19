@@ -1,7 +1,7 @@
-//! A small stack-based virtual machine.
+//! Deterministic A/RVM execution engines.
 //!
-//! Programs are represented as a sequence of [`Instruction`] values. The VM
-//! evaluates them from left to right and leaves the result on its value stack.
+//! [`Vm`] executes legacy flat integer programs. [`module::ModuleVm`]
+//! executes validated multi-function modules.
 
 pub mod agent;
 pub mod apps;
@@ -21,6 +21,7 @@ pub mod guest_tools;
 pub mod jobs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
+pub mod module;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod openrouter;
 pub mod permissions;
@@ -177,7 +178,7 @@ pub const MAX_VM_STEPS: usize = 1_000_000;
 /// a long `PUSH` chain cannot grow memory without bound.
 pub const MAX_STACK_DEPTH: usize = 1_024;
 
-/// A simple integer stack virtual machine.
+/// The legacy integer stack virtual machine.
 #[derive(Debug, Default)]
 pub struct Vm {
     stack: Vec<i32>,
