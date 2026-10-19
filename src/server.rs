@@ -388,7 +388,7 @@ impl AnonStore {
         let mut map = self.sessions.lock().expect("anon store poisoned");
         let expired: Vec<String> = map
             .iter()
-            .filter(|(_, s)| now.duration_since(*s.last_seen.lock().unwrap()) > SESSION_TTL)
+            .filter(|(_, s)| now.duration_since(*lock_recover(&s.last_seen)) > SESSION_TTL)
             .map(|(k, _)| k.clone())
             .collect();
         for k in expired {
@@ -399,8 +399,8 @@ impl AnonStore {
             if is_valid_sid_format(&raw) {
                 if let Some(sess) = map.get(&raw).cloned() {
                     if sess.owner == owner {
-                        if now.duration_since(*sess.last_seen.lock().unwrap()) <= SESSION_TTL {
-                            *sess.last_seen.lock().unwrap() = now;
+                        if now.duration_since(*lock_recover(&sess.last_seen)) <= SESSION_TTL {
+                            *lock_recover(&sess.last_seen) = now;
                             return Ok((sess, None));
                         }
                         map.remove(&raw);
@@ -611,8 +611,8 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
     };
     let rate_hit = {
         let now = Instant::now();
-        let mut w = session.rate_window.lock().unwrap();
-        let mut c = session.rate_count.lock().unwrap();
+        let mut w = lock_recover(&session.rate_window);
+        let mut c = lock_recover(&session.rate_count);
         if now.duration_since(*w) > Duration::from_secs(60) {
             *w = now;
             *c = 1;
@@ -631,7 +631,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path, state: &ServerState) {
         );
         return;
     }
-    *session.last_seen.lock().unwrap() = Instant::now();
+    *lock_recover(&session.last_seen) = Instant::now();
     let should_persist_runtime_state = persists_runtime_state(&request.method, &request.path);
     let _state_guard = should_persist_runtime_state.then(|| lock_recover(&session.state_lock));
     match (request.method.as_str(), request.path.as_str()) {
@@ -1258,7 +1258,7 @@ fn handle_tabulate(
         }
     };
     let job = {
-        let mut jobs = session.jobs.lock().unwrap();
+        let mut jobs = lock_recover(&session.jobs);
         let Some(j) =
             jobs.try_start_tabulation(&session.owner, &request.path, MAX_JOBS_PER_SESSION)
         else {
@@ -1329,7 +1329,7 @@ fn handle_pdf_inspection(
         }
     };
     let job = {
-        let mut jobs = session.jobs.lock().unwrap();
+        let mut jobs = lock_recover(&session.jobs);
         let Some(j) =
             jobs.try_start_pdf_inspection(&session.owner, &request.path, MAX_JOBS_PER_SESSION)
         else {
