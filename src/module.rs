@@ -129,6 +129,7 @@ pub enum Op {
     ConstValue(usize),
     Input(usize),
     LocalGet(usize),
+    LocalTake(usize),
     LocalSet(usize),
     Add,
     Sub,
@@ -340,7 +341,9 @@ impl Module {
                             format!("input {index} is missing"),
                         ));
                     }
-                    Op::LocalGet(slot) | Op::LocalSet(slot) if *slot >= function.local_count => {
+                    Op::LocalGet(slot) | Op::LocalTake(slot) | Op::LocalSet(slot)
+                        if *slot >= function.local_count =>
+                    {
                         return Err(ModuleError::new(
                             Some(function_index),
                             Some(ip),
@@ -424,6 +427,10 @@ impl Initialized {
         self.0[slot / 64] |= 1u64 << (slot % 64);
     }
 
+    fn clear(&mut self, slot: usize) {
+        self.0[slot / 64] &= !(1u64 << (slot % 64));
+    }
+
     fn contains(self, slot: usize) -> bool {
         self.0[slot / 64] & (1u64 << (slot % 64)) != 0
     }
@@ -481,6 +488,7 @@ fn validate_function(
             | Op::ConstValue(_)
             | Op::Input(_)
             | Op::LocalGet(_)
+            | Op::LocalTake(_)
             | Op::Jump(_)
             | Op::ListNew
             | Op::MapNew => 0,
@@ -504,7 +512,7 @@ fn validate_function(
                 format!("instruction needs {required} operands, has {depth}"),
             ));
         }
-        if let Op::LocalGet(slot) = op
+        if let Op::LocalGet(slot) | Op::LocalTake(slot) = op
             && !merged.contains(slot)
         {
             return Err(ModuleError::new(
@@ -525,6 +533,7 @@ fn validate_function(
             | Op::ConstValue(_)
             | Op::Input(_)
             | Op::LocalGet(_)
+            | Op::LocalTake(_)
             | Op::ListNew
             | Op::MapNew => depth + 1,
             Op::LocalSet(_) | Op::JumpIfZero(_) => depth - 1,
@@ -553,6 +562,8 @@ fn validate_function(
         let mut outgoing = merged;
         if let Op::LocalSet(slot) = op {
             outgoing.mark(slot);
+        } else if let Op::LocalTake(slot) = op {
+            outgoing.clear(slot);
         }
         match op {
             Op::Return => {}
@@ -870,6 +881,15 @@ impl<'a> ModuleVm<'a> {
                 self.frames[frame_index].stack.push(value);
                 self.frames[frame_index].ip += 1;
             }
+            Op::LocalTake(slot) => {
+                self.check_push()?;
+                let frame = &mut self.frames[frame_index];
+                let value = frame.locals[slot]
+                    .take()
+                    .ok_or(ModuleVmError::UninitializedLocal)?;
+                frame.stack.push(value);
+                frame.ip += 1;
+            }
             Op::LocalSet(slot) => {
                 let frame = &mut self.frames[frame_index];
                 let value = frame
@@ -1103,28 +1123,56 @@ impl<'a> ModuleVm<'a> {
     }
 
     fn list_push(&mut self) -> Result<(), ModuleVmError> {
-        let [list, value] = self.operands::<2>()?;
-        let items = self.list(list)?;
-        let count = items.len().checked_add(1).ok_or(ModuleVmError::HeapLimit)?;
-        let charge = HEAP_OBJECT_CHARGE
-            .checked_add(
-                count
-                    .checked_mul(size_of::<Value>())
-                    .ok_or(ModuleVmError::HeapLimit)?,
-            )
-            .ok_or(ModuleVmError::HeapLimit)?;
-        self.reserve_heap(charge)?;
-        let depth = self
-            .value_depth(list)
-            .max(self.value_depth(value).saturating_add(1));
-        if depth > MAX_VALUE_DEPTH {
-            return Err(ModuleVmError::ValueDepthLimit);
-        }
-        let mut new_items = Vec::with_capacity(count);
-        new_items.extend_from_slice(items);
-        new_items.push(value.clone());
-        let result = self.allocate(HeapData::List(new_items), charge, depth);
-        self.replace_operands(2, result);
+        let (unique, charge, depth) = {
+            let [list, value] = self.operands::<2>()?;
+            let items = self.list(list)?;
+            let count = items.len().checked_add(1).ok_or(ModuleVmError::HeapLimit)?;
+            let charge = HEAP_OBJECT_CHARGE
+                .checked_add(
+                    count
+                        .checked_mul(size_of::<Value>())
+                        .ok_or(ModuleVmError::HeapLimit)?,
+                )
+                .ok_or(ModuleVmError::HeapLimit)?;
+            let depth = self
+                .value_depth(list)
+                .max(self.value_depth(value).saturating_add(1));
+            if depth > MAX_VALUE_DEPTH {
+                return Err(ModuleVmError::ValueDepthLimit);
+            }
+            let unique =
+                matches!(list, Value::Heap(reference) if Rc::strong_count(&reference.0) == 1);
+            self.reserve_heap(if unique { size_of::<Value>() } else { charge })?;
+            (unique, charge, depth)
+        };
+        let frame = self.frames.last_mut().expect("running VM has a frame");
+        let value = frame.stack.pop().expect("validated operand count");
+        let list = frame.stack.pop().expect("validated operand count");
+        let Value::Heap(mut reference) = list else {
+            unreachable!("validated list")
+        };
+        let result = if unique {
+            let object = Rc::get_mut(&mut reference.0).expect("unique list");
+            let HeapData::List(items) = &mut object.data else {
+                unreachable!("validated list")
+            };
+            items.push(value);
+            object.charge += size_of::<Value>();
+            object.depth = depth;
+            object.usage.set(object.usage.get() + size_of::<Value>());
+            Value::Heap(reference)
+        } else {
+            let HeapData::List(items) = &reference.0.data else {
+                unreachable!("validated list")
+            };
+            let mut new_items = Vec::with_capacity(items.len() + 1);
+            new_items.extend_from_slice(items);
+            new_items.push(value);
+            self.allocate(HeapData::List(new_items), charge, depth)
+        };
+        let frame = self.frames.last_mut().expect("running VM has a frame");
+        frame.stack.push(result);
+        frame.ip += 1;
         Ok(())
     }
 
@@ -1149,32 +1197,77 @@ impl<'a> ModuleVm<'a> {
         Ok(())
     }
 
-    fn map_charge(entries: &BTreeMap<String, Value>) -> Result<usize, ModuleVmError> {
-        entries.keys().try_fold(HEAP_OBJECT_CHARGE, |total, key| {
-            total
-                .checked_add(MAP_ENTRY_CHARGE)
-                .and_then(|charge| charge.checked_add(key.len()))
-                .ok_or(ModuleVmError::HeapLimit)
-        })
-    }
-
     fn map_insert(&mut self) -> Result<(), ModuleVmError> {
-        let [map, key, value] = self.operands::<3>()?;
-        let key = self.text(key)?.to_owned();
-        let mut entries = self.map(map)?.clone();
-        entries.insert(key, value.clone());
-        let charge = Self::map_charge(&entries)?;
-        self.reserve_heap(charge)?;
-        let depth = entries
-            .values()
-            .map(|value| self.value_depth(value) + 1)
-            .max()
-            .unwrap_or(0);
-        if depth > MAX_VALUE_DEPTH {
-            return Err(ModuleVmError::ValueDepthLimit);
-        }
-        let result = self.allocate(HeapData::Map(entries), charge, depth);
-        self.replace_operands(3, result);
+        let (key, unique, charge, delta, depth) = {
+            let [map, key, value] = self.operands::<3>()?;
+            let key = self.text(key)?.to_owned();
+            let entries = self.map(map)?;
+            let delta = if entries.contains_key(&key) {
+                0
+            } else {
+                MAP_ENTRY_CHARGE
+                    .checked_add(key.len())
+                    .ok_or(ModuleVmError::HeapLimit)?
+            };
+            let Value::Heap(reference) = map else {
+                unreachable!("validated map")
+            };
+            let charge = reference
+                .0
+                .charge
+                .checked_add(delta)
+                .ok_or(ModuleVmError::HeapLimit)?;
+            let new_depth = self.value_depth(value) + 1;
+            let depth = match entries.get(&key) {
+                Some(old)
+                    if self.value_depth(old) + 1 == reference.0.depth
+                        && new_depth < reference.0.depth =>
+                {
+                    entries
+                        .iter()
+                        .filter(|(existing, _)| *existing != &key)
+                        .map(|(_, value)| self.value_depth(value) + 1)
+                        .max()
+                        .unwrap_or(0)
+                        .max(new_depth)
+                }
+                _ => reference.0.depth.max(new_depth),
+            };
+            if depth > MAX_VALUE_DEPTH {
+                return Err(ModuleVmError::ValueDepthLimit);
+            }
+            let unique = Rc::strong_count(&reference.0) == 1;
+            self.reserve_heap(if unique { delta } else { charge })?;
+            (key, unique, charge, delta, depth)
+        };
+        let frame = self.frames.last_mut().expect("running VM has a frame");
+        let value = frame.stack.pop().expect("validated operand count");
+        frame.stack.pop().expect("validated operand count");
+        let map = frame.stack.pop().expect("validated operand count");
+        let Value::Heap(mut reference) = map else {
+            unreachable!("validated map")
+        };
+        let result = if unique {
+            let object = Rc::get_mut(&mut reference.0).expect("unique map");
+            let HeapData::Map(entries) = &mut object.data else {
+                unreachable!("validated map")
+            };
+            entries.insert(key, value);
+            object.charge += delta;
+            object.depth = depth;
+            object.usage.set(object.usage.get() + delta);
+            Value::Heap(reference)
+        } else {
+            let HeapData::Map(entries) = &reference.0.data else {
+                unreachable!("validated map")
+            };
+            let mut new_entries = entries.clone();
+            new_entries.insert(key, value);
+            self.allocate(HeapData::Map(new_entries), charge, depth)
+        };
+        let frame = self.frames.last_mut().expect("running VM has a frame");
+        frame.stack.push(result);
+        frame.ip += 1;
         Ok(())
     }
 
@@ -1476,7 +1569,7 @@ mod tests {
                     Op::LocalGet(5),
                     Op::Add,
                     Op::LocalSet(2),
-                    Op::LocalGet(3), // doubled.push(score * 2)
+                    Op::LocalTake(3), // doubled.push(score * 2)
                     Op::LocalGet(5),
                     Op::Const(2),
                     Op::Mul,
@@ -1666,6 +1759,129 @@ mod tests {
         );
         drop(snapshot);
         assert_eq!(vm.heap_bytes(), HEAP_OBJECT_CHARGE + "second".len());
+    }
+
+    #[test]
+    fn builds_large_list_with_linear_heap_charge() {
+        let program = module(vec![function(
+            0,
+            2,
+            vec![
+                Op::ListNew,
+                Op::LocalSet(0),
+                Op::Const(0),
+                Op::LocalSet(1),
+                Op::LocalGet(1),
+                Op::Const(10_000),
+                Op::Lt,
+                Op::JumpIfZero(17),
+                Op::LocalTake(0),
+                Op::LocalGet(1),
+                Op::ListPush,
+                Op::LocalSet(0),
+                Op::LocalGet(1),
+                Op::Const(1),
+                Op::Add,
+                Op::LocalSet(1),
+                Op::Jump(4),
+                Op::LocalTake(0),
+                Op::Return,
+            ],
+        )]);
+        let mut vm = ModuleVm::with_inputs(&program, vec![], 256 * 1024).unwrap();
+        let result = vm.run().unwrap();
+        let OwnedValue::List(values) = vm.resolve(result).unwrap() else {
+            panic!("expected list")
+        };
+        assert_eq!(values.len(), 10_000);
+        assert_eq!(values.first(), Some(&OwnedValue::Integer(0)));
+        assert_eq!(values.last(), Some(&OwnedValue::Integer(9_999)));
+        assert_eq!(
+            vm.heap_bytes(),
+            HEAP_OBJECT_CHARGE + 10_000 * size_of::<Value>()
+        );
+    }
+
+    #[test]
+    fn shared_collections_keep_their_previous_values() {
+        let list_program = module(vec![function(
+            0,
+            1,
+            vec![
+                Op::ListNew,
+                Op::LocalSet(0),
+                Op::LocalGet(0),
+                Op::Const(7),
+                Op::ListPush,
+                Op::Return,
+            ],
+        )]);
+        let mut vm = ModuleVm::new(&list_program);
+        let result = vm.run().unwrap();
+        assert_eq!(
+            vm.resolve(vm.frames()[0].locals[0].clone().unwrap()),
+            Ok(OwnedValue::List(vec![]))
+        );
+        assert_eq!(
+            vm.resolve(result),
+            Ok(OwnedValue::List(vec![OwnedValue::Integer(7)]))
+        );
+
+        let map_program = Module::with_values(
+            MODULE_VERSION,
+            vec![function(
+                0,
+                1,
+                vec![
+                    Op::MapNew,
+                    Op::LocalSet(0),
+                    Op::LocalGet(0),
+                    Op::ConstValue(0),
+                    Op::Const(7),
+                    Op::MapInsert,
+                    Op::Return,
+                ],
+            )],
+            0,
+            vec![OwnedValue::Text("key".into())],
+            0,
+        )
+        .unwrap();
+        let mut vm = ModuleVm::new(&map_program);
+        let result = vm.run().unwrap();
+        assert_eq!(
+            vm.resolve(vm.frames()[0].locals[0].clone().unwrap()),
+            Ok(OwnedValue::Map(BTreeMap::new()))
+        );
+        assert_eq!(
+            vm.resolve(result),
+            Ok(OwnedValue::Map(BTreeMap::from([(
+                "key".into(),
+                OwnedValue::Integer(7)
+            )])))
+        );
+    }
+
+    #[test]
+    fn local_take_requires_reinitialization() {
+        let error = Module::new(
+            MODULE_VERSION,
+            vec![function(
+                0,
+                1,
+                vec![
+                    Op::Const(1),
+                    Op::LocalSet(0),
+                    Op::LocalTake(0),
+                    Op::LocalTake(0),
+                    Op::Return,
+                ],
+            )],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.instruction, Some(3));
+        assert!(error.message.contains("uninitialized"));
     }
 
     #[test]
