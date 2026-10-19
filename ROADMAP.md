@@ -1,5 +1,8 @@
 # A/RVM Roadmap
 
+For the broader autonomous-agent path beyond the coding-agent milestones,
+see [docs/general-purpose-agent-roadmap.md](docs/general-purpose-agent-roadmap.md).
+
 ## Product target
 
 A/RVM is a terminal-first, LLM-powered coding agent whose distinctive runtime
