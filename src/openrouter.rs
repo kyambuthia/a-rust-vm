@@ -14,7 +14,8 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RETRIES: u32 = 2;
-const MAX_TOOL_ARGS_BYTES: usize = 32 * 1024;
+/// Room for a full `write_file` (128 KB of content) after JSON escaping.
+const MAX_TOOL_ARGS_BYTES: usize = 256 * 1024;
 /// Tool calls accepted from one model step.
 const MAX_TOOL_CALLS_PER_STEP: usize = 16;
 /// Enough output for a model to write a medium-sized file in one call.
@@ -25,7 +26,8 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 /// Safety caps on what one request carries. The agent bounds its context;
 /// these only stop a runaway value, so they sit well above normal use.
 const MAX_SYSTEM_CHARS: usize = 64 * 1024;
-const MAX_MESSAGE_CHARS: usize = 32 * 1024;
+/// Matches the workspace file limit, so a whole-file read arrives intact.
+const MAX_MESSAGE_CHARS: usize = 128 * 1024;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
@@ -773,11 +775,18 @@ fn normalize_role(role: &str) -> &str {
     }
 }
 
+/// Cut text to `limit` characters, saying so, so the model never mistakes a
+/// shortened tool result or message for the whole thing.
 fn bounded_text(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        value.to_owned()
-    } else {
-        value.chars().take(limit).collect()
+    match value.char_indices().nth(limit) {
+        None => value.to_owned(),
+        Some((end, _)) => {
+            let rest = value[end..].chars().count();
+            format!(
+                "{}\n[truncated: {rest} more characters not sent]",
+                &value[..end]
+            )
+        }
     }
 }
 
@@ -1100,6 +1109,15 @@ mod tests {
             }
             _ => panic!("expected tool call"),
         }
+    }
+
+    #[test]
+    fn long_text_is_cut_with_a_visible_marker() {
+        assert_eq!(bounded_text("héllo", 5), "héllo");
+        assert_eq!(
+            bounded_text("héllo wörld", 5),
+            "héllo\n[truncated: 6 more characters not sent]"
+        );
     }
 
     #[test]
