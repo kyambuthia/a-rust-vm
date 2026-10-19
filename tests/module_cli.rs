@@ -62,3 +62,20 @@ fn module_command_loads_validates_and_runs_external_images() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn module_command_runs_text_assembly() {
+    let directory =
+        std::env::temp_dir().join(format!("arvm-module-assembly-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("program.arvm");
+    fs::write(&source, "entry main\nfn main 0 0\n const 21\n call twice\n return\nend\nfn twice 1 1\n local_get 0\n const 2\n mul\n return\nend\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_arvm"))
+        .args(["module", "run", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["integer"], 42);
+    fs::remove_dir_all(directory).unwrap();
+}

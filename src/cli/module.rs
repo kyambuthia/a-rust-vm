@@ -8,6 +8,7 @@ use std::{
 
 use a_rust_vm::{
     module::{MAX_MODULE_HEAP_BYTES, ModuleVm, OwnedValue},
+    module_assembly::assemble_module,
     module_format::{MAX_MODULE_SOURCE_BYTES, parse_module},
 };
 
@@ -120,8 +121,19 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
         ));
     }
     let source = read_limited(source_path, MAX_MODULE_SOURCE_BYTES)?;
-    let module =
-        parse_module(&source).map_err(|error| ModuleCommandError::input(error.to_string()))?;
+    let module = if source
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'{')
+    {
+        parse_module(&source).map_err(|error| ModuleCommandError::input(error.to_string()))?
+    } else {
+        let text = std::str::from_utf8(&source).map_err(|error| {
+            ModuleCommandError::input(format!("invalid UTF-8 module source: {error}"))
+        })?;
+        assemble_module(text).map_err(|error| ModuleCommandError::input(error.to_string()))?
+    };
     if command == "check" {
         let instructions: usize = module
             .functions()
