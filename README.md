@@ -212,7 +212,7 @@ CLI.
 
 ## Permission rules
 
-Guarded tools (`write_file`, `run_command`, MCP tools) ask for approval unless
+Guarded tools (`write_file`, `edit_file`, `run_command`, MCP tools) ask for approval unless
 a rule decides first. Rules take the form
 `<allow|ask|deny> <tool|*>[:<target-prefix>]`; the first matching rule wins,
 checked in this order:
@@ -236,6 +236,8 @@ outcome more cautious:
   redirects. A `deny` or `ask` rule matches any command in such a line, so
   `deny run_command:rm` also blocks `ls; /bin/rm -rf x`.
 - `deny` rules override approvals remembered earlier in the session.
+- A `write_file` rule also governs `edit_file`, so `deny write_file:secrets`
+  blocks edits too; an `edit_file` rule covers edits only.
 
 ### Configuration files
 

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::{
     PermissionRequest, Tool, ToolArguments, ToolError, ToolRegistry, ToolSpec, ensure_arguments,
-    optional_text, required_text, required_text_allow_empty,
+    optional_flag, optional_text, required_text, required_text_allow_empty,
 };
 
 fn sanitize_permission_component(value: &str) -> String {
@@ -231,6 +231,7 @@ pub fn workspace_tool_registry_with_options(
     registry.register(ReadFileTool::new(workspace.clone()))?;
     registry.register(SearchFilesTool::new(workspace.clone()))?;
     registry.register(WriteFileTool::new(workspace.clone()))?;
+    registry.register(EditFileTool::new(workspace.clone()))?;
     registry.register(RunCommandTool::new(workspace, env_passthrough.to_vec()))?;
     Ok(registry)
 }
@@ -346,21 +347,7 @@ impl Tool for ReadFileTool {
         let requested = required_text(arguments, "path")?;
         let workspace = self.workspace.borrow();
         let path = workspace.resolve(requested, false)?;
-        let metadata = fs::metadata(&path)
-            .map_err(|error| ToolError::new(format!("cannot inspect '{requested}': {error}")))?;
-        if !metadata.is_file() {
-            return Err(ToolError::new(format!("not a file: {requested}")));
-        }
-        if metadata.len() > MAX_FILE_BYTES as u64 {
-            return Err(ToolError::new(format!(
-                "file exceeds the {} byte limit: {requested}",
-                MAX_FILE_BYTES
-            )));
-        }
-        let bytes = fs::read(&path)
-            .map_err(|error| ToolError::new(format!("cannot read '{requested}': {error}")))?;
-        String::from_utf8(bytes)
-            .map_err(|_| ToolError::new(format!("file is not valid UTF-8: {requested}")))
+        read_bounded_text(&path, requested)
     }
 }
 
@@ -450,6 +437,150 @@ impl Tool for WriteFileTool {
             .map_err(|error| ToolError::new(format!("cannot write '{requested}': {error}")))?;
         Ok(format!("wrote {} bytes to {requested}", content.len()))
     }
+}
+
+/// Lines of each side shown in an edit's diff before it is shortened.
+const MAX_DIFF_LINES: usize = 12;
+
+struct EditFileTool {
+    workspace: SharedWorkspace,
+}
+
+impl EditFileTool {
+    fn new(workspace: SharedWorkspace) -> Self {
+        Self { workspace }
+    }
+}
+
+impl Tool for EditFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "edit_file",
+            "Replace exact text in an existing workspace file and return a short diff. \
+             old_string must match the file exactly, including whitespace, and occur once \
+             unless replace_all is true. Prefer this to write_file for changes to existing files.",
+            r#"{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}"#,
+        )
+    }
+
+    fn permission(&self, arguments: &ToolArguments) -> Option<PermissionRequest> {
+        let path = optional_text(arguments, "path").unwrap_or("<invalid path>");
+        Some(PermissionRequest {
+            id: format!("edit_file:{}", sanitize_permission_component(path)),
+            tool: "edit_file".to_owned(),
+            description: format!("edit workspace file '{path}'"),
+        })
+    }
+
+    fn execute(&mut self, arguments: &ToolArguments) -> Result<String, ToolError> {
+        ensure_arguments(
+            arguments,
+            &["path", "old_string", "new_string", "replace_all"],
+        )?;
+        let requested = required_text(arguments, "path")?;
+        let old = required_text_allow_empty(arguments, "old_string")?;
+        let new = required_text_allow_empty(arguments, "new_string")?;
+        let replace_all = optional_flag(arguments, "replace_all")?;
+        if old.is_empty() {
+            return Err(ToolError::new(
+                "old_string must not be empty; use write_file to create a file",
+            ));
+        }
+        if old == new {
+            return Err(ToolError::new("old_string and new_string are identical"));
+        }
+
+        let workspace = self.workspace.borrow();
+        let path = workspace.resolve(requested, false)?;
+        let content = read_bounded_text(&path, requested)?;
+        let starts = content
+            .match_indices(old)
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>();
+        let Some(&first) = starts.first() else {
+            return Err(ToolError::new(format!(
+                "old_string was not found in {requested}; read the file and copy the text exactly"
+            )));
+        };
+        if starts.len() > 1 && !replace_all {
+            let lines = starts
+                .iter()
+                .take(10)
+                .map(|start| line_number_at(&content, *start).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ToolError::new(format!(
+                "old_string occurs {} times in {requested} (lines {lines}); \
+                 add surrounding text to make it unique or set replace_all",
+                starts.len()
+            )));
+        }
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        if updated.len() > MAX_FILE_BYTES {
+            return Err(ToolError::new(format!(
+                "edited file would exceed the {MAX_FILE_BYTES} byte limit"
+            )));
+        }
+        fs::write(&path, &updated)
+            .map_err(|error| ToolError::new(format!("cannot write '{requested}': {error}")))?;
+
+        let count = if replace_all { starts.len() } else { 1 };
+        let plural = if count == 1 { "" } else { "s" };
+        Ok(format!(
+            "edited {requested} ({count} replacement{plural})\n{}",
+            short_diff(line_number_at(&content, first), old, new)
+        ))
+    }
+}
+
+/// Read a workspace file that must be bounded, UTF-8 text.
+fn read_bounded_text(path: &Path, requested: &str) -> Result<String, ToolError> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| ToolError::new(format!("cannot inspect '{requested}': {error}")))?;
+    if !metadata.is_file() {
+        return Err(ToolError::new(format!("not a file: {requested}")));
+    }
+    if metadata.len() > MAX_FILE_BYTES as u64 {
+        return Err(ToolError::new(format!(
+            "file exceeds the {MAX_FILE_BYTES} byte limit: {requested}"
+        )));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| ToolError::new(format!("cannot read '{requested}': {error}")))?;
+    String::from_utf8(bytes)
+        .map_err(|_| ToolError::new(format!("file is not valid UTF-8: {requested}")))
+}
+
+/// The 1-based line on which byte offset `index` falls.
+fn line_number_at(content: &str, index: usize) -> usize {
+    content[..index].matches('\n').count() + 1
+}
+
+/// A compact diff of one replacement, each side cut to `MAX_DIFF_LINES`.
+fn short_diff(line: usize, old: &str, new: &str) -> String {
+    fn side(text: &str, marker: char, output: &mut String) {
+        let lines = text.lines().collect::<Vec<_>>();
+        for line in lines.iter().take(MAX_DIFF_LINES) {
+            output.push(marker);
+            output.push_str(line);
+            output.push('\n');
+        }
+        if lines.len() > MAX_DIFF_LINES {
+            output.push_str(&format!(
+                "{marker}... {} more lines\n",
+                lines.len() - MAX_DIFF_LINES
+            ));
+        }
+    }
+    let mut output = format!("@@ line {line} @@\n");
+    side(old, '-', &mut output);
+    side(new, '+', &mut output);
+    output.truncate(output.trim_end().len());
+    output
 }
 
 struct RunCommandTool {
@@ -825,6 +956,108 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn edit(
+        registry: &mut crate::agent::ToolRegistry,
+        path: &str,
+        old: &str,
+        new: &str,
+        replace_all: Option<bool>,
+    ) -> crate::agent::ToolResult {
+        let mut arguments: ToolArguments = [
+            ("path".to_owned(), ToolValue::Text(path.to_owned())),
+            ("old_string".to_owned(), ToolValue::Text(old.to_owned())),
+            ("new_string".to_owned(), ToolValue::Text(new.to_owned())),
+        ]
+        .into_iter()
+        .collect();
+        if let Some(flag) = replace_all {
+            arguments.insert("replace_all".to_owned(), ToolValue::Boolean(flag));
+        }
+        registry.execute(&ToolCall::new("edit-1", "edit_file", arguments))
+    }
+
+    #[test]
+    fn edit_file_replaces_unique_text_and_reports_a_diff() {
+        let root = test_root("edit");
+        std::fs::write(root.join("a.rs"), "fn a() {}\nfn b() {\n    1\n}\n").unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+
+        let result = edit(&mut registry, "a.rs", "    1\n", "    2\n", None);
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            result.content,
+            "edited a.rs (1 replacement)\n@@ line 3 @@\n-    1\n+    2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "fn a() {}\nfn b() {\n    2\n}\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_file_refuses_missing_ambiguous_and_empty_matches() {
+        let root = test_root("edit-errors");
+        std::fs::write(root.join("a.txt"), "x\ny\nx\n").unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+
+        let missing = edit(&mut registry, "a.txt", "z", "w", None);
+        assert!(missing.is_error && missing.content.contains("not found"));
+
+        let ambiguous = edit(&mut registry, "a.txt", "x", "w", None);
+        assert!(ambiguous.is_error, "{}", ambiguous.content);
+        assert!(ambiguous.content.contains("2 times") && ambiguous.content.contains("lines 1, 3"));
+
+        let empty = edit(&mut registry, "a.txt", "", "w", None);
+        assert!(empty.is_error);
+        let same = edit(&mut registry, "a.txt", "y", "y", None);
+        assert!(same.is_error);
+        let absent_file = edit(&mut registry, "new.txt", "a", "b", None);
+        assert!(absent_file.is_error);
+        assert!(!root.join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "x\ny\nx\n"
+        );
+
+        let all = edit(&mut registry, "a.txt", "x", "w", Some(true));
+        assert!(!all.is_error, "{}", all.content);
+        assert!(all.content.starts_with("edited a.txt (2 replacements)"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "w\ny\nw\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_file_stays_inside_the_workspace_and_needs_approval() {
+        let root = test_root("edit-scope");
+        let outside = test_root("edit-scope-outside");
+        std::fs::write(outside.join("x.txt"), "keep").unwrap();
+        let mut registry = workspace_tool_registry(&root).unwrap();
+        let escaped = outside.join("x.txt").display().to_string();
+        let result = edit(&mut registry, &escaped, "keep", "lost", None);
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(outside.join("x.txt")).unwrap(),
+            "keep"
+        );
+
+        let call = ToolCall::new(
+            "edit-2",
+            "edit_file",
+            [("path".to_owned(), ToolValue::Text("a.txt".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+        let request = registry.permission_request(&call).unwrap();
+        assert_eq!(request.tool, "edit_file");
+        assert!(request.description.contains("a.txt"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_file_refuses_dangling_symlinks_that_point_outside() {
@@ -871,7 +1104,7 @@ mod tests {
         assert!(request.description.contains("new.txt"));
 
         let coding = coding_tool_registry(&root).unwrap();
-        assert_eq!(coding.specs().len(), 12);
+        assert_eq!(coding.specs().len(), 13);
         std::fs::remove_dir_all(root).unwrap();
     }
 

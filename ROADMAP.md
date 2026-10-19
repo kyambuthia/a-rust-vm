@@ -220,9 +220,10 @@ token streams, and `/usage` shows tokens, cache hits, and cost.
 
 ### Q1: Benchmark harness and recording contract
 
-1. Recording contract: every model request summary, response, tool call, and
+1. ~~Recording contract: every model request summary, response, tool call, and
    tool result in a turn is written to the session with a schema version.
-   This is also the base for replay (M3).
+   This is also the base for replay (M3)~~. Sessions (schema 2) keep one
+   record per turn and the exact model context; `ask --session` resumes.
 2. `tests/` integration suite that drives the real `arvm` binary with a
    scripted model and scripted MCP server, like the manual checks used for
    M1.1-M1.2.
@@ -235,8 +236,9 @@ before-and-after benchmark numbers.
 
 ### U2: Tools that finish tasks
 
-1. `edit_file`: replace one exact, unique string (or a list of them) and
-   return a short diff; same approval and path rules as `write_file`.
+1. ~~`edit_file`: replace one exact, unique string (or a list of them) and
+   return a short diff; same approval and path rules as `write_file`~~.
+   `replace_all` covers repeated strings; `write_file` rules also govern it.
 2. `read_file` with line ranges and line numbers; a `glob` tool; `search`
    that skips `.gitignore`d and binary files and caps results.
 3. Parallel tool calls: accept several calls per step; run read-only tools

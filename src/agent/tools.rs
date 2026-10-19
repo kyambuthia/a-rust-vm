@@ -159,6 +159,18 @@ pub(crate) fn optional_text<'a>(arguments: &'a ToolArguments, name: &str) -> Opt
     }
 }
 
+/// Reads an optional boolean argument; absent means `false`. Any other type
+/// is an error, so `"true"` as text is not silently ignored.
+pub(crate) fn optional_flag(arguments: &ToolArguments, name: &str) -> Result<bool, ToolError> {
+    match arguments.get(name) {
+        None => Ok(false),
+        Some(ToolValue::Boolean(value)) => Ok(*value),
+        Some(_) => Err(ToolError::new(format!(
+            "argument '{name}' must be true or false"
+        ))),
+    }
+}
+
 /// Rejects arguments outside `allowed` so typos fail instead of being ignored.
 pub(crate) fn ensure_arguments(
     arguments: &ToolArguments,

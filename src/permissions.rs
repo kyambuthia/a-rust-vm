@@ -62,7 +62,7 @@ impl PermissionRule {
     /// liberally and `allow` rules match strictly, so an unusual spelling
     /// of a target can only make the outcome more cautious.
     pub fn matches_target(&self, tool: &str, kind: TargetKind, target: &str) -> bool {
-        if self.tool != "*" && self.tool != tool {
+        if !rule_covers_tool(&self.tool, tool) {
             return false;
         }
         if self.target_prefix.is_empty() {
@@ -75,6 +75,13 @@ impl PermissionRule {
             TargetKind::Command => command_matches(&self.target_prefix, target, restrictive),
         }
     }
+}
+
+/// Whether a rule naming `rule_tool` applies to `tool`. An edit is a kind of
+/// write, so `write_file` rules also govern `edit_file`; otherwise a rule
+/// such as `deny write_file:secrets` could be sidestepped with an edit.
+fn rule_covers_tool(rule_tool: &str, tool: &str) -> bool {
+    rule_tool == "*" || rule_tool == tool || (rule_tool == "write_file" && tool == "edit_file")
 }
 
 /// Split a path into whether it is absolute and its meaningful components.
@@ -248,6 +255,21 @@ mod tests {
 
     fn rule(text: &str) -> PermissionRule {
         parse_permission_rule(text).expect("rule should parse")
+    }
+
+    #[test]
+    fn write_file_rules_also_govern_edit_file() {
+        let policy = PermissionPolicy::with_rules(vec![
+            rule("deny write_file:secrets"),
+            rule("allow write_file:src"),
+            rule("deny edit_file:docs"),
+        ]);
+        let decide = |tool, path| policy.decide_target(tool, TargetKind::Path, path);
+        assert_eq!(decide("edit_file", "secrets.txt"), PermissionEffect::Deny);
+        assert_eq!(decide("edit_file", "src/main.rs"), PermissionEffect::Allow);
+        assert_eq!(decide("edit_file", "docs/a.md"), PermissionEffect::Deny);
+        // Edit rules do not widen to whole-file writes.
+        assert_eq!(decide("write_file", "docs/a.md"), PermissionEffect::Ask);
     }
 
     #[test]
