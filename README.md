@@ -200,6 +200,18 @@ override them:
 }
 ```
 
+Each turn has a budget. The defaults (50 model steps, 150 tool calls,
+900 seconds, and a context of 400 messages or 256 KB) leave room to read,
+edit, test, and fix in one turn. Change them in the user configuration;
+a workspace file cannot, so a cloned project cannot make turns cost more:
+
+```json
+{ "limits": { "maxSteps": 80, "maxToolCalls": 200, "turnTimeoutSecs": 1200,
+              "contextMessages": 600, "contextChars": 400000 } }
+```
+
+`/status` shows the limits in effect.
+
 `/fast` and `/strong` in the REPL switch to those models
 (`OPENROUTER_FAST_MODEL` and `OPENROUTER_STRONG_MODEL` override them).
 `baseUrl` accepts any OpenAI-compatible endpoint over `https://`, or plain

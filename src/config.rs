@@ -54,6 +54,80 @@ pub struct ArvmConfig {
     /// only: the base URL receives the API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::openrouter::ModelSettings>,
+    /// Per-turn budgets for `agent` and `ask`. User configuration only, so
+    /// a project cannot make a turn run longer or cost more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<TurnLimits>,
+}
+
+/// Optional per-turn budgets; unset fields use the defaults below.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TurnLimits {
+    /// Model steps (requests) per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
+    /// Tool calls per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
+    /// Wall-clock seconds per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_timeout_secs: Option<u64>,
+    /// Messages of history kept in the model context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_messages: Option<usize>,
+    /// Characters of history kept in the model context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_chars: Option<usize>,
+}
+
+/// Turn budgets with every default filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedLimits {
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub turn_timeout_secs: u64,
+    pub context_messages: usize,
+    pub context_chars: usize,
+}
+
+impl TurnLimits {
+    /// Enough to read, edit, test, and fix in one turn.
+    pub const DEFAULTS: ResolvedLimits = ResolvedLimits {
+        max_steps: 50,
+        max_tool_calls: 150,
+        turn_timeout_secs: 900,
+        context_messages: 400,
+        context_chars: 256 * 1024,
+    };
+
+    pub fn resolved(&self) -> ResolvedLimits {
+        let defaults = Self::DEFAULTS;
+        ResolvedLimits {
+            max_steps: self.max_steps.unwrap_or(defaults.max_steps),
+            max_tool_calls: self.max_tool_calls.unwrap_or(defaults.max_tool_calls),
+            turn_timeout_secs: self.turn_timeout_secs.unwrap_or(defaults.turn_timeout_secs),
+            context_messages: self.context_messages.unwrap_or(defaults.context_messages),
+            context_chars: self.context_chars.unwrap_or(defaults.context_chars),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        fn check(name: &str, value: Option<u64>, low: u64, high: u64) -> Result<(), String> {
+            match value {
+                Some(value) if !(low..=high).contains(&value) => Err(format!(
+                    "limits.{name} must be between {low} and {high}, not {value}"
+                )),
+                _ => Ok(()),
+            }
+        }
+        let wide = |value: Option<usize>| value.map(|value| value as u64);
+        check("maxSteps", wide(self.max_steps), 1, 500)?;
+        check("maxToolCalls", wide(self.max_tool_calls), 1, 2_000)?;
+        check("turnTimeoutSecs", self.turn_timeout_secs, 10, 3_600)?;
+        check("contextMessages", wide(self.context_messages), 4, 10_000)?;
+        check("contextChars", wide(self.context_chars), 4_096, 4_000_000)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +196,15 @@ impl ArvmConfig {
             model
                 .validate()
                 .map_err(|error| ConfigError::new(format!("invalid model settings: {error}")))?;
+        }
+        if let Some(limits) = &self.limits {
+            if scope == ConfigScope::Workspace {
+                return Err(ConfigError::new(
+                    "limits are only allowed in the user configuration, \
+                     so a project cannot make turns run longer or cost more",
+                ));
+            }
+            limits.validate().map_err(ConfigError::new)?;
         }
         if let Some(name) = self
             .env_passthrough
@@ -237,6 +320,16 @@ impl LoadedConfig {
             .as_ref()
             .and_then(|config| config.model.clone())
             .unwrap_or_default()
+    }
+
+    /// Turn budgets from the user configuration, with defaults filled in.
+    pub fn turn_limits(&self) -> ResolvedLimits {
+        self.user
+            .config
+            .as_ref()
+            .and_then(|config| config.limits)
+            .unwrap_or_default()
+            .resolved()
     }
 
     /// Extra environment variable names from the user configuration.
@@ -408,6 +501,25 @@ mod tests {
         let error =
             ArvmConfig::parse(br#"{"envPassthrough":["A-B"]}"#, ConfigScope::User).unwrap_err();
         assert!(error.message.contains("invalid envPassthrough name 'A-B'"));
+    }
+
+    #[test]
+    fn limits_are_user_only_validated_and_defaulted() {
+        let bytes = br#"{"limits":{"maxSteps":80,"contextChars":100000}}"#;
+        let user = ArvmConfig::parse(bytes, ConfigScope::User).unwrap();
+        let resolved = user.limits.unwrap().resolved();
+        assert_eq!(resolved.max_steps, 80);
+        assert_eq!(resolved.context_chars, 100_000);
+        assert_eq!(resolved.max_tool_calls, TurnLimits::DEFAULTS.max_tool_calls);
+        let error = ArvmConfig::parse(bytes, ConfigScope::Workspace).unwrap_err();
+        assert!(error.message.contains("cannot make turns run longer"));
+        for bad in [
+            &br#"{"limits":{"maxSteps":0}}"#[..],
+            br#"{"limits":{"turnTimeoutSecs":99999}}"#,
+            br#"{"limits":{"maxStep":5}}"#,
+        ] {
+            assert!(ArvmConfig::parse(bad, ConfigScope::User).is_err());
+        }
     }
 
     #[test]

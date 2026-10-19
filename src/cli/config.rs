@@ -57,6 +57,23 @@ fn describe_config(loaded: &LoadedConfig) -> String {
     loaded.sources().into_iter().map(describe_source).collect()
 }
 
+/// `key=value` pairs for the set fields of a serializable settings block.
+fn key_values(settings: &impl serde::Serialize) -> String {
+    let fields = serde_json::to_value(settings).expect("settings are serializable");
+    fields
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| match value.as_str() {
+                    Some(text) => format!("{key}={text}"),
+                    None => format!("{key}={value}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
 fn describe_source(source: &ConfigSource) -> String {
     let mut text = format!("{} {}", source.scope.label(), source.path.display());
     let Some(config) = &source.config else {
@@ -68,24 +85,15 @@ fn describe_source(source: &ConfigSource) -> String {
         && config.mcp_servers.is_empty()
         && config.env_passthrough.is_empty()
         && config.model.is_none()
+        && config.limits.is_none()
     {
         text.push_str("  (empty)\n");
     }
     if let Some(model) = &config.model {
-        let fields = serde_json::to_value(model).expect("model settings are serializable");
-        let summary = fields
-            .as_object()
-            .map(|map| {
-                map.iter()
-                    .map(|(key, value)| match value.as_str() {
-                        Some(text) => format!("{key}={text}"),
-                        None => format!("{key}={value}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        text.push_str(&format!("  model {summary}\n"));
+        text.push_str(&format!("  model {}\n", key_values(model)));
+    }
+    if let Some(limits) = &config.limits {
+        text.push_str(&format!("  limits {}\n", key_values(limits)));
     }
     for rule in &config.rules {
         text.push_str(&format!("  rule {rule}\n"));

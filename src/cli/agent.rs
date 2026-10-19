@@ -159,7 +159,12 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         std::process::exit(2);
     });
     let mcp_summary = register_mcp_tools(&config, &mut registry);
+    let limits = config.turn_limits();
     let mut agent = Agent::new(router, registry)
+        .with_max_steps(limits.max_steps)
+        .with_max_tool_calls(limits.max_tool_calls)
+        .with_turn_timeout(std::time::Duration::from_secs(limits.turn_timeout_secs))
+        .with_context_limits(limits.context_messages, limits.context_chars)
         .with_system_prompt(workspace_system_prompt_with_skills(
             &working_directory,
             &load_requested_skills(&working_directory, user_arguments),
@@ -187,6 +192,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             .collect(),
         mcp: mcp_summary,
         rules: policy.rules().len(),
+        limits,
     };
     agent.set_permission_policy(policy);
     let mut route = agent.route_request().clone();
@@ -418,6 +424,7 @@ struct RunStatus {
     config_files: Vec<String>,
     mcp: Vec<String>,
     rules: usize,
+    limits: a_rust_vm::config::ResolvedLimits,
 }
 
 impl RunStatus {
@@ -442,6 +449,14 @@ impl RunStatus {
             format!("config: {}", list(&self.config_files)),
             format!("mcp: {}", list(&self.mcp)),
             format!("permission rules: {}", self.rules),
+            format!(
+                "turn limits: {} steps, {} tool calls, {} s, context {} messages / {} KB",
+                self.limits.max_steps,
+                self.limits.max_tool_calls,
+                self.limits.turn_timeout_secs,
+                self.limits.context_messages,
+                self.limits.context_chars / 1024
+            ),
         ]
     }
 }
@@ -712,6 +727,7 @@ mod tests {
             config_files: Vec::new(),
             mcp: vec!["files (3 tools)".to_owned()],
             rules: 2,
+            limits: a_rust_vm::config::TurnLimits::DEFAULTS,
         };
         assert_eq!(
             status.lines(),
@@ -721,6 +737,7 @@ mod tests {
                 "config: none",
                 "mcp: files (3 tools)",
                 "permission rules: 2",
+                "turn limits: 50 steps, 150 tool calls, 900 s, context 400 messages / 256 KB",
             ]
         );
     }

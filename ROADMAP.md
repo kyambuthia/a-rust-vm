@@ -243,8 +243,11 @@ before-and-after benchmark numbers.
    that skips `.gitignore`d and binary files and caps results.
 3. Parallel tool calls: accept several calls per step; run read-only tools
    concurrently and guarded tools in order.
-4. Budgets instead of a step count: default about 50 steps per turn with a
-   token and wall-clock budget, set in config.
+4. ~~Budgets instead of a step count: default about 50 steps per turn with a
+   token and wall-clock budget, set in config~~. `limits` in the user
+   configuration sets steps, tool calls, turn time, and context size; the
+   CLI defaults are 50 steps, 150 calls, 900 s, and 400 messages / 256 KB.
+   A token budget waits for token-aware context (5).
 5. Token-aware context: estimate tokens, use the model's window, and compact
    older turns into a summary (fast model) when near the limit.
 6. Retained tool results: long output is truncated in context with an id;
