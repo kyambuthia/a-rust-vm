@@ -110,6 +110,45 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> String {
 }
 
 #[test]
+fn task_commands_list_and_show_saved_record() {
+    use a_rust_vm::task::{TaskBudget, TaskEventKind, TaskRecord, TaskSpec};
+    use a_rust_vm::task_store::TaskStore;
+
+    let fixture = Fixture::new("task-inspect");
+    let mut task = TaskRecord::new(TaskSpec {
+        id: "task-1".to_owned(),
+        owner: "local".to_owned(),
+        workspace_id: "workspace-1".to_owned(),
+        prompt: "inspect the workspace".to_owned(),
+        input_version_ids: Vec::new(),
+        budget: TaskBudget {
+            max_model_steps: 4,
+            max_tool_calls: 8,
+            timeout_seconds: 60,
+        },
+    })
+    .unwrap();
+    task.append(TaskEventKind::Started).unwrap();
+    TaskStore::new(fixture.root.join("state/tasks"))
+        .save(&task)
+        .unwrap();
+    let model = fixture.model(&[], "unused");
+
+    let listed = fixture.command(&model, &["task", "list"]).output().unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(String::from_utf8_lossy(&listed.stdout), "task-1\n");
+
+    let shown = fixture
+        .command(&model, &["task", "show", "task-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    let value: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(value["status"], "running");
+    assert_eq!(value["spec"]["id"], "task-1");
+}
+
+#[test]
 fn edit_file_with_auto_changes_the_file_and_records_the_session() {
     let fixture = Fixture::new("edit");
     fixture.write("a.txt", "say hello\n");

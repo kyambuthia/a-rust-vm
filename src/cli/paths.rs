@@ -14,6 +14,10 @@ pub(crate) fn session_directory() -> PathBuf {
     state_directory().join("sessions")
 }
 
+pub(crate) fn task_directory() -> PathBuf {
+    state_directory().join("tasks")
+}
+
 pub(crate) fn permission_rules_path() -> PathBuf {
     state_directory().join("rules.json")
 }

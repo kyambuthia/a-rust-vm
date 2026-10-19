@@ -12,4 +12,5 @@ pub(crate) mod permission;
 pub(crate) mod program;
 pub(crate) mod session;
 pub(crate) mod skill;
+pub(crate) mod task;
 pub(crate) mod workspace;
