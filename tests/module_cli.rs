@@ -131,3 +131,45 @@ fn module_command_replays_only_matching_import_responses() {
     assert!(String::from_utf8_lossy(&mismatch.stderr).contains("does not match"));
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn module_live_read_requires_grant_and_stays_in_workspace() {
+    let directory = std::env::temp_dir().join(format!("arvm-module-live-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("program.arvm");
+    fs::write(&source, "entry main\nconst path {\"text\":\"note.txt\"}\nimport workspace.read_file 1\nfn main 0 0\n const_value path\n import workspace.read_file\n return\nend\n").unwrap();
+    fs::write(directory.join("note.txt"), "workspace content").unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_arvm"))
+        .args([
+            "module",
+            "run",
+            source.to_str().unwrap(),
+            "--allow-import",
+            "workspace.read_file",
+            "--workspace",
+            directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    let output: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(output["result"]["text"], "workspace content");
+
+    let escaped = directory.join("escape.arvm");
+    fs::write(&escaped, "entry main\nconst path {\"text\":\"../outside.txt\"}\nimport workspace.read_file 1\nfn main 0 0\n const_value path\n import workspace.read_file\n return\nend\n").unwrap();
+    let denied = Command::new(env!("CARGO_BIN_EXE_arvm"))
+        .args([
+            "module",
+            "run",
+            escaped.to_str().unwrap(),
+            "--allow-import",
+            "workspace.read_file",
+            "--workspace",
+            directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("cannot contain '..'"));
+    fs::remove_dir_all(directory).unwrap();
+}

@@ -9,13 +9,15 @@ use std::{
 };
 
 use a_rust_vm::{
+    agent::{ToolArguments, ToolCall, ToolValue},
     module::{MAX_MODULE_HEAP_BYTES, ModuleVm, OwnedValue},
     module_assembly::assemble_module,
     module_format::{MAX_MODULE_SOURCE_BYTES, parse_module},
+    workspace::workspace_tool_registry,
 };
 
 const MAX_MODULE_INPUT_BYTES: usize = 8 * 1024 * 1024;
-const USAGE: &str = "usage: arvm module check <file|->\n       arvm module run <file|-> [--input <file|->] [--import-replies <file|->] [--heap-bytes <n>]";
+const USAGE: &str = "usage: arvm module check <file|->\n       arvm module run <file|-> [--input <file|->] [--import-replies <file|->] [--allow-import workspace.read_file --workspace <dir>] [--heap-bytes <n>]";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +92,8 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
     let mut source_path = None;
     let mut input_path = None;
     let mut replies_path = None;
+    let mut live_import = false;
+    let mut workspace_path = None;
     let mut heap_limit = MAX_MODULE_HEAP_BYTES;
     let mut heap_limit_set = false;
     let mut index = 1;
@@ -107,6 +111,24 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
             "--import-replies" if command == "run" && replies_path.is_none() => {
                 index += 1;
                 replies_path = Some(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| ModuleCommandError::input(USAGE))?
+                        .as_str(),
+                );
+            }
+            "--allow-import" if command == "run" && !live_import => {
+                index += 1;
+                if arguments.get(index).map(String::as_str) != Some("workspace.read_file") {
+                    return Err(ModuleCommandError::input(
+                        "only workspace.read_file is available as a live import",
+                    ));
+                }
+                live_import = true;
+            }
+            "--workspace" if command == "run" && workspace_path.is_none() => {
+                index += 1;
+                workspace_path = Some(
                     arguments
                         .get(index)
                         .ok_or_else(|| ModuleCommandError::input(USAGE))?
@@ -135,6 +157,11 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
         index += 1;
     }
     let source_path = source_path.ok_or_else(|| ModuleCommandError::input(USAGE))?;
+    if (live_import != workspace_path.is_some()) || (live_import && replies_path.is_some()) {
+        return Err(ModuleCommandError::input(
+            "live imports require --allow-import workspace.read_file and --workspace <dir>, without --import-replies",
+        ));
+    }
     if [Some(source_path), input_path, replies_path]
         .into_iter()
         .filter(|path| *path == Some("-"))
@@ -184,12 +211,22 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
             })?,
         None => Vec::new(),
     };
-    let grants: Vec<String> = replies
+    let mut grants: Vec<String> = replies
         .iter()
         .map(|reply| reply.name.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let mut workspace_tools = match workspace_path {
+        Some(path) => {
+            grants.push("workspace.read_file".to_owned());
+            Some(
+                workspace_tool_registry(path)
+                    .map_err(|error| ModuleCommandError::input(error.to_string()))?,
+            )
+        }
+        None => None,
+    };
     let mut vm = ModuleVm::with_inputs_and_imports(&module, inputs, heap_limit, &grants)
         .map_err(|error| ModuleCommandError::input(format!("invalid module input: {error}")))?;
     let mut next_reply = 0;
@@ -200,6 +237,32 @@ pub(crate) fn run_module_command(arguments: &[String]) -> Result<(), ModuleComma
             .pending_import()
             .map_err(|error| ModuleCommandError::runtime(format!("module VM error: {error}")))?
         {
+            if let Some(tools) = workspace_tools.as_mut() {
+                let [OwnedValue::Text(path)] = request.arguments.as_slice() else {
+                    return Err(ModuleCommandError::runtime(
+                        "workspace.read_file requires one text path",
+                    ));
+                };
+                let arguments: ToolArguments = [("path".to_owned(), ToolValue::Text(path.clone()))]
+                    .into_iter()
+                    .collect();
+                let response = tools.execute(&ToolCall::new(
+                    next_reply.to_string(),
+                    "read_file",
+                    arguments,
+                ));
+                if response.is_error {
+                    return Err(ModuleCommandError::runtime(format!(
+                        "workspace.read_file: {}",
+                        response.content
+                    )));
+                }
+                vm.resume_import(&OwnedValue::Text(response.content))
+                    .map_err(|error| {
+                        ModuleCommandError::runtime(format!("invalid import result: {error}"))
+                    })?;
+                continue;
+            }
             let reply = replies.get(next_reply).ok_or_else(|| {
                 ModuleCommandError::runtime(format!("no reply for import '{}'", request.name))
             })?;
