@@ -172,6 +172,11 @@ After each turn `arvm` prints what it cost, for example
 `/usage` in the REPL shows the session total, and `ask --json` emits a
 `usage` event per model step with the provider and first-token time.
 
+Approval prompts show what the tool would do: the diff of an edit, the
+size and first lines of a write, or an MCP call's arguments. Answer `y` to
+allow (remembered for the same tool and target this session), or
+`n <reason>` to refuse and tell the agent why.
+
 Ctrl-C during a turn cancels it: a running command and its children are
 stopped, a streaming answer ends at its next chunk, and the session keeps
 going. A second Ctrl-C in the same turn, or Ctrl-C at the prompt, quits.

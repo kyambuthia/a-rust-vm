@@ -282,6 +282,9 @@ Q1 baseline; read-only exploration triggers no approval prompts.
    the decision in an ADR.
 3. Approval prompt with `y` / `n` / `a` (always for this session) / `p`
    (save as a rule), showing the exact command or the diff of an edit.
+   (Done in part: prompts show the diff of an edit, the size and start of a
+   write, and MCP arguments; `n <reason>` tells the agent why. `y` already
+   remembers the same tool and target for the session. `p` is open.)
 4. Edits shown as coloured diffs; long tool output collapsed.
 5. Slash commands `/status`, `/usage`, `/clear`, `/compact`, `/model`.
 6. Background commands with logs and lifecycle (`start`, `status`, `stop`).

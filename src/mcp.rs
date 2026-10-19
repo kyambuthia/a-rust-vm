@@ -333,13 +333,23 @@ impl crate::agent::Tool for McpToolAdapter {
 
     fn permission(
         &self,
-        _arguments: &crate::agent::ToolArguments,
+        arguments: &crate::agent::ToolArguments,
     ) -> Option<crate::agent::PermissionRequest> {
         let safe_name = self.remote_name.replace([':', ' ', '\n', '\r', '\t'], "_");
+        let object = arguments
+            .iter()
+            .map(|(name, value)| (name.clone(), tool_value_to_json(value)))
+            .collect::<serde_json::Map<_, _>>();
+        let mut detail = serde_json::to_string_pretty(&object).unwrap_or_default();
+        if let Some((end, _)) = detail.char_indices().nth(MAX_PERMISSION_DETAIL_CHARS) {
+            detail.truncate(end);
+            detail.push_str("\n...");
+        }
         Some(crate::agent::PermissionRequest {
             id: format!("mcp:{}", safe_name),
             tool: self.registry_name.clone(),
             description: format!("call {}", self.origin),
+            detail: Some(format!("arguments: {detail}")),
         })
     }
 
@@ -391,6 +401,9 @@ fn sanitize_name(name: &str, what: &str) -> Result<String, McpError> {
     }
     Ok(sanitized)
 }
+
+/// Longest argument preview shown in an approval prompt.
+const MAX_PERMISSION_DETAIL_CHARS: usize = 1_000;
 
 fn tool_value_to_json(value: &crate::agent::ToolValue) -> serde_json::Value {
     match value {

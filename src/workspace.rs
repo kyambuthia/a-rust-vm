@@ -541,10 +541,37 @@ impl Tool for WriteFileTool {
 
     fn permission(&self, arguments: &ToolArguments) -> Option<PermissionRequest> {
         let path = optional_text(arguments, "path").unwrap_or("<invalid path>");
+        let detail = optional_text(arguments, "content").map(|content| {
+            let existing = self
+                .workspace
+                .borrow()
+                .resolve(path, false)
+                .ok()
+                .and_then(|resolved| fs::metadata(resolved).ok());
+            let action = match existing {
+                Some(metadata) => format!(
+                    "replaces {} bytes with {} bytes",
+                    metadata.len(),
+                    content.len()
+                ),
+                None => format!("creates the file with {} bytes", content.len()),
+            };
+            let mut preview = String::new();
+            let mut lines = content.lines();
+            for line in lines.by_ref().take(MAX_DIFF_LINES) {
+                preview.push_str(&format!("\n+{line}"));
+            }
+            let rest = lines.count();
+            if rest > 0 {
+                preview.push_str(&format!("\n+... {rest} more lines"));
+            }
+            format!("{action}{preview}")
+        });
         Some(PermissionRequest {
             id: format!("write_file:{}", sanitize_permission_component(path)),
             tool: "write_file".to_owned(),
             description: format!("write workspace file '{path}'"),
+            detail,
         })
     }
 
@@ -598,10 +625,36 @@ impl Tool for EditFileTool {
 
     fn permission(&self, arguments: &ToolArguments) -> Option<PermissionRequest> {
         let path = optional_text(arguments, "path").unwrap_or("<invalid path>");
+        let old = optional_text(arguments, "old_string");
+        let new = arguments.get("new_string").and_then(|value| match value {
+            crate::agent::ToolValue::Text(text) => Some(text.as_str()),
+            _ => None,
+        });
+        let detail = old.zip(new).map(|(old, new)| {
+            let line = self
+                .workspace
+                .borrow()
+                .resolve(path, false)
+                .ok()
+                .and_then(|resolved| fs::read_to_string(resolved).ok())
+                .and_then(|content| {
+                    content
+                        .find(old)
+                        .map(|start| line_number_at(&content, start))
+                });
+            match line {
+                Some(line) => short_diff(line, old, new),
+                None => format!(
+                    "old_string was not found, so the edit will fail\n{}",
+                    short_diff(1, old, new)
+                ),
+            }
+        });
         Some(PermissionRequest {
             id: format!("edit_file:{}", sanitize_permission_component(path)),
             tool: "edit_file".to_owned(),
             description: format!("edit workspace file '{path}'"),
+            detail,
         })
     }
 
@@ -856,6 +909,7 @@ impl Tool for RunCommandTool {
             id: format!("run_command:{}", sanitize_permission_component(command)),
             tool: "run_command".to_owned(),
             description: format!("run command in workspace: {command}"),
+            detail: None,
         })
     }
 
@@ -1516,6 +1570,55 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(leftovers, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approval_requests_show_what_a_write_or_edit_would_do() {
+        let root = test_root("permission-detail");
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let registry = workspace_tool_registry(&root).unwrap();
+        let request = |tool: &str, pairs: &[(&str, &str)]| {
+            let arguments = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), ToolValue::Text((*value).to_owned())))
+                .collect();
+            registry
+                .permission_request(&ToolCall::new("p", tool, arguments))
+                .unwrap()
+                .detail
+                .unwrap()
+        };
+        assert_eq!(
+            request(
+                "edit_file",
+                &[
+                    ("path", "a.txt"),
+                    ("old_string", "two"),
+                    ("new_string", "2")
+                ]
+            ),
+            "@@ line 2 @@\n-two\n+2"
+        );
+        assert!(
+            request(
+                "edit_file",
+                &[
+                    ("path", "a.txt"),
+                    ("old_string", "zzz"),
+                    ("new_string", "2")
+                ]
+            )
+            .starts_with("old_string was not found")
+        );
+        assert_eq!(
+            request("write_file", &[("path", "a.txt"), ("content", "x\ny")]),
+            "replaces 14 bytes with 3 bytes\n+x\n+y"
+        );
+        assert!(
+            request("write_file", &[("path", "new.txt"), ("content", "hi")])
+                .starts_with("creates the file with 2 bytes")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

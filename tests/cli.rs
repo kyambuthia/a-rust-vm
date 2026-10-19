@@ -321,3 +321,42 @@ fn ctrl_c_cancels_a_running_command_and_keeps_the_session() {
         "{events}"
     );
 }
+
+#[test]
+fn the_repl_shows_the_diff_and_passes_a_denial_reason_to_the_agent() {
+    use std::io::Write;
+    let fixture = Fixture::new("repl-approval");
+    fixture.write("a.txt", "say hello\n");
+    let call = tool_call(
+        "c1",
+        "edit_file",
+        serde_json::json!({"path": "a.txt", "old_string": "hello", "new_string": "goodbye"}),
+    );
+    let model = fixture.model(&[&call], "understood");
+    let mut child = fixture
+        .command(&model, &["agent"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"change it\nn use notes.md instead\n/exit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("[permission] edit workspace file 'a.txt'"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  -hello\n  +goodbye"), "{stdout}");
+    assert!(
+        stdout.contains("approval denied by user: use notes.md instead"),
+        "{stdout}"
+    );
+    assert_eq!(fixture.read("a.txt"), "say hello\n");
+}

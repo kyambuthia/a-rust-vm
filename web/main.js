@@ -461,7 +461,8 @@ async function askAgent(prompt) {
 }
 
 async function answerApproval(request) {
-  const allowed = window.confirm(`Allow ${request.description}?`);
+  const detail = request.detail ? `\n\n${request.detail}` : "";
+  const allowed = window.confirm(`Allow ${request.description}?${detail}`);
   const response = await fetch("../api/approval", {
     method: "POST",
     headers: { "content-type": "application/json" },

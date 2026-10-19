@@ -52,6 +52,10 @@ pub struct PermissionRequest {
     pub id: String,
     pub tool: String,
     pub description: String,
+    /// What approving would do, shown under the description: the diff of
+    /// an edit, the start of written content, or a call's arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// The decision returned by the host for a guarded tool call.

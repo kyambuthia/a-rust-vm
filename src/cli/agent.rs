@@ -348,19 +348,14 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         let turn = super::interrupt::TurnGuard::begin(&agent.cancel_token());
         if let Err(error) = agent.run_streaming_with_approval(
             prompt,
-            |request| {
-                println!("[approval] allow {}? [y/N]", request.description);
+            |_request| {
+                print!("[approval] allow? [y/N, or n <reason to tell the agent>] ");
+                io::stdout().flush().expect("stdout should be writable");
                 let mut answer = String::new();
-                io::stdin()
-                    .read_line(&mut answer)
-                    .expect("stdin should be readable");
-                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                    a_rust_vm::agent::PermissionDecision::Allow
-                } else {
-                    a_rust_vm::agent::PermissionDecision::Deny {
-                        reason: "approval denied by user".to_owned(),
-                    }
+                if io::stdin().read_line(&mut answer).is_err() {
+                    answer.clear();
                 }
+                approval_decision(&answer)
             },
             |event| {
                 record.record(&event);
@@ -380,7 +375,12 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
                         println!("[tool result] {}", result.content);
                     }
                     AgentEvent::PermissionRequested(request) => {
-                        println!("[permission] {}", request.description)
+                        println!("\n[permission] {}", request.description);
+                        if let Some(detail) = &request.detail {
+                            for line in detail.lines() {
+                                println!("  {line}");
+                            }
+                        }
                     }
                     AgentEvent::RepeatedToolCall { tool, count } => {
                         println!("[agent] repeated tool call: {tool} (x{count})")
@@ -511,6 +511,30 @@ fn extract_session_id(arguments: &[String]) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
+/// Read an approval answer: `y`/`yes` allows; anything else denies, and
+/// text after `n` or `no` is passed to the agent as the reason.
+fn approval_decision(answer: &str) -> a_rust_vm::agent::PermissionDecision {
+    let answer = answer.trim();
+    let lower = answer.to_ascii_lowercase();
+    if matches!(lower.as_str(), "y" | "yes") {
+        return a_rust_vm::agent::PermissionDecision::Allow;
+    }
+    let reason = ["no ", "n "]
+        .iter()
+        .find_map(|prefix| {
+            lower
+                .starts_with(prefix)
+                .then(|| answer[prefix.len()..].trim())
+        })
+        .filter(|reason| !reason.is_empty());
+    a_rust_vm::agent::PermissionDecision::Deny {
+        reason: match reason {
+            Some(reason) => format!("approval denied by user: {reason}"),
+            None => "approval denied by user".to_owned(),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OneShotPermission {
     Auto,
@@ -568,7 +592,13 @@ fn run_one_shot_agent(
                         OneShotPermission::Auto => "approved (--auto)",
                         OneShotPermission::Deny => "denied (use --auto or a rule to allow)",
                     };
-                    println!("\n[permission {decision}] {}\n", request.description)
+                    println!("\n[permission {decision}] {}", request.description);
+                    if let Some(detail) = &request.detail {
+                        for line in detail.lines() {
+                            println!("  {line}");
+                        }
+                    }
+                    println!();
                 }
                 AgentEvent::RepeatedToolCall { tool, count } => {
                     println!("\n[agent] repeated tool call: {tool} (x{count})\n")
@@ -725,6 +755,36 @@ mod tests {
         assert_eq!(
             select_model_backend(false, false),
             ModelBackend::OpencodeBridge
+        );
+    }
+
+    #[test]
+    fn approval_answers_allow_deny_and_carry_reasons() {
+        use a_rust_vm::agent::PermissionDecision;
+        assert_eq!(super::approval_decision("y\n"), PermissionDecision::Allow);
+        assert_eq!(super::approval_decision(" YES "), PermissionDecision::Allow);
+        let denied = |reason: &str| PermissionDecision::Deny {
+            reason: reason.to_owned(),
+        };
+        assert_eq!(
+            super::approval_decision(""),
+            denied("approval denied by user")
+        );
+        assert_eq!(
+            super::approval_decision("n"),
+            denied("approval denied by user")
+        );
+        assert_eq!(
+            super::approval_decision("yep"),
+            denied("approval denied by user")
+        );
+        assert_eq!(
+            super::approval_decision("n Use tests/ instead\n"),
+            denied("approval denied by user: Use tests/ instead")
+        );
+        assert_eq!(
+            super::approval_decision("No   too risky"),
+            denied("approval denied by user: too risky")
         );
     }
 
