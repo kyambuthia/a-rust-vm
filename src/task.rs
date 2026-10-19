@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const TASK_SCHEMA_VERSION: u32 = 2;
+pub const TASK_SCHEMA_VERSION: u32 = 3;
 const MAX_EVENTS: usize = 512;
 const MAX_PLAN_STEPS: usize = 128;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -47,6 +47,8 @@ pub struct TaskPlan {
 pub struct TaskCheckpoint {
     pub session_id: String,
     pub completed_turns: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +221,7 @@ impl TaskRecord {
         }
         let stored: Self =
             serde_json::from_slice(bytes).map_err(|error| TaskError::Decode(error.to_string()))?;
-        if !matches!(stored.schema_version, 1 | TASK_SCHEMA_VERSION) {
+        if !matches!(stored.schema_version, 1..=TASK_SCHEMA_VERSION) {
             return Err(TaskError::UnsupportedSchema {
                 actual: stored.schema_version,
             });
@@ -233,12 +235,14 @@ impl TaskRecord {
             return Err(TaskError::InvalidRecord);
         }
         let mut replayed = Self::new(stored.spec.clone())?;
+        replayed.schema_version = stored.schema_version;
         for event in &stored.events {
             let applied = replayed.append(event.kind.clone())?;
             if applied.sequence != event.sequence {
                 return Err(TaskError::InvalidRecord);
             }
         }
+        replayed.schema_version = TASK_SCHEMA_VERSION;
         let mut expected = stored;
         expected.schema_version = TASK_SCHEMA_VERSION;
         if replayed != expected {
@@ -256,12 +260,27 @@ impl TaskRecord {
         };
         match (self.status, kind) {
             (TaskStatus::Pending, TaskEventKind::Started) => next.status = TaskStatus::Running,
-            (TaskStatus::Paused, TaskEventKind::Resumed) => next.status = TaskStatus::Running,
+            (TaskStatus::Paused, TaskEventKind::Resumed) => {
+                if self.schema_version >= 3
+                    && self
+                        .checkpoint
+                        .as_ref()
+                        .is_none_or(|checkpoint| checkpoint.session_sha256.is_none())
+                {
+                    return Err(TaskError::InvalidField("resume checkpoint"));
+                }
+                next.status = TaskStatus::Running;
+            }
             (TaskStatus::Running, TaskEventKind::Paused) => {
                 if self.checkpoint.is_none()
                     || !self.events.last().is_some_and(|event| {
                         matches!(event.kind, TaskEventKind::Checkpointed { .. })
                     })
+                    || (self.schema_version >= 3
+                        && self
+                            .checkpoint
+                            .as_ref()
+                            .is_none_or(|checkpoint| checkpoint.session_sha256.is_none()))
                 {
                     return Err(TaskError::InvalidField("pause checkpoint"));
                 }
@@ -278,11 +297,24 @@ impl TaskRecord {
             }
             (TaskStatus::Running, TaskEventKind::Checkpointed { checkpoint }) => {
                 validate_file_id(&checkpoint.session_id, "checkpoint session id")?;
-                if self
-                    .checkpoint
-                    .as_ref()
-                    .is_some_and(|old| checkpoint.completed_turns < old.completed_turns)
+                if self.schema_version >= 3 && checkpoint.completed_turns == 0 {
+                    return Err(TaskError::InvalidField("checkpoint turn count"));
+                }
+                if let Some(digest) = &checkpoint.session_sha256
+                    && (digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
                 {
+                    return Err(TaskError::InvalidField("checkpoint digest"));
+                }
+                if self.checkpoint.as_ref().is_some_and(|old| {
+                    if self.schema_version >= 3 {
+                        checkpoint.completed_turns <= old.completed_turns
+                    } else {
+                        checkpoint.completed_turns < old.completed_turns
+                    }
+                }) {
                     return Err(TaskError::InvalidField("checkpoint turn count"));
                 }
                 next.checkpoint = Some(checkpoint.clone());
@@ -432,6 +464,7 @@ mod tests {
             checkpoint: TaskCheckpoint {
                 session_id: "session-1".to_owned(),
                 completed_turns: 1,
+                session_sha256: None,
             },
         })
         .unwrap();
@@ -458,6 +491,7 @@ mod tests {
             checkpoint: TaskCheckpoint {
                 session_id: "task-1".to_owned(),
                 completed_turns: 1,
+                session_sha256: Some("a".repeat(64)),
             },
         })
         .unwrap();
@@ -473,10 +507,21 @@ mod tests {
             })
         );
         task.append(TaskEventKind::Resumed).unwrap();
+        assert_eq!(
+            task.append(TaskEventKind::Checkpointed {
+                checkpoint: TaskCheckpoint {
+                    session_id: "task-1".to_owned(),
+                    completed_turns: 1,
+                    session_sha256: Some("a".repeat(64)),
+                },
+            }),
+            Err(TaskError::InvalidField("checkpoint turn count"))
+        );
         task.append(TaskEventKind::Checkpointed {
             checkpoint: TaskCheckpoint {
                 session_id: "task-1".to_owned(),
                 completed_turns: 2,
+                session_sha256: Some("b".repeat(64)),
             },
         })
         .unwrap();
@@ -504,6 +549,7 @@ mod tests {
             checkpoint: TaskCheckpoint {
                 session_id: "task-1".to_owned(),
                 completed_turns: 1,
+                session_sha256: Some("a".repeat(64)),
             },
         })
         .unwrap();
@@ -513,6 +559,31 @@ mod tests {
         assert_eq!(
             TaskRecord::restore(&serde_json::to_vec(&invalid_old).unwrap()),
             Err(TaskError::InvalidRecord)
+        );
+    }
+
+    #[test]
+    fn legacy_pause_without_digest_loads_but_cannot_resume() {
+        let mut task = TaskRecord::new(spec()).unwrap();
+        task.append(TaskEventKind::Started).unwrap();
+        task.append(TaskEventKind::Checkpointed {
+            checkpoint: TaskCheckpoint {
+                session_id: "task-1".to_owned(),
+                completed_turns: 1,
+                session_sha256: Some("a".repeat(64)),
+            },
+        })
+        .unwrap();
+        task.append(TaskEventKind::Paused).unwrap();
+        let mut old = serde_json::to_value(&task).unwrap();
+        old["schema_version"] = serde_json::json!(2);
+        old["checkpoint"]["session_sha256"] = serde_json::Value::Null;
+        old["events"][1]["kind"]["checkpoint"]["session_sha256"] = serde_json::Value::Null;
+        let mut restored = TaskRecord::restore(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(restored.status(), TaskStatus::Paused);
+        assert_eq!(
+            restored.append(TaskEventKind::Resumed),
+            Err(TaskError::InvalidField("resume checkpoint"))
         );
     }
 

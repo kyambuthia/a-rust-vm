@@ -82,9 +82,11 @@ exact output versions and verification events.
 In progress: `src/task.rs` defines a versioned, replay-validated task record
 with plans, checkpoints, approval states, and terminal outcomes.
 `src/task_store.rs` saves it as a private, atomic local file and refuses event
-history rollback. `arvm ask --task <id>` now records a one-shot CLI run, and
-`arvm task list|show` inspects it. Restart-safe continuation, browser wiring,
-approval events, and a shared transactional store remain open.
+history rollback. `arvm ask --task <id> --pause` can checkpoint a finished
+turn and resume it in a later CLI process after validating its session digest.
+An interrupted in-flight turn stays blocked to avoid repeated tool effects.
+`arvm task list|show` inspects records. Browser wiring, approval events, and
+a shared transactional store remain open.
 
 ### G2. Execute useful work inside real boundaries
 

@@ -385,6 +385,8 @@ def run_case(case, mode, binary, timeout):
             and task.get("status") == "completed"
             and checkpoint.get("session_id") == "bench"
             and checkpoint.get("completed_turns") == 1
+            and isinstance(checkpoint.get("session_sha256"), str)
+            and len(checkpoint["session_sha256"]) == 64
             and len(session.get("turns", [])) == 1
         )
         events = []

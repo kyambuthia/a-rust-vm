@@ -175,7 +175,10 @@ fn one_shot_task_records_checkpoint_and_rejects_reuse() {
 
     let reused = fixture.ask(&model, &["--task", "task-1", "again"]);
     assert_eq!(reused.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&reused.stderr).contains("already exists"));
+    assert!(
+        String::from_utf8_lossy(&reused.stderr).contains("only a checkpointed paused"),
+        "{reused:?}"
+    );
     assert_eq!(
         fixture.session("task-1")["turns"].as_array().unwrap().len(),
         1
@@ -200,6 +203,103 @@ fn one_shot_task_records_model_failure() {
             .as_array()
             .unwrap()
             .len(),
+        1
+    );
+}
+
+#[test]
+fn paused_task_resumes_from_its_saved_session() {
+    let fixture = Fixture::new("task-resume");
+    fixture.write("task.txt", "before\n");
+    let edit = tool_call(
+        "edit-1",
+        "edit_file",
+        serde_json::json!({"path": "task.txt", "old_string": "before", "new_string": "after"}),
+    );
+    let first_model = fixture.model(&[&edit], "first answer");
+    let first = fixture.ask(
+        &first_model,
+        &["--auto", "--task", "task-1", "--pause", "first prompt"],
+    );
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(fixture.read("task.txt"), "after\n");
+    let paused: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/tasks/task-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(paused["checkpoint"]["completed_turns"], 1);
+    assert_eq!(
+        paused["checkpoint"]["session_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        fixture.session("task-1")["turns"][0]["prompt"],
+        "first prompt"
+    );
+    let unrelated = fixture.ask(&first_model, &["--session", "task-1", "other prompt"]);
+    assert_eq!(unrelated.status.code(), Some(2));
+    let manual_save = fixture
+        .command(
+            &first_model,
+            &["session", "save", "task-1", "user", "other"],
+        )
+        .output()
+        .unwrap();
+    assert_eq!(manual_save.status.code(), Some(2));
+
+    let resumed = fixture.ask(&first_model, &["--task", "task-1", "second prompt"]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert_eq!(fixture.read("task.txt"), "after\n");
+    let task: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/tasks/task-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(task["status"], "completed");
+    assert_eq!(task["checkpoint"]["completed_turns"], 2);
+    assert_eq!(task["events"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        fixture.session("task-1")["turns"][1]["prompt"],
+        "second prompt"
+    );
+    assert!(
+        fixture.session("task-1")["turns"][1]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["type"] != "tool_call")
+    );
+}
+
+#[test]
+fn resume_rejects_changed_session_and_in_flight_task() {
+    use a_rust_vm::task::TaskEventKind;
+    use a_rust_vm::task_store::TaskStore;
+
+    let fixture = Fixture::new("task-reject-resume");
+    let model = fixture.model(&[r#"{"type":"text","text":"answer"}"#], "unused");
+    let first = fixture.ask(&model, &["--task", "task-1", "--pause", "first"]);
+    assert!(first.status.success(), "{first:?}");
+    let session_path = fixture.root.join("state/sessions/task-1.json");
+    let original = fs::read(&session_path).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    changed["messages"][0]["content"] = "changed".into();
+    fs::write(&session_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    let mismatch = fixture.ask(&model, &["--task", "task-1", "second"]);
+    assert_eq!(mismatch.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("does not match"));
+    fs::write(&session_path, original).unwrap();
+
+    let store = TaskStore::new(fixture.root.join("state/tasks"));
+    let mut task = store.load("task-1").unwrap();
+    task.append(TaskEventKind::Resumed).unwrap();
+    store.save(&task).unwrap();
+    let interrupted = fixture.ask(&model, &["--task", "task-1", "second"]);
+    assert_eq!(interrupted.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&interrupted.stderr).contains("only a checkpointed paused"));
+    assert_eq!(
+        fixture.session("task-1")["turns"].as_array().unwrap().len(),
         1
     );
 }

@@ -11,7 +11,9 @@ use a_rust_vm::agent::{
     load_project_instructions, system_prompt_with_instructions, system_prompt_with_skills,
 };
 use a_rust_vm::session::{Session, SessionStore, TurnRecord};
-use a_rust_vm::task::{TaskBudget, TaskCheckpoint, TaskEventKind, TaskRecord, TaskSpec};
+use a_rust_vm::task::{
+    TaskBudget, TaskCheckpoint, TaskEventKind, TaskRecord, TaskSpec, TaskStatus,
+};
 use a_rust_vm::task_store::{TaskStore, TaskStoreError};
 use a_rust_vm::workspace::coding_tool_registry_with_options;
 
@@ -203,8 +205,13 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
     let mut route = agent.route_request().clone();
     let session_id = extract_session_id(user_arguments);
     let task_id = extract_task_id(user_arguments);
+    let pause_after_turn = user_arguments.iter().any(|argument| argument == "--pause");
     if user_arguments.iter().any(|argument| argument == "--task") && task_id.is_none() {
         eprintln!("[task] --task requires an id");
+        std::process::exit(2);
+    }
+    if pause_after_turn && task_id.is_none() {
+        eprintln!("[task] --pause requires --task <id>");
         std::process::exit(2);
     }
     let store = SessionStore::new(session_directory());
@@ -215,16 +222,30 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             std::process::exit(2);
         }
         let task_store = TaskStore::new(task_directory());
-        let task = task_id.as_ref().map(|id| {
-            new_one_shot_task(&task_store, &store, id, &working_directory, &prompt, limits)
-                .unwrap_or_else(|error| {
-                    eprintln!("[task] {error}");
-                    std::process::exit(2);
-                })
+        let _task_lease = task_id.as_ref().or(session_id.as_ref()).map(|id| {
+            task_store.lease(id).unwrap_or_else(|error| {
+                eprintln!("[task] {error}");
+                std::process::exit(2);
+            })
+        });
+        if let Some(id) = &session_id {
+            ensure_unclaimed_session(&task_store, id).unwrap_or_else(|error| {
+                eprintln!("[task] {error}");
+                std::process::exit(2);
+            });
+        }
+        let (task, task_session) = task_id.as_ref().map_or((None, None), |id| {
+            let (task, session) =
+                prepare_one_shot_task(&task_store, &store, id, &working_directory, &prompt, limits)
+                    .unwrap_or_else(|error| {
+                        eprintln!("[task] {error}");
+                        std::process::exit(2);
+                    });
+            (Some(task), Some(session))
         });
         // `ask --session <id>` continues (or starts) a saved session.
-        let session = session_id.as_ref().or(task_id.as_ref()).map(|id| {
-            let session = match store.load(id) {
+        let session = task_session.or_else(|| {
+            session_id.as_ref().map(|id| match store.load(id) {
                 Ok(existing) => existing,
                 Err(error) if error.is_not_found() => {
                     Session::new(id.clone()).unwrap_or_else(|error| {
@@ -236,10 +257,11 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
                     eprintln!("[session] cannot resume {id}: {error}");
                     std::process::exit(2);
                 }
-            };
-            agent.set_conversation(session.resume_conversation());
-            session
+            })
         });
+        if let Some(session) = &session {
+            agent.set_conversation(session.resume_conversation());
+        }
         run_one_shot_agent(
             &mut agent,
             &prompt,
@@ -247,6 +269,7 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
             permission,
             session.map(|s| (&store, s)),
             task.map(|record| (&task_store, record)),
+            pause_after_turn,
         );
         return;
     }
@@ -254,6 +277,18 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
         eprintln!("[task] --task requires a one-shot prompt");
         std::process::exit(2);
     }
+    let task_store = TaskStore::new(task_directory());
+    let _session_lease = session_id.as_ref().map(|id| {
+        let lease = task_store.lease(id).unwrap_or_else(|error| {
+            eprintln!("[task] {error}");
+            std::process::exit(2);
+        });
+        ensure_unclaimed_session(&task_store, id).unwrap_or_else(|error| {
+            eprintln!("[task] {error}");
+            std::process::exit(2);
+        });
+        lease
+    });
     let mut session = match &session_id {
         Some(id) => match store.load(id) {
             Ok(existing) => {
@@ -283,6 +318,19 @@ pub(crate) fn run_live_agent(user_arguments: &[String]) {
                 }
             }
         }
+    };
+    let _anonymous_session_lease = if session_id.is_none() {
+        let lease = task_store.lease(&session.id).unwrap_or_else(|error| {
+            eprintln!("[task] {error}");
+            std::process::exit(2);
+        });
+        ensure_unclaimed_session(&task_store, &session.id).unwrap_or_else(|error| {
+            eprintln!("[task] {error}");
+            std::process::exit(2);
+        });
+        Some(lease)
+    } else {
+        None
     };
     let stdin = io::stdin();
 
@@ -511,7 +559,10 @@ fn parse_one_shot_args(arguments: &[String]) -> Option<(String, bool)> {
             skip_next = false;
             continue;
         }
-        if !matches!(argument.as_str(), "--json" | "--auto" | "--deny") {
+        if !matches!(
+            argument.as_str(),
+            "--json" | "--auto" | "--deny" | "--pause"
+        ) {
             prompt_parts.push(argument.clone());
         }
     }
@@ -545,52 +596,107 @@ fn extract_task_id(arguments: &[String]) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
-fn new_one_shot_task(
+fn prepare_one_shot_task(
     task_store: &TaskStore,
     session_store: &SessionStore,
     id: &str,
     working_directory: &std::path::Path,
     prompt: &str,
     limits: a_rust_vm::config::ResolvedLimits,
-) -> Result<TaskRecord, String> {
+) -> Result<(TaskRecord, Session), String> {
     TaskRecord::validate_id(id).map_err(|error| error.to_string())?;
-    Session::new(id).map_err(|error| error.to_string())?;
+    let workspace_id = workspace_id(working_directory)?;
+    let budget = TaskBudget {
+        max_model_steps: u32::try_from(limits.max_steps)
+            .map_err(|_| "model step budget exceeds task limit")?,
+        max_tool_calls: u32::try_from(limits.max_tool_calls)
+            .map_err(|_| "tool call budget exceeds task limit")?,
+        timeout_seconds: limits.turn_timeout_secs,
+    };
     match task_store.load(id) {
-        Ok(_) => return Err(format!("task '{id}' already exists")),
+        Ok(mut task) => {
+            if task.status() != TaskStatus::Paused {
+                return Err(format!(
+                    "task '{id}' is {:?}; only a checkpointed paused task can resume",
+                    task.status()
+                ));
+            }
+            if task.spec().owner != "local"
+                || task.spec().workspace_id != workspace_id
+                || task.spec().budget != budget
+            {
+                return Err(format!("task '{id}' workspace, owner, or budget changed"));
+            }
+            let checkpoint = task
+                .checkpoint()
+                .ok_or_else(|| format!("task '{id}' has no checkpoint"))?;
+            let expected_digest = checkpoint
+                .session_sha256
+                .as_deref()
+                .ok_or_else(|| format!("task '{id}' has no session digest"))?;
+            let session = session_store.load(id).map_err(|error| error.to_string())?;
+            let completed_turns = u32::try_from(session.turns.len())
+                .map_err(|_| "session turn count exceeds task checkpoint limit")?;
+            if checkpoint.session_id != id
+                || session.id != id
+                || checkpoint.completed_turns != completed_turns
+                || session_digest(&session)? != expected_digest
+            {
+                return Err(format!("task '{id}' session does not match its checkpoint"));
+            }
+            task.append(TaskEventKind::Resumed)
+                .map_err(|error| error.to_string())?;
+            task_store.save(&task).map_err(|error| error.to_string())?;
+            return Ok((task, session));
+        }
         Err(TaskStoreError::NotFound { .. }) => {}
         Err(error) => return Err(error.to_string()),
     }
+    let session = Session::new(id).map_err(|error| error.to_string())?;
     match session_store.load(id) {
         Ok(_) => return Err(format!("session '{id}' already exists")),
         Err(error) if error.is_not_found() => {}
         Err(error) => return Err(error.to_string()),
     }
-    let canonical = working_directory
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve workspace: {error}"))?;
-    let path = canonical
-        .to_str()
-        .ok_or("workspace path is not valid UTF-8")?;
-    let workspace_id = format!("sha256:{:x}", Sha256::digest(path.as_bytes()));
     let mut task = TaskRecord::new(TaskSpec {
         id: id.to_owned(),
         owner: "local".to_owned(),
         workspace_id,
         prompt: prompt.to_owned(),
         input_version_ids: Vec::new(),
-        budget: TaskBudget {
-            max_model_steps: u32::try_from(limits.max_steps)
-                .map_err(|_| "model step budget exceeds task limit")?,
-            max_tool_calls: u32::try_from(limits.max_tool_calls)
-                .map_err(|_| "tool call budget exceeds task limit")?,
-            timeout_seconds: limits.turn_timeout_secs,
-        },
+        budget,
     })
     .map_err(|error| error.to_string())?;
     task.append(TaskEventKind::Started)
         .map_err(|error| error.to_string())?;
     task_store.save(&task).map_err(|error| error.to_string())?;
-    Ok(task)
+    Ok((task, session))
+}
+
+fn workspace_id(root: &std::path::Path) -> Result<String, String> {
+    let canonical = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve workspace: {error}"))?;
+    let path = canonical
+        .to_str()
+        .ok_or("workspace path is not valid UTF-8")?;
+    Ok(format!("sha256:{:x}", Sha256::digest(path.as_bytes())))
+}
+
+fn session_digest(session: &Session) -> Result<String, String> {
+    let bytes = serde_json::to_vec(session)
+        .map_err(|error| format!("cannot encode session checkpoint: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn ensure_unclaimed_session(task_store: &TaskStore, id: &str) -> Result<(), String> {
+    match task_store.load(id) {
+        Ok(_) => Err(format!(
+            "session '{id}' belongs to a task; use --task to continue it"
+        )),
+        Err(TaskStoreError::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Read an approval answer: `y`/`yes` allows; anything else denies, and
@@ -638,6 +744,7 @@ fn run_one_shot_agent(
     permission: OneShotPermission,
     mut session: Option<(&SessionStore, Session)>,
     mut task: Option<(&TaskStore, TaskRecord)>,
+    pause_after_turn: bool,
 ) {
     let mut record = TurnRecord::new(prompt);
     let mut total = a_rust_vm::agent::Usage::default();
@@ -727,17 +834,19 @@ fn run_one_shot_agent(
         }
         session.finish_turn(record, agent.conversation());
         match store.save(session) {
-            Ok(()) => match u32::try_from(session.turns.len()) {
-                Ok(completed_turns) => {
+            Ok(()) => match (u32::try_from(session.turns.len()), session_digest(session)) {
+                (Ok(completed_turns), Ok(digest)) => {
                     checkpoint = Some(TaskCheckpoint {
                         session_id: session.id.clone(),
                         completed_turns,
+                        session_sha256: Some(digest),
                     })
                 }
-                Err(_) => {
+                (Err(_), _) => {
                     session_save_error =
                         Some("session turn count exceeds task checkpoint limit".to_owned());
                 }
+                (_, Err(error)) => session_save_error = Some(error),
             },
             Err(error) => {
                 eprintln!("[session] cannot save: {error}");
@@ -767,6 +876,8 @@ fn run_one_shot_agent(
             TaskEventKind::Failed {
                 reason: "repeated tool call without an answer".to_owned(),
             }
+        } else if pause_after_turn {
+            TaskEventKind::Paused
         } else {
             TaskEventKind::Completed {
                 output_version_ids: Vec::new(),

@@ -223,11 +223,14 @@ state directory; files are written owner-only.
 `arvm ask --task <id> <prompt>` starts a new, bounded one-shot task. It records
 the configured turn budget, local workspace identity, session checkpoint, and
 completed, failed, or cancelled outcome under the state directory. Inspect it
-with `arvm task list` or `arvm task show <id> [--json]`. Task IDs cannot be
-reused yet; restart-safe task continuation and browser access are still in
-progress. A completed status means the agent turn ended; use the benchmark to
-measure whether its result met the task goal. `--task` and `--session` cannot
-be combined.
+with `arvm task list` or `arvm task show <id> [--json]`. Add `--pause` to
+leave a finished turn resumable, then run `arvm ask --task <id> <next prompt>`
+after restarting the CLI. Resume requires the same workspace and configured
+turn limits, and verifies the saved session against its checkpoint. A task
+left running by an interrupted turn cannot be resumed automatically because
+tool effects may have occurred without a saved checkpoint. A completed
+status means the agent turn ended; use the benchmark to measure whether its
+result met the task goal. `--task` and `--session` cannot be combined.
 
 Optional limits: `OPENROUTER_MAX_TOKENS` (128-32768, default 8192) and
 `OPENROUTER_TIMEOUT_SECS` (1-600, default 120). Invalid values are errors.

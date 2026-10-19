@@ -1,8 +1,9 @@
 //! `arvm session`: saved agent transcripts.
 
 use a_rust_vm::session::{Session, SessionStore};
+use a_rust_vm::task_store::{TaskStore, TaskStoreError};
 
-use super::paths::session_directory;
+use super::paths::{session_directory, task_directory};
 
 fn session_usage() {
     eprintln!("usage: arvm session list|show <id>|save <id> <role> <content>|export <id> [--json]");
@@ -92,6 +93,22 @@ pub(crate) fn run_session_command(arguments: &[String]) {
             let id = &arguments[1];
             let role = &arguments[2];
             let content = &arguments[3];
+            let task_store = TaskStore::new(task_directory());
+            let _lease = task_store.lease(id).unwrap_or_else(|error| {
+                eprintln!("[session] {error}");
+                std::process::exit(2);
+            });
+            match task_store.load(id) {
+                Ok(_) => {
+                    eprintln!("[session] session '{id}' belongs to a task");
+                    std::process::exit(2);
+                }
+                Err(TaskStoreError::NotFound { .. }) => {}
+                Err(error) => {
+                    eprintln!("[session] {error}");
+                    std::process::exit(2);
+                }
+            }
             let mut session = match store.load(id) {
                 Ok(existing) => existing,
                 Err(error) if error.is_not_found() => match Session::new(id.clone()) {
